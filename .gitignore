@@ -1,0 +1,11 @@
+# Python compiled files (These are auto-generated and just waste space)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local Database 
+db.sqlite3
+# IDE and Editor folders
+.vscode/
+.env
