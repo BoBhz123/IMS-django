@@ -7,10 +7,33 @@
 </head>
 <body>
 
-{%if name %}
-    <h1>Hello, {{name}}</h1>
-{%else%}
-<h1> Hello World </h1>
-{% endif %}
+    {% if name %}
+        <h1>Hello, {{ name }}</h1>
+    {% else %}
+        <h1>Hello World</h1>
+    {% endif %} 
+    
+    <!-- Display the global count of orders here -->
+    <h2>Total Orders in System: {{ total_orders }}</h2>
+    <hr>
+    
+    <ul>
+    {% for order in orders %}
+        <!-- Display the order ID and the annotated Total Price! -->
+        <li>
+            <strong>Order ID:</strong> {{ order.id }} <br>
+            <strong>Invoice Total:</strong> ${{ order.order_total_price }}
+            
+            <ul>
+            {% for item in order.items.all %}
+                <li>{{ item.product.name }} - {{ item.quantity }} units @ ${{ item.unit_price }}</li>
+            {% endfor %}
+            </ul>
+
+        </li>
+        <br>
+    {% endfor %}
+    </ul>
+
 </body>
-</html>>
+</html>
