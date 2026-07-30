@@ -22,6 +22,8 @@ class ProductAdmin(admin.ModelAdmin):
     list_editable= ['default_sell_price']
     search_fields = ['name']
     list_filter=['category']
+    autocomplete_fields = ['category','supplier']
+    
     def category(self,product):
         return product.category.name
     @admin.action(description='Clear stock')
@@ -35,20 +37,28 @@ class ProductAdmin(admin.ModelAdmin):
 @admin.register(models.Category)
 class CategoryAdmin(admin.ModelAdmin):
     list_display = ['name']
-    
+    search_fields = ['name']
+   
+   
+class PurchaseItemInline(admin.TabularInline):
+    model = models.PurchaseItem 
+    extra = 0
+      
     
 @admin.register(models.Purchase)
 class PurchaseAdmin(admin.ModelAdmin):
-    list_display = ['id','supplier_name','exchange_rate','placed_at']
+    list_display = ['id','supplier_name','exchange_rate','get_total','placed_at']
     list_select_related = ['supplier']
     list_filter = ['supplier']
+    inlines = [PurchaseItemInline]
+    
     def supplier_name(self,purchase):
         url =(  reverse('admin:inventory_supplier_changelist')
         +'?'
         +urlencode({
             'purchase__id':str(purchase.id)
         }))
-        return format_html('<a href={}">{}</a>',url,purchase.supplier.name)
+        return format_html('<a href="`{}">{}</a>',url,purchase.supplier.name)
     
     
     def get_queryset(self, request):
@@ -102,21 +112,25 @@ class PlacedAtFilter(admin.SimpleListFilter):
 def export_orders_to_csv(modeladmin, request, queryset):
     response = HttpResponse(content_type='text/csv')
     response['Content-Disposition'] = 'attachment; filename="orders_export.csv"'
+    writer = csv.writer(response)    
+    writer.writerow(['Order ID', 'Customer Name', 'Date Placed', 'Exchange Rate (LBP)', 'Total Value (USD)'])
 
-    writer = csv.writer(response)
-    
-    writer.writerow(['Order ID', 'Customer Name', 'Date Placed', 'Exchange Rate (LBP)'])
+    # Annotate the queryset to calculate the math
+    annotated_queryset = queryset.annotate(
+        total_value=Sum(F('items__quantity') * F('items__unit_price'))
+    )
 
-    for order in queryset:
+    for order in annotated_queryset:
+        calculated_total = order.total_value if order.total_value is not None else 0
         writer.writerow([
             order.id, 
             order.customer.name if order.customer else "No Customer", 
             order.placed_at.strftime("%Y-%m-%d %H:%M"), 
-            order.exchange_rate
+            order.exchange_rate,
+            f"${calculated_total:.2f}" # Added the formatted total
         ])
 
-    return response
-    
+    return response    
     
 @admin.action(description='Export selected purchases to CSV')
 def export_purchases_to_csv(modeladmin, request, queryset):
@@ -138,11 +152,20 @@ def export_purchases_to_csv(modeladmin, request, queryset):
             purchase.placed_at.strftime("%Y-%m-%d %H:%M"), 
             f"${calculated_total:.2f}"
         ]) 
+
+class OrderItemInline(admin.TabularInline):
+    model = models.OrderItem
+    extra = 0
+
+        
+
+
 @admin.register(models.Order)
 class OrderAdmin(admin.ModelAdmin):
-    list_display = ['id','customer','exchange_rate','placed_at']
+    list_display = ['id','customer','exchange_rate','get_total','placed_at']
     list_select_related = ['customer']
     list_filter = ['customer',PlacedAtFilter]
+    inlines = [OrderItemInline]
     search_fields = ['customer__name']
     actions = [export_orders_to_csv]    
     
@@ -156,7 +179,8 @@ class OrderAdmin(admin.ModelAdmin):
     def get_total(self, obj):
         total = getattr(obj, 'annotated_total', obj.total_price)
         return f"${total:.2f}" if total else "$0.00"
-    
+  
+  
 
 @admin.register(models.Supplier)
 class SupplierAdmin(admin.ModelAdmin):

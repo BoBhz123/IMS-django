@@ -8,7 +8,7 @@ class Supplier(models.Model):
     id = models.AutoField(primary_key=True,
                           null=False,editable=False)
     name = models.CharField(max_length=255,unique=True,null = False)
-    phone_number= models.CharField(max_length=255,blank=True)
+    phone_number= models.CharField(max_length=255,blank=True,null=True)
     def __str__(self):
         return self.name
     
@@ -26,11 +26,11 @@ class Product(models.Model):
                           null=False,editable=False)
    
     name = models.CharField(max_length=255,unique=True,null=False)
-    description = models.TextField(null=True)
+    description = models.TextField(null=True,blank=True)
     cost_price = models.DecimalField(max_digits=7,decimal_places=2,null=False,validators=[MinValueValidator(1)])
     default_sell_price = models.DecimalField(max_digits=7,decimal_places=2,null=False,validators=[MinValueValidator(1)])
     stock_quantity = models.IntegerField(default=1,blank=False)
-    supplier = models.ForeignKey(Supplier,on_delete=models.PROTECT)
+    supplier = models.ForeignKey(Supplier,on_delete=models.PROTECT,blank=True)
     category= models.ForeignKey(Category,on_delete=models.PROTECT,related_name='products')
     
     def __str__(self):
@@ -44,7 +44,7 @@ class Purchase(models.Model):
     placed_at= models.DateTimeField(auto_now_add=True)
     supplier= models.ForeignKey(Supplier,on_delete=models.SET_NULL,
                                     null=True,blank=True)
-    exchange_rate = models.IntegerField()
+    exchange_rate = models.IntegerField(default=89000)
         
 class PurchaseItem(models.Model):
      purchase_order = models.ForeignKey(Purchase ,on_delete=models.CASCADE,related_name='items')
@@ -70,13 +70,13 @@ class Order(models.Model):
     placed_at= models.DateTimeField(auto_now_add=True)
     customer= models.ForeignKey(Customer,on_delete=models.SET_NULL,
                                     null=True,blank=True)
-    exchange_rate = models.IntegerField()
+    exchange_rate = models.IntegerField(default=89000)
         
 class OrderItem(models.Model):
      order = models.ForeignKey(Order ,on_delete=models.CASCADE,related_name='items')
      product = models.ForeignKey( Product, 
                                  on_delete=models.
-                                 PROTECT, related_name='orderitems')
+                                 PROTECT, related_name='orderitems',blank=True)
      quantity = models.PositiveSmallIntegerField(default=1)
      unit_price = models.DecimalField(max_digits=9, decimal_places=2, validators=[MinValueValidator(1)])
      unit_multiplier = models.PositiveSmallIntegerField(default=1)
