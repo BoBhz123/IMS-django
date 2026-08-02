@@ -48,6 +48,7 @@ class Purchase(models.Model):
     @property
     def total_price(self):
         return sum(item.quantity * item.unit_price for item in self.items.all())
+    
         
 class PurchaseItem(models.Model):
      purchase_order = models.ForeignKey(Purchase ,on_delete=models.CASCADE,related_name='items')
