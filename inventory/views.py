@@ -1,8 +1,10 @@
 from django.shortcuts import render
 from django.db.models import Prefetch
 from django.http import HttpResponse
+from django_filters.rest_framework import DjangoFilterBackend
 from .serializers import *
 from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order
+from .filters import ProductFilter
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
@@ -15,6 +17,9 @@ from rest_framework.viewsets import ModelViewSet
 class ProductViewSet(ModelViewSet):
    queryset = Product.objects.all()
    serializer_class = ProductSerializer
+   filter_backends = [DjangoFilterBackend]
+   filterset_class = ProductFilter
+   search_fields = ['name']
     
 
 class  CategoryViewSet(ModelViewSet):
