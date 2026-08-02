@@ -40,36 +40,6 @@ class CategoryAdmin(admin.ModelAdmin):
     search_fields = ['name']
    
    
-class PurchaseItemInline(admin.TabularInline):
-    model = models.PurchaseItem 
-    extra = 0
-      
-    
-@admin.register(models.Purchase)
-class PurchaseAdmin(admin.ModelAdmin):
-    list_display = ['id','supplier_name','exchange_rate','get_total','placed_at']
-    list_select_related = ['supplier']
-    list_filter = ['supplier']
-    inlines = [PurchaseItemInline]
-    
-    def supplier_name(self,purchase):
-        url =(  reverse('admin:inventory_supplier_changelist')
-        +'?'
-        +urlencode({
-            'purchase__id':str(purchase.id)
-        }))
-        return format_html('<a href="`{}">{}</a>',url,purchase.supplier.name)
-    
-    
-    def get_queryset(self, request):
-        qs = super().get_queryset(request)
-        return qs.annotate(annotated_total=Sum(F('items__quantity') * F('items__unit_price')))
-
-    @admin.display(description='Total Value', ordering='annotated_total')
-    def get_total(self, obj):
-        total = getattr(obj, 'annotated_total', obj.total_price)
-        return f"${total:.2f}" if total else "$0.00"
-    
 
 class PlacedAtFilter(admin.SimpleListFilter):
     title = 'date'
@@ -106,6 +76,9 @@ class PlacedAtFilter(admin.SimpleListFilter):
             return queryset.filter(placed_at__gte=now - timedelta(days=365))
         elif self.value().isdigit():
             return queryset.filter(placed_at__year=int(self.value()))
+
+
+
 
 
 @admin.action(description='Export selected orders to CSV')
@@ -152,6 +125,51 @@ def export_purchases_to_csv(modeladmin, request, queryset):
             purchase.placed_at.strftime("%Y-%m-%d %H:%M"), 
             f"${calculated_total:.2f}"
         ]) 
+
+
+
+
+class PurchaseItemInline(admin.TabularInline):
+    model = models.PurchaseItem 
+    extra = 0
+      
+    
+@admin.register(models.Purchase)
+class PurchaseAdmin(admin.ModelAdmin):
+    list_display = ['id','supplier_name','exchange_rate','get_total','placed_at']
+    list_select_related = ['supplier']
+    list_filter = ['supplier']
+    inlines = [PurchaseItemInline]
+    actions = [export_purchases_to_csv]
+    
+    def supplier_name(self,purchase):
+        url =(  reverse('admin:inventory_supplier_changelist')
+        +'?'
+        +urlencode({
+            'purchase__id':str(purchase.id)
+        }))
+        return format_html('<a href="{}">{}</a>',url,purchase.supplier.name)
+    
+    
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        return qs.annotate(annotated_total=Sum(F('items__quantity') * F('items__unit_price')))
+
+    @admin.display(description='Total Value', ordering='annotated_total')
+    def get_total(self, obj):
+        total = getattr(obj, 'annotated_total', obj.total_price)
+        return f"${total:.2f}" if total else "$0.00"
+    
+
+
+
+
+
+
+
+
+
+
 
 class OrderItemInline(admin.TabularInline):
     model = models.OrderItem

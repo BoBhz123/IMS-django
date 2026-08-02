@@ -45,6 +45,9 @@ class Purchase(models.Model):
     supplier= models.ForeignKey(Supplier,on_delete=models.SET_NULL,
                                     null=True,blank=True)
     exchange_rate = models.IntegerField(default=89000)
+    @property
+    def total_price(self):
+        return sum(item.quantity * item.unit_price for item in self.items.all())
         
 class PurchaseItem(models.Model):
      purchase_order = models.ForeignKey(Purchase ,on_delete=models.CASCADE,related_name='items')
@@ -71,6 +74,9 @@ class Order(models.Model):
     customer= models.ForeignKey(Customer,on_delete=models.SET_NULL,
                                     null=True,blank=True)
     exchange_rate = models.IntegerField(default=89000)
+    @property
+    def total_price(self):
+        return sum(item.quantity * item.unit_price for item in self.items.all())
         
 class OrderItem(models.Model):
      order = models.ForeignKey(Order ,on_delete=models.CASCADE,related_name='items')
