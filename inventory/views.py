@@ -155,39 +155,61 @@ class AnalyticsView(APIView):
      
      
 class ExportOrdersCSVView(APIView):
+    permission_classes = [IsAdminUser] 
+
     def get(self, request):
         response = HttpResponse(content_type='text/csv')
-        response['Content-Disposition'] = 'attachment; filename="orders_export.csv"'
+        response['Content-Disposition'] = 'attachment; filename="orders_detailed_export.csv"'
         
         writer = csv.writer(response)    
-        writer.writerow(['Order ID', 'Customer Name', 'Date Placed', 'Exchange Rate (LBP)', 'Total Value (USD)'])
+        writer.writerow([
+            'Order ID', 
+            'Customer Name', 
+            'Date Placed', 
+            'Exchange Rate (LBP)', 
+            'Product Name', 
+            'Quantity', 
+            'Unit Multiplier', 
+            'Sell Price (USD)', 
+            'Cost Price (USD)', 
+            'Line Total (USD)'
+        ])
 
-        orders = Order.objects.all()
+        items = OrderItem.objects.select_related('order', 'order__customer', 'product').all()
         
+        # Capture all possible filter parameters from the URL
         year = request.query_params.get('year')
         month = request.query_params.get('month')
+        date_str = request.query_params.get('date')      # Format: YYYY-MM-DD
+        order_id = request.query_params.get('order_id')  # UUID string
         
         if year:
-            orders = orders.filter(placed_at__year=year)
+            items = items.filter(order__placed_at__year=year)
         if month:
-            orders = orders.filter(placed_at__month=month)
+            items = items.filter(order__placed_at__month=month)
+        if date_str:
+            items = items.filter(order__placed_at__date=date_str)
+        if order_id:
+            items = items.filter(order__id=order_id)
 
-        annotated_queryset = orders.annotate(
-            total_value=Sum(F('items__quantity') * F('items__unit_price'))
-        )
-
-        for order in annotated_queryset:
-            calculated_total = order.total_value if order.total_value is not None else 0
+        for item in items:
+            line_total = item.quantity * item.unit_multiplier * item.unit_price
+            cost_price = item.product.cost_price if item.product else 0
+            
             writer.writerow([
-                order.id, 
-                order.customer.name if order.customer else "No Customer", 
-                order.placed_at.strftime("%Y-%m-%d %H:%M"), 
-                order.exchange_rate,
-                f"${calculated_total:.2f}"
+                item.order.id, 
+                item.order.customer.name if item.order.customer else "No Customer", 
+                item.order.placed_at.strftime("%Y-%m-%d %H:%M"), 
+                item.order.exchange_rate,
+                item.product.name if item.product else "Unknown Product",
+                item.quantity,
+                item.unit_multiplier,
+                f"${item.unit_price:.2f}",
+                f"${cost_price:.2f}",
+                f"${line_total:.2f}"
             ])
+            
         return response
-    
-    
     
     
 class ExportPurchasesCSVView(APIView):
@@ -195,32 +217,52 @@ class ExportPurchasesCSVView(APIView):
 
     def get(self, request):
         response = HttpResponse(content_type='text/csv')
-        response['Content-Disposition'] = 'attachment; filename="purchases_export.csv"'
+        response['Content-Disposition'] = 'attachment; filename="purchases_detailed_export.csv"'
         
         writer = csv.writer(response)    
-        writer.writerow(['Purchase ID', 'Supplier Name', 'Date Placed', 'Total Cost (USD)'])
+        writer.writerow([
+            'Purchase ID', 
+            'Supplier Name', 
+            'Date Placed', 
+            'Exchange Rate (LBP)', 
+            'Product Name', 
+            'Quantity', 
+            'Unit Multiplier', 
+            'Unit Cost Price (USD)', 
+            'Line Total (USD)'
+        ])
 
-        purchases = Purchase.objects.all()
+        # Query PurchaseItems directly for the row-by-row breakdown
+        items = PurchaseItem.objects.select_related('purchase_order', 'purchase_order__supplier', 'product').all()
         
+        # Capture filter parameters from the URL
         year = request.query_params.get('year')
         month = request.query_params.get('month')
+        date_str = request.query_params.get('date')         # Format: YYYY-MM-DD
+        purchase_id = request.query_params.get('purchase_id') # UUID string
         
         if year:
-            purchases = purchases.filter(placed_at__year=year)
+            items = items.filter(purchase_order__placed_at__year=year)
         if month:
-            purchases = purchases.filter(placed_at__month=month)
+            items = items.filter(purchase_order__placed_at__month=month)
+        if date_str:
+            items = items.filter(purchase_order__placed_at__date=date_str)
+        if purchase_id:
+            items = items.filter(purchase_order__id=purchase_id)
 
-        annotated_queryset = purchases.annotate(
-            total_cost=Sum(F('items__quantity') * F('items__unit_price'))
-        )
-
-        for purchase in annotated_queryset:
-            calculated_total = purchase.total_cost if purchase.total_cost is not None else 0
+        for item in items:
+            line_total = item.quantity * item.unit_multiplier * item.unit_price
+            
             writer.writerow([
-                purchase.id, 
-                purchase.supplier.name if purchase.supplier else "No Supplier", 
-                purchase.placed_at.strftime("%Y-%m-%d %H:%M"), 
-                f"${calculated_total:.2f}"
+                item.purchase_order.id, 
+                item.purchase_order.supplier.name if item.purchase_order.supplier else "No Supplier", 
+                item.purchase_order.placed_at.strftime("%Y-%m-%d %H:%M"), 
+                item.purchase_order.exchange_rate,
+                item.product.name if item.product else "Unknown Product",
+                item.quantity,
+                item.unit_multiplier,
+                f"${item.unit_price:.2f}",
+                f"${line_total:.2f}"
             ])
             
         return response
