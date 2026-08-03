@@ -30,7 +30,7 @@ class Product(models.Model):
     cost_price = models.DecimalField(max_digits=7,decimal_places=2,null=False,validators=[MinValueValidator(1)])
     default_sell_price = models.DecimalField(max_digits=7,decimal_places=2,null=False,validators=[MinValueValidator(1)])
     stock_quantity = models.IntegerField(default=1,blank=False)
-    supplier = models.ForeignKey(Supplier,on_delete=models.PROTECT,blank=True)
+    supplier = models.ForeignKey(Supplier,on_delete=models.PROTECT,blank=True,null=True)
     category= models.ForeignKey(Category,on_delete=models.PROTECT,related_name='products')
     
     def __str__(self):
@@ -43,8 +43,8 @@ class Purchase(models.Model):
     id = models.UUIDField(default=uuid.uuid4,primary_key=True,null=False)
     placed_at= models.DateTimeField(auto_now_add=True)
     supplier= models.ForeignKey(Supplier,on_delete=models.SET_NULL,
-                                    null=True,blank=True)
-    exchange_rate = models.IntegerField(default=89000)
+                                    null=True)
+    exchange_rate = models.IntegerField(default=89000,blank=True)
     @property
     def total_price(self):
         return sum(item.quantity * item.unit_price for item in self.items.all())
@@ -73,8 +73,8 @@ class Order(models.Model):
     id = models.UUIDField(primary_key=True,null=False,default=uuid.uuid4)
     placed_at= models.DateTimeField(auto_now_add=True)
     customer= models.ForeignKey(Customer,on_delete=models.SET_NULL,
-                                    null=True,blank=True)
-    exchange_rate = models.IntegerField(default=89000)
+                                    null=True)
+    exchange_rate = models.IntegerField(default=89000,blank=True)
     @property
     def total_price(self):
         return sum(item.quantity * item.unit_price for item in self.items.all())

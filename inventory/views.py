@@ -59,23 +59,31 @@ class PurchaseViewSet(ModelViewSet):
         annotated_total=Sum(F('items__quantity') * F('items__unit_price'))
     )
     
-    serializer_class = PurchaseSerializer
     filterset_class = PurchaseFilter
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     ordering_fields = ['annotated_total', 'placed_at']
     
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return CreatePurchaseSerializer
+        return PurchaseSerializer
     
     
     
 class OrderViewSet(ModelViewSet):
     queryset = Order.objects.select_related('customer').prefetch_related(
-        Prefetch(
-            'items', 
-            queryset=OrderItem.objects.select_related('product')
+            Prefetch(
+                'items', 
+                queryset=OrderItem.objects.select_related('product')
+            )
+        ).annotate(
+            annotated_total=Sum(F('items__quantity') * F('items__unit_price'))
         )
-    ).all()
-    serializer_class = OrderSerializer
     filterset_class = OrderFilter
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     ordering_fields = ['annotated_total', 'placed_at']
     
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return CreateOrderSerializer
+        return OrderSerializer
