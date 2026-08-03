@@ -11,7 +11,19 @@ import csv
 
 
 #admin models register
+class ProductImageInline(admin.TabularInline):
+    model = models.ProductImage
+    readonly_fields = ['thumbnail']
+    extra = 1
 
+    def thumbnail(self, instance):
+        if instance.image and hasattr(instance.image, 'url'):
+            # Corrected: Use {} placeholders and pass instance.image.url as an argument
+            return format_html(
+                '<img src="{}" style="width: 50px; height: 50px; object-fit: cover; border-radius: 4px;" />',
+                instance.image.url
+            )
+        return ''
 
 
 @admin.register(models.Product)
@@ -23,7 +35,7 @@ class ProductAdmin(admin.ModelAdmin):
     search_fields = ['name']
     list_filter=['category']
     autocomplete_fields = ['category','supplier']
-    
+    inlines = [ProductImageInline]
     def category(self,product):
         return product.category.name
     @admin.action(description='Clear stock')

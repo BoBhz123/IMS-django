@@ -1,3 +1,5 @@
+import os
+from datetime import timedelta
 """
 Django settings for ims project.
 
@@ -37,10 +39,15 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    #third_party-apps
     'django_filters',
     'rest_framework',
+    'rest_framework.authtoken', 
+    'djoser',
+    #dev apps
     'playground',
     'debug_toolbar',
+    #local apps
     'inventory'
 ]
 
@@ -132,4 +139,21 @@ STATIC_URL = 'static/'
 
 REST_FRAMEWORK = {
     'COERCE_DECIMAL_TO_STRING':False,
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ),
+    'DEFAULT_PERMISSION_CLASSES': (
+        'inventory.permissions.FullDjangoModelPermissions', 
+    )
 }
+
+
+SIMPLE_JWT= {
+    'AUTH_HEADER_TYPES': ('JWT',),
+    'ACCESS_TOKEN_LIFETIME': timedelta(days=1)
+}
+
+
+STATIC_URL = 'static/'
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')

@@ -1,7 +1,7 @@
 from django.db import models
 import uuid
 from django.core.validators import MinValueValidator
-
+from .validators import validate_file_size
 
 
 class Supplier(models.Model):
@@ -27,8 +27,8 @@ class Product(models.Model):
    
     name = models.CharField(max_length=255,unique=True,null=False)
     description = models.TextField(null=True,blank=True)
-    cost_price = models.DecimalField(max_digits=7,decimal_places=2,null=False,validators=[MinValueValidator(1)])
-    default_sell_price = models.DecimalField(max_digits=7,decimal_places=2,null=False,validators=[MinValueValidator(1)])
+    cost_price = models.DecimalField(max_digits=7,decimal_places=2,null=False,validators=[MinValueValidator(0)])
+    default_sell_price = models.DecimalField(max_digits=7,decimal_places=2,null=False,validators=[MinValueValidator(0)])
     stock_quantity = models.IntegerField(default=1,blank=False)
     supplier = models.ForeignKey(Supplier,on_delete=models.PROTECT,blank=True,null=True)
     category= models.ForeignKey(Category,on_delete=models.PROTECT,related_name='products')
@@ -38,6 +38,12 @@ class Product(models.Model):
     
     class Meta:
         ordering = ['name']
+        
+        
+        
+class ProductImage(models.Model):
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='images')
+    image = models.ImageField(upload_to='inventory/images', validators=[validate_file_size])
     
 class Purchase(models.Model):
     id = models.UUIDField(default=uuid.uuid4,primary_key=True,null=False)
@@ -56,7 +62,7 @@ class PurchaseItem(models.Model):
                                  on_delete=models.
                                  PROTECT, related_name='purchaseitems')
      quantity = models.PositiveSmallIntegerField(default=1)
-     unit_price = models.DecimalField(max_digits=9, decimal_places=2,validators=[MinValueValidator(1)])
+     unit_price = models.DecimalField(max_digits=9, decimal_places=2,validators=[MinValueValidator(0)])
      unit_multiplier = models.PositiveSmallIntegerField(default=1)
      
 class Customer(models.Model):
@@ -85,7 +91,7 @@ class OrderItem(models.Model):
                                  on_delete=models.
                                  PROTECT, related_name='orderitems',blank=True)
      quantity = models.PositiveSmallIntegerField(default=1)
-     unit_price = models.DecimalField(max_digits=9, decimal_places=2, validators=[MinValueValidator(1)])
+     unit_price = models.DecimalField(max_digits=9, decimal_places=2, validators=[MinValueValidator(0)])
      unit_multiplier = models.PositiveSmallIntegerField(default=1)
      
      
