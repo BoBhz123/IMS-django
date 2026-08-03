@@ -9,10 +9,14 @@ router.register('categories',views.CategoryViewSet)
 router.register('purchases',views.PurchaseViewSet)
 router.register('orders',views.OrderViewSet)
 router.register('suppliers',views.SupplierViewSet)
-router.register('customers',views.CustomerViewSet)
+router.register('customers',views.CustomerViewSet
+                
+                )
 
 products_router = routers.NestedDefaultRouter(
     router, 'products', lookup='product')
 
 
-urlpatterns = router.urls + products_router.urls 
+urlpatterns = [
+    path('analytics/', views.AnalyticsView.as_view(), name='analytics'),
+] + router.urls + products_router.urls

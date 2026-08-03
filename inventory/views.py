@@ -1,5 +1,5 @@
 from django.shortcuts import render
-from django.db.models import Prefetch,F
+from django.db.models import Prefetch,F,Q
 from django.db.models.aggregates import Sum
 from django.http import HttpResponse
 from django_filters.rest_framework import DjangoFilterBackend
@@ -7,10 +7,12 @@ from rest_framework.filters import SearchFilter,OrderingFilter
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
+from rest_framework.views import APIView
 from .filters import ProductFilter,PurchaseFilter,OrderFilter
 from .pagination import DefaultPagination
 from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order
 from .serializers import *
+from datetime import date
 # Create your views here.
 
 
@@ -87,3 +89,53 @@ class OrderViewSet(ModelViewSet):
         if self.request.method == 'POST':
             return CreateOrderSerializer
         return OrderSerializer
+    
+    
+    
+class AnalyticsView(APIView):
+     def get(self,request):
+         purchases = Purchase.objects.all()
+         orders = Order.objects.all()
+         products = OrderItem.objects.all()
+         
+         year = request.query_params.get('year')
+         month = request.query_params.get('month')
+
+         if year:
+            orders = orders.filter(placed_at__year=year)
+            purchases = purchases.filter(placed_at__year=year)
+            products = products.filter(order__placed_at__year=year)
+        
+         if month:
+                 orders = orders.filter(placed_at__month=month)
+                 purchases = purchases.filter(placed_at__month=month)         
+                 products = products.filter(order__placed_at__month=month)   
+         
+         
+         revenue_query = orders.aggregate(
+             total_revenue=Sum(F('items__quantity') * F('items__unit_price') * F('items__unit_multiplier'))
+         )
+         cost_query = purchases.aggregate(
+             total_cost=Sum(F('items__quantity') * F('items__unit_price') * F('items__unit_multiplier'))
+         )
+         
+         best_seller_query= products.values('product__name').annotate(
+             total_sold = Sum(F('quantity')*F('unit_multiplier'))
+         ).order_by('total_sold')[0:5]
+         
+         
+         raw_revenue = revenue_query['total_revenue'] or 0
+         raw_cost = cost_query['total_cost'] or 0
+
+         raw_profit = raw_revenue - raw_cost
+
+         
+         data = {
+             "total_revenue": f"${raw_revenue:,.2f}", 
+             "total_costs": f"${raw_cost:,.2f}",
+             "net_profit": f"${raw_profit:,.2f}",
+             "top_products": best_seller_query  
+
+         }
+
+         return Response(data)
