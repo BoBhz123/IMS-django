@@ -20,7 +20,7 @@ class ProductSerializer(serializers.ModelSerializer):
     images = ProductImageSerializer(many=True, read_only=True)
     class Meta():
         model = Product
-        fields = ['id','name','category','description','cost_price','default_sell_price','stock_quantity','images']
+        fields = ['id','name','category','supplier','description','cost_price','default_sell_price','profit','stock_quantity','images']
         
 class SimpleProductSerializer(serializers.ModelSerializer):
     class Meta:
@@ -112,7 +112,7 @@ class CreateOrderItemSerializer(serializers.ModelSerializer):
 class OrderItemSerializer(serializers.ModelSerializer):
     class Meta():
         model =OrderItem
-        fields = ['product','quantity','unit_multiplier','unit_price']
+        fields = ['product','quantity','unit_multiplier','unit_price','profit']
         
         
 class CreateOrderSerializer(serializers.ModelSerializer):
@@ -155,4 +155,4 @@ class OrderSerializer(serializers.ModelSerializer):
 
     class Meta():
         model = Order
-        fields = ['id','customer','placed_at','exchange_rate','items','total_price']  
+        fields = ['id','customer','placed_at','exchange_rate','items','total_price','total_profit']  
