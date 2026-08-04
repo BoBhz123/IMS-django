@@ -154,6 +154,57 @@ class AnalyticsView(APIView):
      
      
      
+class ExportProductsCSVView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="products_export.csv"'
+
+        writer = csv.writer(response)
+        writer.writerow([
+            'Product Name',
+            'Category',
+            'Supplier',
+            'Stock Quantity',
+            'Cost Price (USD)',
+            'Sell Price (USD)',
+            'Profit (USD)',
+        ])
+
+        products = Product.objects.select_related('category', 'supplier').all()
+
+        search = request.query_params.get('search')
+        category_id = request.query_params.get('category_id')
+        supplier_id = request.query_params.get('supplier_id')
+        min_price = request.query_params.get('default_sell_price__gt')
+        max_price = request.query_params.get('default_sell_price__lt')
+
+        if search:
+            products = products.filter(Q(name__icontains=search) | Q(description__icontains=search))
+        if category_id:
+            products = products.filter(category_id=category_id)
+        if supplier_id:
+            products = products.filter(supplier_id=supplier_id)
+        if min_price:
+            products = products.filter(default_sell_price__gt=min_price)
+        if max_price:
+            products = products.filter(default_sell_price__lt=max_price)
+
+        for product in products:
+            writer.writerow([
+                product.name,
+                product.category.name if product.category else 'Uncategorized',
+                product.supplier.name if product.supplier else 'No Supplier',
+                product.stock_quantity,
+                f"${product.cost_price:.2f}",
+                f"${product.default_sell_price:.2f}",
+                f"${product.profit:.2f}",
+            ])
+
+        return response
+
+
 class ExportOrdersCSVView(APIView):
     permission_classes = [IsAdminUser] 
 

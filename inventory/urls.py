@@ -19,4 +19,5 @@ urlpatterns = [
     path('analytics/', views.AnalyticsView.as_view(), name='analytics'),
     path('orders/export/csv/', views.ExportOrdersCSVView.as_view(), name='export-orders-csv'),
     path('purchases/export/csv/', views.ExportPurchasesCSVView.as_view(), name='export-purchases-csv'),
+    path('products/export/csv/', views.ExportProductsCSVView.as_view(), name='export-products-csv'),
 ] + router.urls + products_router.urls
