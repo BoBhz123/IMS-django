@@ -29,6 +29,9 @@ class Product(models.Model):
     description = models.TextField(null=True,blank=True)
     cost_price = models.DecimalField(max_digits=7,decimal_places=2,null=False,validators=[MinValueValidator(0)])
     default_sell_price = models.DecimalField(max_digits=7,decimal_places=2,null=False,validators=[MinValueValidator(0)])
+    @property
+    def profit(self):
+        return self.default_sell_price - self.cost_price
     stock_quantity = models.IntegerField(default=1,blank=False)
     supplier = models.ForeignKey(Supplier,on_delete=models.PROTECT,blank=True,null=True)
     category= models.ForeignKey(Category,on_delete=models.PROTECT,related_name='products')
@@ -84,15 +87,22 @@ class Order(models.Model):
     @property
     def total_price(self):
         return sum(item.quantity * item.unit_price for item in self.items.all())
-        
+    @property
+    def total_profit(self):
+        return sum((item.profit or 0) for item in self.items.all())
+
 class OrderItem(models.Model):
      order = models.ForeignKey(Order ,on_delete=models.CASCADE,related_name='items')
-     product = models.ForeignKey( Product, 
+     product = models.ForeignKey( Product,
                                  on_delete=models.
                                  PROTECT, related_name='orderitems',blank=True)
      quantity = models.PositiveSmallIntegerField(default=1)
      unit_price = models.DecimalField(max_digits=9, decimal_places=2, validators=[MinValueValidator(0)])
      unit_multiplier = models.PositiveSmallIntegerField(default=1)
-     
-     
-     
+     @property
+     def profit(self):
+         if not self.product_id:
+             return None
+         return (self.unit_price - self.product.cost_price) * self.quantity * self.unit_multiplier
+
+
