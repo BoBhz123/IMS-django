@@ -108,7 +108,10 @@ export function Orders() {
       }
 
       setInvoiceOrder({
-        ...order,
+        id: order.id,
+        placed_at: order.placed_at,
+        exchange_rate: order.exchange_rate,
+        customer: order.customer,
         items: order.items.map((item) => ({
           name: nextCache.get(item.product) ?? `Product #${item.product}`,
           quantity: item.quantity,
