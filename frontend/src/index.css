@@ -1,0 +1,187 @@
+@import 'tailwindcss';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  color-scheme: light;
+
+  --canvas: #f5f5f7;
+  --canvas-2: #ececee;
+  --glass: rgba(255, 255, 255, 0.65);
+  --glass-strong: rgba(255, 255, 255, 0.85);
+  --glass-border: rgba(255, 255, 255, 0.6);
+  --hairline: rgba(60, 60, 67, 0.13);
+
+  --text-primary: #1d1d1f;
+  --text-secondary: #6e6e73;
+  --text-tertiary: #aeaeb2;
+
+  --accent-blue: #007aff;
+  --accent-green: #34c759;
+  --accent-orange: #ff9500;
+  --accent-red: #ff3b30;
+  --accent-purple: #af52de;
+  --accent-teal: #32ade6;
+
+  --delta-good: #006300;
+  --delta-bad: #d03b3b;
+
+  /* chart series — validated separately from the UI accents above,
+     see node scripts/validate_palette.js from the dataviz skill */
+  --chart-surface: #ffffff;
+  --chart-series-revenue: #007aff;
+  --chart-series-cost: #ff9500;
+  --chart-grid: rgba(60, 60, 67, 0.09);
+  --chart-axis: rgba(60, 60, 67, 0.35);
+
+  --shadow-glass: 0 20px 40px -12px rgba(0, 0, 0, 0.12), 0 1px 0 0 rgba(255, 255, 255, 0.7) inset;
+  --shadow-dock: 0 16px 32px -8px rgba(0, 0, 0, 0.18);
+}
+
+.dark {
+  color-scheme: dark;
+
+  --canvas: #1c1c1e;
+  --canvas-2: #151517;
+  --glass: rgba(44, 44, 46, 0.6);
+  --glass-strong: rgba(44, 44, 46, 0.82);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --hairline: rgba(84, 84, 88, 0.48);
+
+  --text-primary: #f5f5f7;
+  --text-secondary: #98989d;
+  --text-tertiary: #636366;
+
+  --accent-blue: #0a84ff;
+  --accent-green: #30d158;
+  --accent-orange: #ff9f0a;
+  --accent-red: #ff453a;
+  --accent-purple: #bf5af2;
+  --accent-teal: #64d2ff;
+
+  --delta-good: #0ca30c;
+  --delta-bad: #e66767;
+
+  --chart-surface: #2c2c2e;
+  --chart-series-revenue: #0a84ff;
+  --chart-series-cost: #cc7a00;
+  --chart-grid: rgba(255, 255, 255, 0.08);
+  --chart-axis: rgba(255, 255, 255, 0.3);
+
+  --shadow-glass: 0 20px 40px -12px rgba(0, 0, 0, 0.6), 0 1px 0 0 rgba(255, 255, 255, 0.06) inset;
+  --shadow-dock: 0 16px 40px -8px rgba(0, 0, 0, 0.6);
+}
+
+@theme inline {
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-display: 'Inter Tight', 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  --color-canvas: var(--canvas);
+  --color-canvas-2: var(--canvas-2);
+  --color-glass: var(--glass);
+  --color-glass-strong: var(--glass-strong);
+  --color-glass-border: var(--glass-border);
+  --color-hairline: var(--hairline);
+
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-tertiary: var(--text-tertiary);
+
+  --color-accent-blue: var(--accent-blue);
+  --color-accent-green: var(--accent-green);
+  --color-accent-orange: var(--accent-orange);
+  --color-accent-red: var(--accent-red);
+  --color-accent-purple: var(--accent-purple);
+  --color-accent-teal: var(--accent-teal);
+
+  --color-delta-good: var(--delta-good);
+  --color-delta-bad: var(--delta-bad);
+
+  --radius-squircle: 22px;
+  --radius-squircle-sm: 16px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  color: var(--text-primary);
+  background: var(--canvas);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.3s ease;
+}
+
+::selection {
+  background: color-mix(in oklab, var(--accent-blue) 30%, transparent);
+}
+
+/* thin, unobtrusive scrollbars to match the macOS chrome feel */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--text-tertiary) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--hairline);
+  border-radius: 999px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* Printable invoice: isolate it as the only visible content, paper-white regardless of theme.
+   NOTE: .invoice-print sits inside the Modal's backdrop/box wrappers, so those wrappers must
+   only ever be hidden with `visibility`, never `display: none` — a `display: none` ancestor
+   removes its descendants from print entirely, no matter what visibility/display the invoice
+   itself requests. `transform: none` is forced globally because framer-motion leaves an inline
+   `transform` on animated elements, and any transformed ancestor creates a new containing block
+   that would re-trap the fixed-position invoice inside the modal's cropped box. */
+@media print {
+  body * {
+    visibility: hidden;
+    transform: none !important;
+  }
+  .invoice-print,
+  .invoice-print * {
+    visibility: visible;
+  }
+  .invoice-print {
+    position: fixed;
+    inset: 0;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: auto;
+    max-height: none !important;
+    overflow: visible !important;
+    background: #ffffff !important;
+    color: #1d1d1f !important;
+    box-shadow: none !important;
+    border: none !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+}
