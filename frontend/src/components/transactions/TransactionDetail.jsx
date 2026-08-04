@@ -23,6 +23,7 @@ export function TransactionDetail({
   partyName,
   items,
   productKey,
+  totalProfit,
 }) {
   const { formatAmount } = useCurrency()
   const { products } = useAllProducts(open)
@@ -44,6 +45,7 @@ export function TransactionDetail({
       quantity: item.quantity,
       unitMultiplier: item.unit_multiplier,
       unitPrice: item.unit_price,
+      profit: item.profit,
     }
   })
   const total = rows.reduce((sum, row) => sum + row.quantity * row.unitMultiplier * row.unitPrice, 0)
@@ -81,6 +83,11 @@ export function TransactionDetail({
                   {row.unitMultiplier > 1 ? ` × ${row.unitMultiplier}` : ''} @{' '}
                   {formatAmount(row.unitPrice, exchangeRate)}
                 </p>
+                {documentType === 'Order' && (
+                  <p className="text-[11px] text-accent-green tabular-nums">
+                    Profit: {formatAmount(row.profit ?? 0, exchangeRate)}
+                  </p>
+                )}
               </div>
               <span className="shrink-0 text-[13px] font-medium text-text-primary tabular-nums">
                 {formatAmount(row.quantity * row.unitMultiplier * row.unitPrice, exchangeRate)}
@@ -93,6 +100,15 @@ export function TransactionDetail({
           <span className="text-text-secondary">Total</span>
           <span className="font-semibold text-text-primary tabular-nums">{formatAmount(total, exchangeRate)}</span>
         </div>
+
+        {documentType === 'Order' && (
+          <div className="flex items-center justify-between rounded-xl bg-canvas-2 px-3 py-2 text-[13px]">
+            <span className="text-text-secondary">Total Profit</span>
+            <span className="font-semibold text-accent-green tabular-nums">
+              {formatAmount(totalProfit ?? 0, exchangeRate)}
+            </span>
+          </div>
+        )}
       </div>
     </SlideOver>
   )

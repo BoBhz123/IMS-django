@@ -243,6 +243,7 @@ export function Orders() {
           partyName={detailOrder.customer}
           items={detailOrder.items}
           productKey="id"
+          totalProfit={detailOrder.total_profit}
         />
       )}
 
