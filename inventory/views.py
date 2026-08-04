@@ -154,6 +154,12 @@ class AnalyticsView(APIView):
      
      
      
+def _csv_safe(value):
+    if isinstance(value, str) and value.startswith(('=', '+', '-', '@', '\t', '\r')):
+        return "'" + value
+    return value
+
+
 class ExportProductsCSVView(APIView):
     permission_classes = [IsAdminUser]
 
@@ -193,9 +199,9 @@ class ExportProductsCSVView(APIView):
 
         for product in products:
             writer.writerow([
-                product.name,
-                product.category.name if product.category else 'Uncategorized',
-                product.supplier.name if product.supplier else 'No Supplier',
+                _csv_safe(product.name),
+                _csv_safe(product.category.name if product.category else 'Uncategorized'),
+                _csv_safe(product.supplier.name if product.supplier else 'No Supplier'),
                 product.stock_quantity,
                 f"${product.cost_price:.2f}",
                 f"${product.default_sell_price:.2f}",
