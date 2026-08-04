@@ -17,6 +17,7 @@ import { useCurrency } from '@/context/CurrencyContext'
 import { GlassCard } from '@/components/ui/GlassCard'
 import { StockBadge } from '@/components/ui/StockBadge'
 import { ProductForm } from '@/components/forms/ProductForm'
+import { ExportButton } from '@/components/ui/ExportButton'
 
 export function Products() {
   const [searchInput, setSearchInput] = useState('')
@@ -128,6 +129,13 @@ export function Products() {
     setFormOpen(true)
   }
 
+  const exportParams = {}
+  if (search) exportParams.search = search
+  if (category !== 'all') exportParams.category_id = category
+  if (supplier !== 'all') exportParams.supplier_id = supplier
+  if (minPrice) exportParams.default_sell_price__gt = minPrice
+  if (maxPrice) exportParams.default_sell_price__lt = maxPrice
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center gap-2">
@@ -149,6 +157,7 @@ export function Products() {
             onClear={clearFilters}
           />
         </div>
+        <ExportButton url="/inventory/products/export/csv/" params={exportParams} filename="products.csv" />
         <button
           type="button"
           onClick={openAdd}
