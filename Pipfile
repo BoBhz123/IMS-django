@@ -21,6 +21,7 @@ boto3 = "*"
 djoser = "*"
 pillow = "*"
 faker = "*"
+whitenoise = "*"
 
 [dev-packages]
 

@@ -9,3 +9,6 @@ db.sqlite3
 # IDE and Editor folders
 .vscode/
 .env
+
+# Django collectstatic output — regenerated on every deploy (DISABLE_COLLECTSTATIC unset)
+/staticfiles/

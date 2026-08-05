@@ -86,6 +86,7 @@ MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'debug_toolbar.middleware.DebugToolbarMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -229,6 +230,13 @@ SECURE_SSL_REDIRECT = not DEBUG
 
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+# Serves the built React app's JS/CSS at the root-relative paths Vite already emits
+# them at (e.g. /assets/index-XXXX.js), separately from STATIC_URL-prefixed Django
+# static files (admin CSS, etc.) — see ims/views.py::spa_index for index.html itself.
+WHITENOISE_ROOT = BASE_DIR / 'frontend' / 'dist'
+
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
@@ -243,7 +251,7 @@ STORAGES = {
         'BACKEND': 'django_tenants.files.storage.TenantFileSystemStorage',
     },
     'staticfiles': {
-        'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage',
+        'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
     },
 }
 
