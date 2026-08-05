@@ -11,6 +11,7 @@ djangorestframework = "*"
 drf-nested-routers = "*"
 django-filter = "*"
 django-cors-headers = "*"
+django-axes = "*"
 
 [dev-packages]
 faker = "*"

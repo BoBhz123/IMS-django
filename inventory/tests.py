@@ -81,3 +81,26 @@ class JWTPersistenceAndRevocationTests(TestCase):
 
         retry = self.client.post("/auth/jwt/refresh/", {"refresh": str(refresh)})
         self.assertEqual(retry.status_code, 401)
+
+
+class BruteForceLockoutTests(TestCase):
+    def setUp(self):
+        User.objects.create_user(username="lockouttarget", password="correct-horse-battery")
+        self.client = APIClient()
+
+    def test_repeated_failed_logins_lock_out_even_correct_credentials(self):
+        from django.conf import settings as dj_settings
+
+        for _ in range(dj_settings.AXES_FAILURE_LIMIT):
+            response = self.client.post(
+                "/auth/jwt/create/",
+                {"username": "lockouttarget", "password": "wrong-password"},
+            )
+            self.assertNotEqual(response.status_code, 200)
+
+        # One more attempt, this time with the CORRECT password — axes should still block it.
+        locked_out = self.client.post(
+            "/auth/jwt/create/",
+            {"username": "lockouttarget", "password": "correct-horse-battery"},
+        )
+        self.assertNotEqual(locked_out.status_code, 200)
