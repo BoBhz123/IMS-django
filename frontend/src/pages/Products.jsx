@@ -345,6 +345,7 @@ function Thumbnail({ product }) {
         alt={product.name}
         className="h-10 w-10 shrink-0 rounded-xl border border-hairline object-cover"
         loading="lazy"
+        decoding="async"
       />
     )
   }

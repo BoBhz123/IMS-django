@@ -1,5 +1,5 @@
 import random
-import re
+import urllib.parse
 import urllib.request
 from datetime import timedelta
 from decimal import Decimal
@@ -212,19 +212,25 @@ class Command(BaseCommand):
 
     def _placeholder_image(self, label):
         """
-        Fetches a real photo from Picsum (a dedicated placeholder-image CDN) seeded by
-        the product name, so the same product gets the same photo across reseeds. Falls
-        back to a generated colored square if the network call fails — Unsplash's old
-        keyword-based "Source" API (source.unsplash.com) is shut down (confirmed 503),
-        and hand-picking specific Unsplash photo IDs isn't verifiable at this scale, so
-        this uses a service actually designed for exactly this use case.
+        Direct, single-request CDN placeholder (placehold.co) — no redirect hop and a
+        tiny (~2-5KB) webp payload, sized/compressed at the source. Tried two
+        photo-CDN alternatives first and both had real problems for a script that
+        fetches ~100 images per run: Picsum always 302-redirects to its fastly.
+        subdomain regardless of URL pattern (verified against both its /seed/ and /id/
+        forms), and Unsplash's real CDN (images.unsplash.com), while redirect-free, took
+        10s+ on a first request for a given size/format variant (cold cache) — fine for
+        one image, not for a batch. Falls back to a generated colored square if the
+        network call fails.
         """
-        seed = re.sub(r'[^a-z0-9]+', '-', label.lower()).strip('-')
-        url = f"https://picsum.photos/seed/{seed}/600/600"
+        color = random.choice(PLACEHOLDER_COLORS)
+        hex_color = "%02x%02x%02x" % color
+        initials = "".join(word[0] for word in label.split()[:2]).upper()
+        text = urllib.parse.quote(initials)
+        url = f"https://placehold.co/400x400/{hex_color}/ffffff.webp?text={text}&font=roboto"
         try:
             with urllib.request.urlopen(url, timeout=10) as response:
                 content = response.read()
-            return ContentFile(content, name=f"{label.lower().replace(' ', '_')}.jpg")
+            return ContentFile(content, name=f"{label.lower().replace(' ', '_')}.webp")
         except (URLError, OSError):
             return self._generated_placeholder_image(label)
 

@@ -16,6 +16,7 @@ export function ProductThumbnail({ image, name, size = 'sm' }) {
         alt={name ?? ''}
         className={`${sizeClass} shrink-0 rounded-lg border border-hairline object-cover`}
         loading="lazy"
+        decoding="async"
       />
     )
   }
