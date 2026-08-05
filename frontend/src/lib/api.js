@@ -1,9 +1,23 @@
 import axios from 'axios'
 import { toast } from './toast'
 
-// Falls back to whatever host the page was loaded from (port 8000) so the API is reachable
-// from other LAN devices (e.g. a phone hitting the Vite dev server's network URL), not just localhost.
-const baseURL = import.meta.env.VITE_API_BASE_URL || `${window.location.protocol}//${window.location.hostname}:8000`
+// No VITE_API_BASE_URL override -> derive it from wherever the page was actually loaded
+// from, not a value baked into the JS bundle at build time. This matters a lot in the
+// multi-tenant deployment: the SAME built bundle is served from every *.myimsapp.com
+// subdomain (django-tenants resolves the tenant from the request's Host header), so a
+// hardcoded API origin would send every tenant's frontend to the SAME backend schema
+// regardless of which subdomain the browser is actually on — which is exactly the bug
+// this was rewritten to fix (see docs/superpowers/specs, "cross-tenant data leakage").
+//
+// import.meta.env.DEV is true only under `vite dev`, never in a production build: the dev
+// server runs on a different port (5173) than the Django API (8000), so it needs the
+// explicit :8000 suffix; a production build is same-origin (frontend and API served by the
+// same Heroku app/domain), so window.location.origin is already correct as-is.
+const baseURL =
+  import.meta.env.VITE_API_BASE_URL ||
+  (import.meta.env.DEV
+    ? `${window.location.protocol}//${window.location.hostname}:8000`
+    : window.location.origin)
 
 export const api = axios.create({ baseURL })
 
