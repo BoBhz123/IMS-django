@@ -1,8 +1,10 @@
 from django.contrib.auth.models import Permission, User
 from django.db import connection
+from django.test import TestCase
 from django_tenants.test.cases import TenantTestCase
 from django_tenants.test.client import TenantClient
 from django_tenants.utils import tenant_context
+from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from inventory.models import Category, Product
@@ -117,3 +119,134 @@ class TenantIsolationTests(TenantTestCase):
         self.assertEqual(response.status_code, 200)
         names = {p['name'] for p in response.json()['results']}
         self.assertEqual(names, {'Tenant1 Widget A', 'Tenant1 Widget B'})
+
+
+class TenantOnboardingTests(TestCase):
+    """
+    Covers tenants/views.py::TenantOnboardingView. Runs as a plain TestCase (not
+    TenantTestCase) since everything it exercises — Tenant, Domain, auth.User — lives in
+    the shared/public schema; standard TestCase transaction rollback also cleanly undoes
+    the real CREATE SCHEMA DDL a successful onboarding call triggers (Postgres DDL is
+    transactional).
+    """
+
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            username='onboard-admin', password='pw12345!', is_staff=True, is_superuser=True
+        )
+        self.admin_auth = f'JWT {RefreshToken.for_user(self.admin).access_token}'
+
+        self.nonadmin = User.objects.create_user(username='onboard-nonadmin', password='pw12345!')
+        self.nonadmin_auth = f'JWT {RefreshToken.for_user(self.nonadmin).access_token}'
+
+        self.client = APIClient()
+
+    def test_admin_can_onboard_a_new_tenant(self):
+        response = self.client.post(
+            '/tenants/onboard/',
+            {'schema_name': 'acme_co'},
+            HTTP_AUTHORIZATION=self.admin_auth,
+        )
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body['schema_name'], 'acme_co')
+        self.assertEqual(body['domain'], 'acme_co.myimsapp.com')
+        self.assertFalse(body['reachable'])
+
+        tenant = Tenant.objects.get(schema_name='acme_co')
+        domain = Domain.objects.get(tenant=tenant)
+        self.assertEqual(domain.domain, 'acme_co.myimsapp.com')
+        self.assertTrue(domain.is_primary)
+
+    def test_rejects_unauthenticated_request(self):
+        response = self.client.post('/tenants/onboard/', {'schema_name': 'no_auth'})
+        self.assertEqual(response.status_code, 401)
+        self.assertFalse(Tenant.objects.filter(schema_name='no_auth').exists())
+
+    def test_rejects_non_admin_user(self):
+        response = self.client.post(
+            '/tenants/onboard/',
+            {'schema_name': 'blocked_co'},
+            HTTP_AUTHORIZATION=self.nonadmin_auth,
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(Tenant.objects.filter(schema_name='blocked_co').exists())
+
+    def test_rejects_when_not_on_public_schema(self):
+        # TenantMainMiddleware resolves the schema fresh from each request's Host header —
+        # setting connection.schema_name manually beforehand doesn't survive the middleware
+        # re-resolving it, so this needs a real Domain + matching Host header, same as
+        # TenantIsolationTests' use of TenantClient elsewhere in this file.
+        other = Tenant(schema_name='some_other_tenant')
+        other.save(verbosity=0)
+        Domain.objects.create(
+            tenant=other, domain='some-other-tenant.test.com', is_primary=True
+        )
+        try:
+            response = self.client.post(
+                '/tenants/onboard/',
+                {'schema_name': 'should_be_blocked'},
+                HTTP_AUTHORIZATION=self.admin_auth,
+                HTTP_HOST='some-other-tenant.test.com',
+            )
+        finally:
+            connection.set_schema_to_public()
+            other.delete(force_drop=True)
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(Tenant.objects.filter(schema_name='should_be_blocked').exists())
+
+    def test_rejects_injection_attempt_in_schema_name(self):
+        response = self.client.post(
+            '/tenants/onboard/',
+            {'schema_name': 'foo"; DROP SCHEMA public CASCADE; --'},
+            HTTP_AUTHORIZATION=self.admin_auth,
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_rejects_uppercase_and_special_characters(self):
+        response = self.client.post(
+            '/tenants/onboard/',
+            {'schema_name': 'Acme-Co!'},
+            HTTP_AUTHORIZATION=self.admin_auth,
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_rejects_reserved_schema_name(self):
+        response = self.client.post(
+            '/tenants/onboard/',
+            {'schema_name': 'public'},
+            HTTP_AUTHORIZATION=self.admin_auth,
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_rejects_duplicate_schema_name(self):
+        existing = Tenant(schema_name='dupe_co')
+        existing.save(verbosity=0)
+        try:
+            response = self.client.post(
+                '/tenants/onboard/',
+                {'schema_name': 'dupe_co'},
+                HTTP_AUTHORIZATION=self.admin_auth,
+            )
+        finally:
+            existing.delete(force_drop=True)
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_rejects_domain_collision_even_with_different_schema_name(self):
+        other = Tenant(schema_name='other_owner')
+        other.save(verbosity=0)
+        Domain.objects.create(domain='taken_co.myimsapp.com', tenant=other, is_primary=True)
+        try:
+            response = self.client.post(
+                '/tenants/onboard/',
+                {'schema_name': 'taken_co'},
+                HTTP_AUTHORIZATION=self.admin_auth,
+            )
+        finally:
+            other.delete(force_drop=True)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(Tenant.objects.filter(schema_name='taken_co').exists())

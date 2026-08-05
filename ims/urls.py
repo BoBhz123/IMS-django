@@ -9,6 +9,7 @@ from .views import spa_index
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('inventory/', include('inventory.urls')),
+    path('tenants/', include('tenants.urls')),
 
     # Djoser Authentication Endpoints
     path('auth/', include('djoser.urls')),

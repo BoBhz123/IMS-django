@@ -88,6 +88,11 @@ TENANT_DOMAIN_MODEL = 'tenants.Domain'
 
 DATABASE_ROUTERS = ('django_tenants.routers.TenantSyncRouter',)
 
+# Base domain new tenants are provisioned under (see tenants/views.py::TenantOnboardingView),
+# i.e. a tenant with schema_name "company" gets domain "company.myimsapp.com". Override via
+# env var for other deployments; this app's only real production domain is myimsapp.com.
+TENANT_BASE_DOMAIN = os.environ.get('TENANT_BASE_DOMAIN', 'myimsapp.com')
+
 AUTHENTICATION_BACKENDS = [
     'axes.backends.AxesStandaloneBackend',
     'django.contrib.auth.backends.ModelBackend',
