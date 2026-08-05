@@ -20,9 +20,9 @@ django-storages = "*"
 boto3 = "*"
 djoser = "*"
 pillow = "*"
+faker = "*"
 
 [dev-packages]
-faker = "*"
 
 [requires]
 python_version = "3.14"

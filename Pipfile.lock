@@ -1,7 +1,7 @@
 {
     "_meta": {
         "hash": {
-            "sha256": "b2b6d30a4d93201dfe656be11778d369021611d1f381dc8989e26a4cd652b560"
+            "sha256": "342a5bbc2f6f9596f34fa82dd62d29a11422c9a313d3ed86a37c13f018b58a6b"
         },
         "pipfile-spec": 6,
         "requires": {
@@ -422,6 +422,15 @@
             "markers": "python_version >= '3.10'",
             "version": "==0.95.3"
         },
+        "faker": {
+            "hashes": [
+                "sha256:754048c76c03afa7de83eee8f4bcee3cf668cbb7d995f54a4e9678db7f110308",
+                "sha256:82b9497d9cfe017048075bcf969298a74b1b6e39f5e4dad1211085d1133f7b62"
+            ],
+            "index": "pypi",
+            "markers": "python_version >= '3.10'",
+            "version": "==40.36.0"
+        },
         "gunicorn": {
             "hashes": [
                 "sha256:40233d26a5f0d1872916188c276e21641155111c2853f0c2cd55260aec0d24fc",
@@ -730,15 +739,5 @@
             "version": "==2.7.0"
         }
     },
-    "develop": {
-        "faker": {
-            "hashes": [
-                "sha256:754048c76c03afa7de83eee8f4bcee3cf668cbb7d995f54a4e9678db7f110308",
-                "sha256:82b9497d9cfe017048075bcf969298a74b1b6e39f5e4dad1211085d1133f7b62"
-            ],
-            "index": "pypi",
-            "markers": "python_version >= '3.10'",
-            "version": "==40.36.0"
-        }
-    }
+    "develop": {}
 }
