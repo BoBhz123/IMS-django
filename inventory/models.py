@@ -27,8 +27,13 @@ class Product(models.Model):
    
     name = models.CharField(max_length=255,unique=True,null=False)
     description = models.TextField(null=True,blank=True)
-    cost_price = models.DecimalField(max_digits=7,decimal_places=2,null=False,validators=[MinValueValidator(0)])
-    default_sell_price = models.DecimalField(max_digits=7,decimal_places=2,null=False,validators=[MinValueValidator(0)])
+    # Strict per-unit prices in USD — independent of stock_quantity. Purchase/Order line items carry
+    # their own unit_price captured at transaction time; they don't read these live, so changing a
+    # product's price here never rewrites historical transactions.
+    cost_price = models.DecimalField(max_digits=7,decimal_places=2,null=False,validators=[MinValueValidator(0)],
+                                      help_text="Cost of a single unit, independent of stock_quantity.")
+    default_sell_price = models.DecimalField(max_digits=7,decimal_places=2,null=False,validators=[MinValueValidator(0)],
+                                      help_text="Sell price of a single unit, independent of stock_quantity.")
     @property
     def profit(self):
         return self.default_sell_price - self.cost_price

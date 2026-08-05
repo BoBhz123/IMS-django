@@ -1,9 +1,11 @@
 from django.shortcuts import render
-from django.db.models import Prefetch,F,Q
+from django.db.models import Prefetch,F,Q,DateField
 from django.db.models.aggregates import Sum
+from django.db.models.functions import TruncDate,TruncWeek,TruncMonth,TruncYear
 from django.http import HttpResponse
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter,OrderingFilter
+from rest_framework.parsers import MultiPartParser,FormParser
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
@@ -12,13 +14,15 @@ from .filters import ProductFilter,PurchaseFilter,OrderFilter
 from .pagination import DefaultPagination
 from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order
 from .serializers import *
-from datetime import date
+from datetime import date, timedelta
+from django.utils import timezone
 from rest_framework.permissions import IsAdminUser
 import csv
 
 
 class ProductImageViewSet(ModelViewSet):
     serializer_class = ProductImageSerializer
+    parser_classes = [MultiPartParser, FormParser]
 
     def get_serializer_context(self):
         return {'product_id': self.kwargs['product_pk']}
@@ -102,56 +106,118 @@ class OrderViewSet(ModelViewSet):
     
     
     
+GROUP_BY_TRUNC = {
+    'day': TruncDate,
+    'week': TruncWeek,
+    'month': TruncMonth,
+    'year': TruncYear,
+}
+
+# 'all_time' is intentionally absent: it means "no date filtering", the existing default behavior.
+PERIOD_WINDOW_DAYS = {
+    'last_month': 30,
+    'last_year': 365,
+}
+
+
 class AnalyticsView(APIView):
     permission_classes = [IsAdminUser]
 
-    def get(self,request):
-         purchases = Purchase.objects.all()
-         orders = Order.objects.all()
-         products = OrderItem.objects.all()
-         
-         year = request.query_params.get('year')
-         month = request.query_params.get('month')
+    def get(self, request):
+        purchases = Purchase.objects.all()
+        orders = Order.objects.all()
+        products = OrderItem.objects.all()
 
-         if year:
+        year = request.query_params.get('year')
+        month = request.query_params.get('month')
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        group_by = request.query_params.get('group_by')
+        period = request.query_params.get('period')
+
+        if period in PERIOD_WINDOW_DAYS:
+            cutoff = timezone.now() - timedelta(days=PERIOD_WINDOW_DAYS[period])
+            orders = orders.filter(placed_at__gte=cutoff)
+            purchases = purchases.filter(placed_at__gte=cutoff)
+            products = products.filter(order__placed_at__gte=cutoff)
+
+        if year:
             orders = orders.filter(placed_at__year=year)
             purchases = purchases.filter(placed_at__year=year)
             products = products.filter(order__placed_at__year=year)
-        
-         if month:
-                 orders = orders.filter(placed_at__month=month)
-                 purchases = purchases.filter(placed_at__month=month)         
-                 products = products.filter(order__placed_at__month=month)   
-         
-         
-         revenue_query = orders.aggregate(
-             total_revenue=Sum(F('items__quantity') * F('items__unit_price') * F('items__unit_multiplier'))
-         )
-         cost_query = purchases.aggregate(
-             total_cost=Sum(F('items__quantity') * F('items__unit_price') * F('items__unit_multiplier'))
-         )
-         
-         best_seller_query = products.values('product__name').annotate(
+
+        if month:
+            orders = orders.filter(placed_at__month=month)
+            purchases = purchases.filter(placed_at__month=month)
+            products = products.filter(order__placed_at__month=month)
+
+        if start_date:
+            orders = orders.filter(placed_at__date__gte=start_date)
+            purchases = purchases.filter(placed_at__date__gte=start_date)
+            products = products.filter(order__placed_at__date__gte=start_date)
+
+        if end_date:
+            orders = orders.filter(placed_at__date__lte=end_date)
+            purchases = purchases.filter(placed_at__date__lte=end_date)
+            products = products.filter(order__placed_at__date__lte=end_date)
+
+        revenue_query = orders.aggregate(
+            total_revenue=Sum(F('items__quantity') * F('items__unit_price') * F('items__unit_multiplier'))
+        )
+        cost_query = purchases.aggregate(
+            total_cost=Sum(F('items__quantity') * F('items__unit_price') * F('items__unit_multiplier'))
+        )
+
+        best_seller_query = products.values('product__name').annotate(
             total_sold=Sum(F('quantity') * F('unit_multiplier'))
         ).order_by('-total_sold')[:5]
-         
-         
-         raw_revenue = revenue_query['total_revenue'] or 0
-         raw_cost = cost_query['total_cost'] or 0
 
-         raw_profit = raw_revenue - raw_cost
+        raw_revenue = revenue_query['total_revenue'] or 0
+        raw_cost = cost_query['total_cost'] or 0
 
-         
-         data = {
-             "total_revenue": f"${raw_revenue:,.2f}", 
-             "total_costs": f"${raw_cost:,.2f}",
-             "net_profit": f"${raw_profit:,.2f}",
-             "top_products": best_seller_query  
+        raw_profit = raw_revenue - raw_cost
 
-         }
+        data = {
+            "total_revenue": f"${raw_revenue:,.2f}",
+            "total_costs": f"${raw_cost:,.2f}",
+            "net_profit": f"${raw_profit:,.2f}",
+            "top_products": best_seller_query,
+        }
 
-         return Response(data)
-     
+        if group_by in GROUP_BY_TRUNC:
+            data["series"] = self._build_series(orders, purchases, GROUP_BY_TRUNC[group_by])
+
+        return Response(data)
+
+    def _build_series(self, orders, purchases, trunc):
+        revenue_rows = (
+            orders
+            .annotate(period=trunc('placed_at', output_field=DateField()))
+            .values('period')
+            .annotate(total=Sum(F('items__quantity') * F('items__unit_price') * F('items__unit_multiplier')))
+        )
+        cost_rows = (
+            purchases
+            .annotate(period=trunc('placed_at', output_field=DateField()))
+            .values('period')
+            .annotate(total=Sum(F('items__quantity') * F('items__unit_price') * F('items__unit_multiplier')))
+        )
+
+        revenue_by_period = {row['period']: row['total'] or 0 for row in revenue_rows if row['period']}
+        cost_by_period = {row['period']: row['total'] or 0 for row in cost_rows if row['period']}
+
+        periods = sorted(set(revenue_by_period) | set(cost_by_period))
+
+        return [
+            {
+                "period": period.isoformat(),
+                "total_revenue": revenue_by_period.get(period, 0),
+                "total_costs": cost_by_period.get(period, 0),
+            }
+            for period in periods
+        ]
+
+
      
      
 def _csv_safe(value):
@@ -228,8 +294,9 @@ class ExportOrdersCSVView(APIView):
             'Quantity', 
             'Unit Multiplier', 
             'Sell Price (USD)', 
-            'Cost Price (USD)', 
-            'Line Total (USD)'
+            'Cost Price (USD)',
+            'Line Total (USD)',
+            'Total Profit (USD)'
         ])
 
         items = OrderItem.objects.select_related('order', 'order__customer', 'product').all()
@@ -263,7 +330,8 @@ class ExportOrdersCSVView(APIView):
                 item.unit_multiplier,
                 f"${item.unit_price:.2f}",
                 f"${cost_price:.2f}",
-                f"${line_total:.2f}"
+                f"${line_total:.2f}",
+                f"${item.order.total_profit:.2f}"
             ])
             
         return response
