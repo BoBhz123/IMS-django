@@ -127,6 +127,35 @@ body {
   background: color-mix(in oklab, var(--accent-blue) 30%, transparent);
 }
 
+input,
+select,
+textarea {
+  font-size: 16px; /* iOS Safari auto-zooms focused inputs below 16px */
+}
+
+button,
+a,
+input,
+select {
+  -webkit-tap-highlight-color: transparent;
+}
+
+.touch-target {
+  min-height: 44px;
+  min-width: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.safe-area-top {
+  padding-top: env(safe-area-inset-top);
+}
+
+.safe-area-bottom {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
 /* thin, unobtrusive scrollbars to match the macOS chrome feel */
 * {
   scrollbar-width: thin;

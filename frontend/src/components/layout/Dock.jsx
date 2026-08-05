@@ -75,7 +75,7 @@ export function MobileTabBar() {
 
   return (
     <nav
-      className="fixed inset-x-3 bottom-3 z-20 flex items-center justify-between rounded-2xl border border-glass-border bg-glass-strong px-2 py-2 backdrop-blur-2xl [box-shadow:var(--shadow-dock)] sm:hidden"
+      className="safe-area-bottom fixed inset-x-3 bottom-3 z-20 flex items-center justify-between rounded-2xl border border-glass-border bg-glass-strong px-2 py-2 backdrop-blur-2xl [box-shadow:var(--shadow-dock)] sm:hidden"
       aria-label="Primary"
     >
       {NAV_ITEMS.map((item) => {

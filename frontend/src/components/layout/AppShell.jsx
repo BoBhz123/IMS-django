@@ -7,7 +7,7 @@ export function AppShell() {
   const activeItem = NAV_ITEMS.find((item) => (item.end ? pathname === item.to : pathname.startsWith(item.to)))
 
   return (
-    <div className="relative min-h-screen overflow-hidden bg-canvas print:hidden">
+    <div className="safe-area-top relative min-h-screen overflow-hidden bg-canvas print:hidden">
       <AmbientBackground />
       <Dock />
       <MobileTabBar />
