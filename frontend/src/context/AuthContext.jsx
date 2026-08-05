@@ -43,10 +43,19 @@ export function AuthProvider({ children }) {
     setStatus('authenticated')
   }
 
-  function logout() {
+  async function logout() {
+    const refresh = tokenStore.getRefresh()
     tokenStore.clear()
     setUser(null)
     setStatus('anonymous')
+
+    if (refresh) {
+      try {
+        await api.post('/auth/jwt/blacklist/', { refresh })
+      } catch {
+        // Token may already be expired/rotated — logout has already cleared local state either way.
+      }
+    }
   }
 
   return (
