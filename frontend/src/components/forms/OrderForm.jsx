@@ -2,7 +2,6 @@ import { useState } from 'react'
 import { Loader2, Plus, Trash2 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { DEFAULT_EXCHANGE_RATE, useCurrency } from '@/context/CurrencyContext'
-import { useAllProducts } from '@/hooks/useAllProducts'
 import { SlideOver } from '@/components/ui/SlideOver'
 import { CurrencyInput } from '@/components/ui/CurrencyInput'
 import { ProductPicker } from '@/components/forms/ProductPicker'
@@ -13,7 +12,6 @@ function emptyItem() {
 
 export function OrderForm({ open, onClose, onSaved, customers }) {
   const { formatAmount } = useCurrency()
-  const { products } = useAllProducts(open)
 
   const [customer, setCustomer] = useState('')
   const [exchangeRate, setExchangeRate] = useState(DEFAULT_EXCHANGE_RATE)
@@ -25,8 +23,7 @@ export function OrderForm({ open, onClose, onSaved, customers }) {
     setItems((current) => current.map((item, i) => (i === index ? { ...item, ...patch } : item)))
   }
 
-  function handleProductChange(index, productId) {
-    const product = products.find((p) => String(p.id) === productId)
+  function handleProductChange(index, productId, product) {
     updateItem(index, {
       product: productId,
       unit_price: product ? product.default_sell_price : 0,
@@ -127,9 +124,8 @@ export function OrderForm({ open, onClose, onSaved, customers }) {
             <div key={index} className="rounded-xl border border-hairline p-3">
               <div className="mb-2 flex items-center gap-2">
                 <ProductPicker
-                  products={products}
                   value={item.product}
-                  onChange={(productId) => handleProductChange(index, productId)}
+                  onChange={(productId, product) => handleProductChange(index, productId, product)}
                 />
                 {items.length > 1 && (
                   <button
