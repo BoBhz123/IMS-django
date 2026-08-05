@@ -1,5 +1,7 @@
 import os
 from datetime import timedelta
+
+import dj_database_url
 """
 Django settings for ims project.
 
@@ -126,6 +128,15 @@ DATABASES = {
         'PASSWORD': ''
     }
 }
+
+# Heroku (and any other DATABASE_URL-based host) sets DATABASE_URL — parse it if present,
+# forcing the tenant-aware engine (dj_database_url would otherwise default to plain
+# django.db.backends.postgresql, which breaks schema routing entirely). Local dev has no
+# DATABASE_URL, so config() returns {} and the DATABASES['default'] block above is unchanged.
+_database_url_config = dj_database_url.config(engine='django_tenants.postgresql_backend')
+if _database_url_config:
+    DATABASES['default'] = _database_url_config
+
 CORS_ALLOW_ALL_ORIGINS = True
 
 # Explicit allowlist, kept alongside the wildcard above for when CORS_ALLOW_ALL_ORIGINS
@@ -235,6 +246,23 @@ STORAGES = {
         'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage',
     },
 }
+
+# Cloudflare R2 / AWS S3 (both speak the S3 API — set AWS_S3_ENDPOINT_URL for R2, leave
+# unset for real AWS S3) for production media, still namespaced per tenant — see
+# ims.storage.TenantS3Storage. Sourced entirely from env vars: nothing here is a real
+# credential. Only takes effect when AWS_STORAGE_BUCKET_NAME is actually set (Heroku config
+# vars); local dev has none of these set, so STORAGES['default'] above is left as-is.
+AWS_STORAGE_BUCKET_NAME = os.environ.get('AWS_STORAGE_BUCKET_NAME')
+AWS_ACCESS_KEY_ID = os.environ.get('AWS_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = os.environ.get('AWS_SECRET_ACCESS_KEY')
+AWS_S3_ENDPOINT_URL = os.environ.get('AWS_S3_ENDPOINT_URL')  # set for R2; omit for AWS S3
+AWS_S3_REGION_NAME = os.environ.get('AWS_S3_REGION_NAME', 'auto')  # R2 has no real regions
+AWS_S3_ADDRESSING_STYLE = 'virtual'
+AWS_DEFAULT_ACL = None  # R2 doesn't support canned ACLs the way S3 does
+AWS_QUERYSTRING_AUTH = False  # serve plain URLs, not presigned ones
+
+if AWS_STORAGE_BUCKET_NAME:
+    STORAGES['default']['BACKEND'] = 'ims.storage.TenantS3Storage'
 
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = 'localhost'

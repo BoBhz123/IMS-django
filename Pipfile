@@ -13,6 +13,10 @@ django-cors-headers = "*"
 django-axes = "*"
 django-tenants = "*"
 psycopg2-binary = "*"
+gunicorn = "*"
+dj-database-url = "*"
+django-storages = "*"
+boto3 = "*"
 
 [dev-packages]
 faker = "*"
