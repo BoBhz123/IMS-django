@@ -19,6 +19,7 @@ dj-database-url = "*"
 django-storages = "*"
 boto3 = "*"
 djoser = "*"
+pillow = "*"
 
 [dev-packages]
 faker = "*"
