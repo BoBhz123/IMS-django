@@ -221,6 +221,21 @@ STATIC_URL = 'static/'
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
+# Namespaces every uploaded file (e.g. ProductImage) under media/<tenant_schema_name>/...
+# instead of a single shared media/ tree, so tenants can never see each other's uploads —
+# matching the schema-level isolation `inventory` already has. "%s" is where django-tenants
+# inserts the active tenant's schema_name (see django_tenants.utils.parse_tenant_config_path).
+MULTITENANT_RELATIVE_MEDIA_ROOT = '%s'
+
+STORAGES = {
+    'default': {
+        'BACKEND': 'django_tenants.files.storage.TenantFileSystemStorage',
+    },
+    'staticfiles': {
+        'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage',
+    },
+}
+
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = 'localhost'
 EMAIL_PORT = 25  # Matches the smtp4dev container port mapping
