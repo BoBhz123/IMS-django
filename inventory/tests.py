@@ -1,12 +1,21 @@
 from django.contrib.auth.models import Permission, User
 from django.test import TestCase
+from django_tenants.test.cases import TenantTestCase
+from django_tenants.test.client import TenantClient
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from inventory.models import Category, Product
 
 
-class ProductSearchTests(TestCase):
+class ProductSearchTests(TenantTestCase):
+    """
+    `inventory` is a TENANT_APPS model (see ims/settings.py) — its tables only exist
+    inside a tenant's own PostgreSQL schema, not in `public`. So this uses
+    TenantTestCase/TenantClient rather than a plain TestCase/APIClient, which would
+    hit a schema with no `inventory_product` table at all.
+    """
+
     def setUp(self):
         category = Category.objects.create(name="Widgets")
         Product.objects.create(
@@ -27,38 +36,46 @@ class ProductSearchTests(TestCase):
         self.user = User.objects.create_user(username="viewer", password="pw12345!")
         self.user.user_permissions.add(Permission.objects.get(codename="view_product"))
 
-        self.client = APIClient()
-        self.client.force_authenticate(user=self.user)
+        self.client = TenantClient(self.tenant)
+        self.auth_header = f"JWT {RefreshToken.for_user(self.user).access_token}"
 
     def test_search_matches_name_case_insensitively(self):
-        response = self.client.get("/inventory/products/", {"search": "blue"})
+        response = self.client.get(
+            "/inventory/products/", {"search": "blue"}, HTTP_AUTHORIZATION=self.auth_header
+        )
         self.assertEqual(response.status_code, 200)
-        names = [p["name"] for p in response.data["results"]]
+        names = [p["name"] for p in response.json()["results"]]
         self.assertEqual(names, ["Blue Widget"])
 
     def test_search_matches_description(self):
-        response = self.client.get("/inventory/products/", {"search": "gadget that is red"})
+        response = self.client.get(
+            "/inventory/products/",
+            {"search": "gadget that is red"},
+            HTTP_AUTHORIZATION=self.auth_header,
+        )
         self.assertEqual(response.status_code, 200)
-        names = [p["name"] for p in response.data["results"]]
+        names = [p["name"] for p in response.json()["results"]]
         self.assertEqual(names, ["Red Gadget"])
 
     def test_search_term_with_sql_wildcards_is_treated_literally(self):
         # icontains escapes %/_ automatically — this must not match everything.
-        response = self.client.get("/inventory/products/", {"search": "%"})
+        response = self.client.get(
+            "/inventory/products/", {"search": "%"}, HTTP_AUTHORIZATION=self.auth_header
+        )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["results"], [])
+        self.assertEqual(response.json()["results"], [])
 
     def test_search_requires_view_permission(self):
         unprivileged = User.objects.create_user(username="nobody", password="pw12345!")
-        client = APIClient()
-        client.force_authenticate(user=unprivileged)
+        auth_header = f"JWT {RefreshToken.for_user(unprivileged).access_token}"
 
-        response = client.get("/inventory/products/", {"search": "blue"})
+        response = self.client.get(
+            "/inventory/products/", {"search": "blue"}, HTTP_AUTHORIZATION=auth_header
+        )
         self.assertEqual(response.status_code, 403)
 
     def test_search_requires_authentication(self):
-        client = APIClient()
-        response = client.get("/inventory/products/", {"search": "blue"})
+        response = self.client.get("/inventory/products/", {"search": "blue"})
         self.assertEqual(response.status_code, 401)
 
 

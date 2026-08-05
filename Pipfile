@@ -6,12 +6,13 @@ name = "pypi"
 [packages]
 django = "*"
 django-debug-toolbar = "*"
-mysqlclient = "*"
 djangorestframework = "*"
 drf-nested-routers = "*"
 django-filter = "*"
 django-cors-headers = "*"
 django-axes = "*"
+django-tenants = "*"
+psycopg2-binary = "*"
 
 [dev-packages]
 faker = "*"

@@ -32,7 +32,16 @@ ALLOWED_HOSTS = ['*']
 
 # Application definition
 
-INSTALLED_APPS = [
+# Multi-tenancy (django-tenants): apps in SHARED_APPS live only in the public schema
+# (shared login, admin, tenant registry); apps in TENANT_APPS are migrated into every
+# tenant's own PostgreSQL schema, giving each tenant fully isolated data. `inventory`
+# is tenant-scoped — that's the actual per-tenant business data (Products, Orders, ...).
+# `django.contrib.contenttypes` is listed in both, per django-tenants convention, since
+# tenant-schema models may need a local ContentType table.
+SHARED_APPS = [
+    'django_tenants',  # mandatory, must be first
+    'tenants',  # app holding the Tenant/Domain models
+
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -50,9 +59,20 @@ INSTALLED_APPS = [
     #dev apps
     'playground',
     'debug_toolbar',
-    #local apps
-    'inventory'
 ]
+
+TENANT_APPS = [
+    'django.contrib.contenttypes',
+    #local apps
+    'inventory',
+]
+
+INSTALLED_APPS = list(SHARED_APPS) + [app for app in TENANT_APPS if app not in SHARED_APPS]
+
+TENANT_MODEL = 'tenants.Tenant'
+TENANT_DOMAIN_MODEL = 'tenants.Domain'
+
+DATABASE_ROUTERS = ('django_tenants.routers.TenantSyncRouter',)
 
 AUTHENTICATION_BACKENDS = [
     'axes.backends.AxesStandaloneBackend',
@@ -60,6 +80,7 @@ AUTHENTICATION_BACKENDS = [
 ]
 
 MIDDLEWARE = [
+    'django_tenants.middleware.main.TenantMainMiddleware',  # must run first — sets the DB schema for the request
     'corsheaders.middleware.CorsMiddleware',
     'debug_toolbar.middleware.DebugToolbarMiddleware',
     'django.middleware.security.SecurityMiddleware',
@@ -97,11 +118,12 @@ WSGI_APPLICATION = 'ims.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.mysql',
+        'ENGINE': 'django_tenants.postgresql_backend',
         'NAME': 'inventory',
         'HOST': 'localhost',
-        'USER': 'root',
-        'PASSWORD': 'MyPassword'
+        'PORT': '5432',
+        'USER': 'postgres',
+        'PASSWORD': ''
     }
 }
 CORS_ALLOW_ALL_ORIGINS = True
