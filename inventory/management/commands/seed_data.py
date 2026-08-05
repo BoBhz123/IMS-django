@@ -1,7 +1,10 @@
 import random
+import re
+import urllib.request
 from datetime import timedelta
 from decimal import Decimal
 from io import BytesIO
+from urllib.error import URLError
 
 from PIL import Image, ImageDraw
 from django.contrib.auth.models import Permission, User
@@ -208,6 +211,24 @@ class Command(BaseCommand):
         return list(Customer.objects.all())
 
     def _placeholder_image(self, label):
+        """
+        Fetches a real photo from Picsum (a dedicated placeholder-image CDN) seeded by
+        the product name, so the same product gets the same photo across reseeds. Falls
+        back to a generated colored square if the network call fails — Unsplash's old
+        keyword-based "Source" API (source.unsplash.com) is shut down (confirmed 503),
+        and hand-picking specific Unsplash photo IDs isn't verifiable at this scale, so
+        this uses a service actually designed for exactly this use case.
+        """
+        seed = re.sub(r'[^a-z0-9]+', '-', label.lower()).strip('-')
+        url = f"https://picsum.photos/seed/{seed}/600/600"
+        try:
+            with urllib.request.urlopen(url, timeout=10) as response:
+                content = response.read()
+            return ContentFile(content, name=f"{label.lower().replace(' ', '_')}.jpg")
+        except (URLError, OSError):
+            return self._generated_placeholder_image(label)
+
+    def _generated_placeholder_image(self, label):
         color = random.choice(PLACEHOLDER_COLORS)
         img = Image.new("RGB", (400, 400), color=color)
         draw = ImageDraw.Draw(img)

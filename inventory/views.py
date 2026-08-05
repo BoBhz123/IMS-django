@@ -33,7 +33,7 @@ class ProductImageViewSet(ModelViewSet):
 
 
 class ProductViewSet(ModelViewSet):
-   queryset = Product.objects.all()
+   queryset = Product.objects.select_related('category', 'supplier').prefetch_related('images')
    serializer_class = ProductSerializer
    filter_backends = [DjangoFilterBackend,SearchFilter,OrderingFilter]
    filterset_class = ProductFilter
