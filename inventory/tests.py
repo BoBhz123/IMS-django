@@ -1,6 +1,7 @@
 from django.contrib.auth.models import Permission, User
 from django.test import TestCase
 from rest_framework.test import APIClient
+from rest_framework_simplejwt.tokens import RefreshToken
 
 from inventory.models import Category, Product
 
@@ -59,3 +60,24 @@ class ProductSearchTests(TestCase):
         client = APIClient()
         response = client.get("/inventory/products/", {"search": "blue"})
         self.assertEqual(response.status_code, 401)
+
+
+class JWTPersistenceAndRevocationTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="jwtuser", password="pw12345!")
+        self.client = APIClient()
+
+    def test_refresh_token_lifetime_is_thirty_days(self):
+        from datetime import timedelta
+        from django.conf import settings as dj_settings
+
+        self.assertEqual(dj_settings.SIMPLE_JWT['REFRESH_TOKEN_LIFETIME'], timedelta(days=30))
+
+    def test_blacklisted_refresh_token_cannot_be_reused(self):
+        refresh = RefreshToken.for_user(self.user)
+
+        response = self.client.post("/auth/jwt/blacklist/", {"refresh": str(refresh)})
+        self.assertEqual(response.status_code, 200)
+
+        retry = self.client.post("/auth/jwt/refresh/", {"refresh": str(refresh)})
+        self.assertEqual(retry.status_code, 401)

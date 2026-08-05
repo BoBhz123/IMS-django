@@ -27,7 +27,7 @@ SECRET_KEY = 'django-insecure-(#!tfz4=kuu1d91rlg+5fqn&x!laf#pa53x=!mg$h&_3&-ffc+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = ['*']
 
 
 # Application definition
@@ -42,7 +42,8 @@ INSTALLED_APPS = [
     #third_party-apps
     'django_filters',
     'rest_framework',
-    'rest_framework.authtoken', 
+    'rest_framework.authtoken',
+    'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
     'djoser',
     #dev apps
@@ -150,10 +151,22 @@ REST_FRAMEWORK = {
 }
 
 
-SIMPLE_JWT= {
+SIMPLE_JWT = {
     'AUTH_HEADER_TYPES': ('JWT',),
-    'ACCESS_TOKEN_LIFETIME': timedelta(days=1)
+    'ACCESS_TOKEN_LIFETIME': timedelta(days=1),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=30),
+    'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': True,
 }
+
+# Only affects /admin/ — the React app authenticates via JWT (see SIMPLE_JWT above), not
+# Django sessions. Kept here for admin-site hardening per security review.
+SESSION_COOKIE_AGE = 2592000  # 30 days
+SESSION_EXPIRE_AT_BROWSER_CLOSE = False
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SECURE = not DEBUG
+SESSION_COOKIE_SAMESITE = 'Lax'
+CSRF_COOKIE_SECURE = not DEBUG
 
 
 STATIC_URL = 'static/'
