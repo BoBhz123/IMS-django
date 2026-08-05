@@ -27,9 +27,21 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = 'django-insecure-(#!tfz4=kuu1d91rlg+5fqn&x!laf#pa53x=!mg$h&_3&-ffc+'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# Defaults to True (unchanged local-dev behavior) when DJANGO_DEBUG isn't set; Heroku sets
+# DJANGO_DEBUG=False explicitly. Accepts '0'/'false'/'no' (case-insensitive) as falsy too,
+# not just the literal string 'False', since env vars are always strings.
+DEBUG = os.environ.get('DJANGO_DEBUG', 'True').strip().lower() not in ('false', '0', 'no')
 
-ALLOWED_HOSTS = ['*']
+# Comma-separated list via ALLOWED_HOSTS env var (e.g. "client.myimsapp.com,testlab.myimsapp.com").
+# Falls back to '*' (unchanged local-dev/current-prod behavior) when unset. '.myimsapp.com' as a
+# leading-dot entry matches that domain and all its subdomains, per Django's ALLOWED_HOSTS docs.
+ALLOWED_HOSTS = [h.strip() for h in os.environ.get('ALLOWED_HOSTS', '*').split(',') if h.strip()]
+
+# Heroku terminates TLS at its edge and forwards plain HTTP to the dyno — without this,
+# SECURE_SSL_REDIRECT (further down, active when DEBUG=False) sees every request as
+# insecure and redirects it again, forever. Required for HTTPS detection to work at all
+# behind Heroku's router.
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 
 # Application definition

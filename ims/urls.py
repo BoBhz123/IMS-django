@@ -17,8 +17,14 @@ urlpatterns = [
     path('__debug__/', include('debug_toolbar.urls')),
 ]
 
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+# Deliberately NOT gated on settings.DEBUG (unlike Django's usual recommendation) — this
+# app has no other route serving locally-stored media (no nginx/whitenoise-for-media, and
+# S3/R2 isn't provisioned yet), so gating this on DEBUG would make every real product-image
+# upload 404 outright the moment DEBUG=False is set in production, with no fallback at all.
+# Still not a production-grade solution on its own (Heroku's ephemeral filesystem means
+# locally-stored uploads don't survive a dyno restart/deploy) — see ims/storage.py's
+# TenantS3Storage, which activates automatically once AWS_STORAGE_BUCKET_NAME is set.
+urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
 
 # Serves the built React app for '/' and any other path not matched above (client-side
 # routes like /products — a hard refresh there should still load the SPA, not 404).
