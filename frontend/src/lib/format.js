@@ -30,6 +30,12 @@ export function shortId(id) {
   return id.toString().slice(0, 8).toUpperCase()
 }
 
+/** e.g. invoiceFileName('2026-08-04T10:00:00Z', 'c7bd9f4a-...') -> "Invoice_2026-08-04_C7BD9F4A.pdf" */
+export function invoiceFileName(placedAt, id) {
+  const datePart = new Date(placedAt).toISOString().slice(0, 10)
+  return `Invoice_${datePart}_${shortId(id)}.pdf`
+}
+
 /** The `total_price` property on Order/Purchase ignores unit_multiplier — recompute from line items instead. */
 export function computeItemsTotal(items) {
   return items.reduce((sum, item) => sum + item.quantity * item.unit_multiplier * item.unit_price, 0)

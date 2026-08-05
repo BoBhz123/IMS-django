@@ -107,11 +107,16 @@ export function Orders() {
         setProductCache(nextCache)
       }
 
+      // OrderSerializer.customer is a StringRelatedField (name only) — look up the phone
+      // number from the already-fetched customers list by name (Customer.name is unique).
+      const matchedCustomer = customers.find((c) => c.name === order.customer)
+
       setInvoiceOrder({
         id: order.id,
         placed_at: order.placed_at,
         exchange_rate: order.exchange_rate,
         customer: order.customer,
+        customerPhone: matchedCustomer?.phone_number || null,
         items: order.items.map((item) => ({
           name: nextCache.get(item.product) ?? `Product #${item.product}`,
           quantity: item.quantity,
@@ -230,6 +235,7 @@ export function Orders() {
           exchangeRate={invoiceOrder.exchange_rate}
           partyLabel="Customer"
           partyName={invoiceOrder.customer}
+          partyPhone={invoiceOrder.customerPhone}
           items={invoiceOrder.items}
         />
       )}

@@ -188,6 +188,14 @@ select {
    `transform` on animated elements, and any transformed ancestor creates a new containing block
    that would re-trap the fixed-position invoice inside the modal's cropped box. */
 @media print {
+  /* A4 by default; .invoice-print below sets max-width: 100% alongside its fixed width, so
+     nothing overflows on Letter either — Letter is wider (215.9mm) than A4 (210mm), so
+     content sized to fit A4's width can never overflow it. */
+  @page {
+    size: A4 portrait;
+    margin: 15mm;
+  }
+
   body * {
     visibility: hidden;
     transform: none !important;
@@ -201,7 +209,12 @@ select {
     inset: 0;
     top: 0;
     left: 0;
-    width: 100%;
+    /* 100% here would be 100% of the *screen* viewport on some mobile browsers' print
+       renderers (notably iOS Safari), not the paper — that's what produces the
+       squeezed-to-phone-width or black-bar symptom. An explicit physical width fixes it
+       regardless of the device the print was triggered from. */
+    width: 210mm;
+    max-width: 100%;
     height: auto;
     max-height: none !important;
     overflow: visible !important;
@@ -209,6 +222,15 @@ select {
     color: #1d1d1f !important;
     box-shadow: none !important;
     border: none !important;
+    box-sizing: border-box;
+  }
+  /* Browsers strip background colors from print/PDF output by default (print-color-adjust:
+     economy) to save ink — without this, the invoice's accent header and zebra striping
+     would silently render as plain white. */
+  .invoice-print,
+  .invoice-print * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
   }
   .no-print {
     display: none !important;
