@@ -2,6 +2,25 @@ import os
 from datetime import timedelta
 
 import dj_database_url
+import sentry_sdk
+from sentry_sdk.integrations.django import DjangoIntegration
+
+# Initialized as early as possible (before most other settings/imports run), per Sentry's
+# own recommendation — but still guarded: with no SENTRY_DSN set (local dev, or before
+# it's provisioned in production), this is a no-op rather than an error or dead-weight init.
+SENTRY_DSN = os.environ.get('SENTRY_DSN')
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        integrations=[DjangoIntegration()],
+        # 10% of requests get full performance tracing — a conventional production default,
+        # not "sample everything" (expensive/noisy at scale) or "sample nothing" (no signal).
+        traces_sample_rate=0.1,
+        # Customer/supplier names and phone numbers pass through this app — don't forward
+        # request/user PII to Sentry by default (this is also sentry-sdk's own current
+        # default, but explicit here so it's not silently toggled on later without review).
+        send_default_pii=False,
+    )
 """
 Django settings for ims project.
 
@@ -24,7 +43,15 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-(#!tfz4=kuu1d91rlg+5fqn&x!laf#pa53x=!mg$h&_3&-ffc+'
+# Falls back to the original hardcoded dev key (unchanged local-dev behavior, harmless
+# since it's never exposed anywhere real) when DJANGO_SECRET_KEY isn't set. This key also
+# signs JWTs by default (SIMPLE_JWT has no separate SIGNING_KEY) — rotating it on a live
+# deployment invalidates every existing session and JWT immediately, forcing every current
+# user to log in again. That's a real, disruptive, one-way action: set DJANGO_SECRET_KEY on
+# Heroku deliberately, not as an incidental side effect of an unrelated deploy.
+SECRET_KEY = os.environ.get(
+    'DJANGO_SECRET_KEY', 'django-insecure-(#!tfz4=kuu1d91rlg+5fqn&x!laf#pa53x=!mg$h&_3&-ffc+'
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
 # Defaults to True (unchanged local-dev behavior) when DJANGO_DEBUG isn't set; Heroku sets
@@ -243,6 +270,10 @@ SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = 'DENY'
 SECURE_HSTS_SECONDS = 0 if DEBUG else 31536000
 SECURE_HSTS_INCLUDE_SUBDOMAINS = not DEBUG
+# Only makes the header eligible for HSTS preload submission — does NOT submit the domain
+# anywhere itself. Actually submitting to hstspreload.org is a separate, much harder to
+# reverse decision (can take months to be removed from browsers afterward) left to you.
+SECURE_HSTS_PRELOAD = not DEBUG
 SECURE_SSL_REDIRECT = not DEBUG
 
 
