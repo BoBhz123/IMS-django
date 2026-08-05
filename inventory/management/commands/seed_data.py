@@ -4,10 +4,12 @@ from decimal import Decimal
 from io import BytesIO
 
 from PIL import Image, ImageDraw
+from django.contrib.auth.models import Permission, User
 from django.core.files.base import ContentFile
 from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.utils import timezone
+from django_tenants.utils import tenant_context
 from faker import Faker
 
 from inventory.models import (
@@ -21,6 +23,7 @@ from inventory.models import (
     PurchaseItem,
     Supplier,
 )
+from tenants.models import Domain, Tenant
 
 fake = Faker()
 
@@ -80,6 +83,18 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument(
+            "--tenant", type=str, default=None,
+            help="Tenant schema name to seed into (e.g. tenant1). Created — along with a "
+                 "<schema>.localhost domain — if it doesn't already exist. If omitted, seeds "
+                 "whatever schema is already active (the old, pre-multi-tenancy behavior).",
+        )
+        parser.add_argument(
+            "--superuser", type=str, default="admin",
+            help="Username to confirm/grant explicit inventory permissions for (superusers "
+                 "already bypass permission checks, but this makes access explicit and "
+                 "verifiable). Skipped if the user doesn't exist.",
+        )
+        parser.add_argument(
             "--products", type=int, default=40, help="Number of products to create."
         )
         parser.add_argument(
@@ -96,6 +111,31 @@ class Command(BaseCommand):
         Faker.seed()
         random.seed()
 
+        tenant_name = options["tenant"]
+        if tenant_name:
+            tenant = self._ensure_tenant(tenant_name)
+            with tenant_context(tenant):
+                self._seed_all(options)
+        else:
+            self._seed_all(options)
+
+        self._grant_superuser_access(options["superuser"])
+
+    def _ensure_tenant(self, schema_name):
+        tenant, created = Tenant.objects.get_or_create(
+            schema_name=schema_name, defaults={"name": schema_name.capitalize()}
+        )
+        if created:
+            self.stdout.write(f"Tenant schema created: {schema_name}")
+        domain_name = f"{schema_name}.localhost"
+        domain, created = Domain.objects.get_or_create(
+            domain=domain_name, defaults={"tenant": tenant, "is_primary": True}
+        )
+        if created:
+            self.stdout.write(f"Domain created: {domain_name}")
+        return tenant
+
+    def _seed_all(self, options):
         with transaction.atomic():
             categories = self._seed_categories()
             suppliers = self._seed_suppliers()
@@ -110,6 +150,25 @@ class Command(BaseCommand):
             f"products={Product.objects.count()} purchases={Purchase.objects.count()} "
             f"orders={Order.objects.count()}"
         ))
+
+    def _grant_superuser_access(self, username):
+        # auth.User/Permission are SHARED_APPS (public schema) — access isn't tenant-scoped,
+        # and a real superuser already bypasses permission checks entirely. This just makes
+        # that access explicit and independently verifiable, rather than implicit.
+        try:
+            user = User.objects.get(username=username)
+        except User.DoesNotExist:
+            self.stdout.write(self.style.WARNING(
+                f"Superuser '{username}' not found — skipping permission grant."
+            ))
+            return
+
+        permissions = Permission.objects.filter(content_type__app_label="inventory")
+        user.user_permissions.add(*permissions)
+        self.stdout.write(
+            f"Granted {permissions.count()} inventory permissions to '{username}' "
+            f"(is_superuser={user.is_superuser})"
+        )
 
     def _seed_categories(self):
         categories = {}

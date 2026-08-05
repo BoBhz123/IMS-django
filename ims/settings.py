@@ -128,6 +128,15 @@ DATABASES = {
 }
 CORS_ALLOW_ALL_ORIGINS = True
 
+# Explicit allowlist, kept alongside the wildcard above for when CORS_ALLOW_ALL_ORIGINS
+# is eventually turned off (that flag takes precedence over this list while it's True).
+# Covers the Vite dev server both un-tenanted and via the tenant1 subdomain used for
+# local multi-tenant testing.
+CORS_ALLOWED_ORIGINS = [
+    'http://localhost:5173',
+    'http://tenant1.localhost:5173',
+]
+
 # Password validation
 # https://docs.djangoproject.com/en/6.0/ref/settings/#auth-password-validators
 
