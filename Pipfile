@@ -18,7 +18,6 @@ gunicorn = "*"
 dj-database-url = "*"
 django-storages = "*"
 boto3 = "*"
-djangorestframework-simplejwt = "*"
 
 [dev-packages]
 faker = "*"
