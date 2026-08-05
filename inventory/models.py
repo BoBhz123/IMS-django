@@ -1,6 +1,7 @@
 from django.db import models
 import uuid
 from django.core.validators import MinValueValidator
+from .fields import ExternalOrLocalImageField
 from .validators import validate_file_size
 
 
@@ -51,7 +52,7 @@ class Product(models.Model):
         
 class ProductImage(models.Model):
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='images')
-    image = models.ImageField(upload_to='inventory/images', validators=[validate_file_size])
+    image = ExternalOrLocalImageField(upload_to='inventory/images', validators=[validate_file_size])
     
 class Purchase(models.Model):
     id = models.UUIDField(default=uuid.uuid4,primary_key=True,null=False)

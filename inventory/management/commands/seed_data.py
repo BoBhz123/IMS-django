@@ -1,14 +1,9 @@
 import random
 import urllib.parse
-import urllib.request
 from datetime import timedelta
 from decimal import Decimal
-from io import BytesIO
-from urllib.error import URLError
 
-from PIL import Image, ImageDraw
 from django.contrib.auth.models import Permission, User
-from django.core.files.base import ContentFile
 from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.utils import timezone
@@ -210,39 +205,22 @@ class Command(BaseCommand):
         self.stdout.write(f"Customers ready: {Customer.objects.count()}")
         return list(Customer.objects.all())
 
-    def _placeholder_image(self, label):
+    def _placeholder_image_url(self, label):
         """
-        Direct, single-request CDN placeholder (placehold.co) — no redirect hop and a
-        tiny (~2-5KB) webp payload, sized/compressed at the source. Tried two
-        photo-CDN alternatives first and both had real problems for a script that
-        fetches ~100 images per run: Picsum always 302-redirects to its fastly.
-        subdomain regardless of URL pattern (verified against both its /seed/ and /id/
-        forms), and Unsplash's real CDN (images.unsplash.com), while redirect-free, took
-        10s+ on a first request for a given size/format variant (cold cache) — fine for
-        one image, not for a batch. Falls back to a generated colored square if the
-        network call fails.
+        Direct placehold.co URL — stored as-is on ProductImage.image (see
+        inventory.fields.ExternalOrLocalImageField) rather than downloaded and saved
+        locally. No network call, no file write: nothing to fail, nothing that depends
+        on persistent local/cloud storage being configured, and no per-image latency
+        during seeding. A single request, redirect-free CDN URL was already chosen
+        (over Picsum, which always 302-redirects, and images.unsplash.com, which had
+        10s+ cold-cache latency on first request for a given size/format variant) —
+        this goes one step further and skips the request entirely.
         """
         color = random.choice(PLACEHOLDER_COLORS)
         hex_color = "%02x%02x%02x" % color
         initials = "".join(word[0] for word in label.split()[:2]).upper()
         text = urllib.parse.quote(initials)
-        url = f"https://placehold.co/400x400/{hex_color}/ffffff.webp?text={text}&font=roboto"
-        try:
-            with urllib.request.urlopen(url, timeout=10) as response:
-                content = response.read()
-            return ContentFile(content, name=f"{label.lower().replace(' ', '_')}.webp")
-        except (URLError, OSError):
-            return self._generated_placeholder_image(label)
-
-    def _generated_placeholder_image(self, label):
-        color = random.choice(PLACEHOLDER_COLORS)
-        img = Image.new("RGB", (400, 400), color=color)
-        draw = ImageDraw.Draw(img)
-        initials = "".join(word[0] for word in label.split()[:2]).upper()
-        draw.text((150, 180), initials, fill=(255, 255, 255))
-        buffer = BytesIO()
-        img.save(buffer, format="PNG")
-        return ContentFile(buffer.getvalue(), name=f"{label.lower().replace(' ', '_')}.png")
+        return f"https://placehold.co/400x400/{hex_color}/ffffff.webp?text={text}&font=roboto"
 
     def _seed_products(self, categories, suppliers, count):
         existing_names = set(Product.objects.values_list("name", flat=True))
@@ -275,7 +253,7 @@ class Command(BaseCommand):
             )
             for _ in range(random.randint(1, 3)):
                 ProductImage.objects.create(
-                    product=product, image=self._placeholder_image(name)
+                    product=product, image=self._placeholder_image_url(name)
                 )
             created.append(product)
 

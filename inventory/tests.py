@@ -5,7 +5,7 @@ from django_tenants.test.client import TenantClient
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from inventory.models import Category, Product
+from inventory.models import Category, Product, ProductImage
 
 
 class ProductSearchTests(TenantTestCase):
@@ -121,3 +121,39 @@ class BruteForceLockoutTests(TestCase):
             {"username": "lockouttarget", "password": "correct-horse-battery"},
         )
         self.assertNotEqual(locked_out.status_code, 200)
+
+
+class ExternalImageURLTests(TenantTestCase):
+    """
+    ProductImage.image uses ExternalOrLocalImageField (see inventory/fields.py):
+    FileSystemStorage.url() percent-encodes ':', '?', '&', '=' in the stored name,
+    which corrupts an absolute URL if routed through the normal storage.url() path
+    (e.g. "https://x/y?a=b" -> ".../https%3A/x/y%3Fa%3Db"). These tests guard against
+    that regressing.
+    """
+
+    def setUp(self):
+        category = Category.objects.create(name="Widgets")
+        self.product = Product.objects.create(
+            name="Widget",
+            description="",
+            cost_price="1.00",
+            default_sell_price="2.00",
+            category=category,
+        )
+
+    def test_external_url_is_returned_unmodified(self):
+        url = "https://placehold.co/400x400/007aff/ffffff.webp?text=WM&font=roboto"
+        image = ProductImage.objects.create(product=self.product, image=url)
+        image.refresh_from_db()
+        self.assertEqual(image.image.url, url)
+
+    def test_locally_stored_file_still_uses_storage_url(self):
+        from django.core.files.base import ContentFile
+
+        image = ProductImage.objects.create(
+            product=self.product, image=ContentFile(b"fake-bytes", name="upload.png")
+        )
+        image.refresh_from_db()
+        self.assertTrue(image.image.url.startswith("/media/"))
+        self.assertNotIn("%3A", image.image.url)
