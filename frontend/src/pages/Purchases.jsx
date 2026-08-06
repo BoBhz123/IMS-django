@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { ArrowDown, ArrowUp, ArrowUpDown, ChevronLeft, ChevronRight, Eye, FileText, Plus, Truck } from 'lucide-react'
+import axios from 'axios'
 import { api } from '@/lib/api'
 import { computeItemsTotal, formatDate, shortId } from '@/lib/format'
 import { useCurrency } from '@/context/CurrencyContext'
@@ -24,7 +25,7 @@ export function Purchases() {
   const [sort, setSort] = useState({ field: 'placed_at', direction: 'desc' })
   const [page, setPage] = useState(1)
 
-  const [purchases, setPurchases] = useState([])
+  const [result, setResult] = useState({ count: 0, next: null, previous: null, results: [] })
   const [status, setStatus] = useState('loading')
   const [refreshKey, setRefreshKey] = useState(0)
   const [addOpen, setAddOpen] = useState(false)
@@ -32,46 +33,50 @@ export function Purchases() {
   const [detailPurchase, setDetailPurchase] = useState(null)
 
   useEffect(() => {
+    const controller = new AbortController()
     api
-      .get('/inventory/suppliers/')
+      .get('/inventory/suppliers/', { signal: controller.signal })
       .then(({ data }) => setSuppliers(data))
       .catch(() => {})
+    return () => controller.abort()
   }, [])
 
   useEffect(() => {
-    let cancelled = false
+    // See the matching comment in Orders.jsx — a `cancelled` flag doesn't cancel the request,
+    // it only ignores the reply, so navigating away left this fetch tying up a connection.
+    const controller = new AbortController()
     setStatus('loading')
-    setPage(1)
 
-    const params = { ordering: sort.direction === 'desc' ? `-${sort.field}` : sort.field }
+    const params = { page, ordering: sort.direction === 'desc' ? `-${sort.field}` : sort.field }
     if (supplier !== 'all') params.supplier = supplier
     if (year !== 'all') params.placed_at__year = year
     if (month !== 'all') params.placed_at__month = month
 
     api
-      .get('/inventory/purchases/', { params })
+      .get('/inventory/purchases/', { params, signal: controller.signal })
       .then(({ data }) => {
-        if (!cancelled) {
-          setPurchases(data)
-          setStatus('ready')
-        }
+        setResult(data)
+        setStatus('ready')
       })
-      .catch(() => {
-        if (!cancelled) setStatus('error')
+      .catch((error) => {
+        if (!axios.isCancel(error)) setStatus('error')
       })
 
-    return () => {
-      cancelled = true
+    return () => controller.abort()
+  }, [supplier, year, month, sort, page, refreshKey])
+
+  const purchases = result.results
+
+  /** Filter/sort changes invalidate the current page number — always go back to page 1. */
+  function resetToFirstPage(setter) {
+    return (value) => {
+      setter(value)
+      setPage(1)
     }
-  }, [supplier, year, month, sort, refreshKey])
-
-  const pageCount = Math.max(1, Math.ceil(purchases.length / PAGE_SIZE))
-  const pagePurchases = useMemo(
-    () => purchases.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE),
-    [purchases, page],
-  )
+  }
 
   function toggleSort(field) {
+    setPage(1)
     setSort((current) =>
       current.field === field
         ? { field, direction: current.direction === 'asc' ? 'desc' : 'asc' }
@@ -102,21 +107,21 @@ export function Purchases() {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center gap-2">
-        <FilterSelect value={supplier} onChange={setSupplier} label="All suppliers">
+        <FilterSelect value={supplier} onChange={resetToFirstPage(setSupplier)} label="All suppliers">
           {suppliers.map((s) => (
             <option key={s.id} value={s.id}>
               {s.name}
             </option>
           ))}
         </FilterSelect>
-        <FilterSelect value={year} onChange={setYear} label="All years">
+        <FilterSelect value={year} onChange={resetToFirstPage(setYear)} label="All years">
           {YEAR_OPTIONS.map((y) => (
             <option key={y} value={y}>
               {y}
             </option>
           ))}
         </FilterSelect>
-        <FilterSelect value={month} onChange={setMonth} label="All months">
+        <FilterSelect value={month} onChange={resetToFirstPage(setMonth)} label="All months">
           {MONTH_OPTIONS.map((m) => (
             <option key={m.value} value={m.value}>
               {m.label}
@@ -146,7 +151,7 @@ export function Purchases() {
       {status !== 'error' && (
         <>
           <PurchasesTable
-            purchases={pagePurchases}
+            purchases={purchases}
             sort={sort}
             onSort={toggleSort}
             loading={status === 'loading'}
@@ -154,30 +159,30 @@ export function Purchases() {
             onViewDetail={openDetail}
           />
           <PurchasesCards
-            purchases={pagePurchases}
+            purchases={purchases}
             loading={status === 'loading'}
             onViewInvoice={openInvoice}
             onViewDetail={openDetail}
           />
 
-          {status === 'ready' && purchases.length === 0 && (
+          {status === 'ready' && result.count === 0 && (
             <div className="flex flex-col items-center gap-2 py-16 text-center">
               <Truck className="text-text-tertiary" size={28} />
               <p className="text-[13px] text-text-secondary">No purchases match your filters.</p>
             </div>
           )}
 
-          {purchases.length > 0 && (
+          {result.count > 0 && (
             <div className="flex items-center justify-between px-1 text-[13px] text-text-secondary">
               <span className="tabular-nums">
-                Showing {(page - 1) * PAGE_SIZE + 1}–{Math.min(page * PAGE_SIZE, purchases.length)} of{' '}
-                {purchases.length}
+                Showing {(page - 1) * PAGE_SIZE + 1}–{Math.min(page * PAGE_SIZE, result.count)} of{' '}
+                {result.count}
               </span>
               <div className="flex items-center gap-1.5">
-                <PageButton disabled={page === 1} onClick={() => setPage((p) => p - 1)}>
+                <PageButton disabled={!result.previous} onClick={() => setPage((p) => p - 1)}>
                   <ChevronLeft size={16} />
                 </PageButton>
-                <PageButton disabled={page === pageCount} onClick={() => setPage((p) => p + 1)}>
+                <PageButton disabled={!result.next} onClick={() => setPage((p) => p + 1)}>
                   <ChevronRight size={16} />
                 </PageButton>
               </div>

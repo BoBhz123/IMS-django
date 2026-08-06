@@ -99,8 +99,14 @@ SHARED_APPS = [
     'axes',
     #dev apps
     'playground',
-    'debug_toolbar',
 ]
+
+# Debug toolbar is a development profiler — it should never be loaded in production, where
+# it only adds per-request middleware overhead and an extra exposed URL surface. Its
+# middleware short-circuits on DEBUG=False anyway, so gating both here changes nothing
+# locally and removes it entirely from the deployed app.
+if DEBUG:
+    SHARED_APPS.append('debug_toolbar')
 
 TENANT_APPS = [
     'django.contrib.contenttypes',
@@ -128,7 +134,6 @@ AUTHENTICATION_BACKENDS = [
 MIDDLEWARE = [
     'django_tenants.middleware.main.TenantMainMiddleware',  # must run first — sets the DB schema for the request
     'corsheaders.middleware.CorsMiddleware',
-    'debug_toolbar.middleware.DebugToolbarMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -139,6 +144,10 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'axes.middleware.AxesMiddleware',
 ]
+
+if DEBUG:
+    MIDDLEWARE.insert(MIDDLEWARE.index('corsheaders.middleware.CorsMiddleware') + 1,
+                      'debug_toolbar.middleware.DebugToolbarMiddleware')
 
 ROOT_URLCONF = 'ims.urls'
 
