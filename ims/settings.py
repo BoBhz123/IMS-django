@@ -265,6 +265,15 @@ CSRF_COOKIE_SECURE = not DEBUG
 AXES_FAILURE_LIMIT = 5
 AXES_COOLOFF_TIME = 1  # hour
 AXES_LOCKOUT_PARAMETERS = ['username', 'ip_address']
+# Heroku's router sits in front of every request as a single reverse proxy, so without this,
+# axes (via django-ipware) reads REMOTE_ADDR — Heroku's internal, per-request router-hop
+# address (10.x.x.x), not the real client IP. That makes the ['username', 'ip_address']
+# lockout bucket above nearly meaningless: unrelated failed logins from different real users
+# can land in the same bucket (since the "IP" it sees rotates independently of who's actually
+# connecting), locking out legitimate users for other people's failed attempts. Trusting
+# exactly one proxy hop and reading X-Forwarded-For recovers the real client IP.
+AXES_IPWARE_PROXY_COUNT = 1
+AXES_IPWARE_META_PRECEDENCE_ORDER = ('HTTP_X_FORWARDED_FOR', 'REMOTE_ADDR')
 
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = 'DENY'
