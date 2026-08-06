@@ -1,7 +1,9 @@
+import re
+
 from django.contrib import admin
 from django.urls import path, include, re_path
 from django.conf import settings
-from django.conf.urls.static import static
+from django.views.static import serve as serve_static
 from rest_framework_simplejwt.views import TokenBlacklistView
 
 from .views import spa_index
@@ -18,14 +20,25 @@ urlpatterns = [
     path('__debug__/', include('debug_toolbar.urls')),
 ]
 
-# Deliberately NOT gated on settings.DEBUG (unlike Django's usual recommendation) — this
-# app has no other route serving locally-stored media (no nginx/whitenoise-for-media, and
-# S3/R2 isn't provisioned yet), so gating this on DEBUG would make every real product-image
-# upload 404 outright the moment DEBUG=False is set in production, with no fallback at all.
-# Still not a production-grade solution on its own (Heroku's ephemeral filesystem means
-# locally-stored uploads don't survive a dyno restart/deploy) — see ims/storage.py's
-# TenantS3Storage, which activates automatically once AWS_STORAGE_BUCKET_NAME is set.
-urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+# Deliberately built by hand instead of django.conf.urls.static.static() — that helper has
+# its own hardcoded `if not settings.DEBUG: return []` internally, so it silently produces
+# ZERO urlpatterns once DEBUG=False, no matter how it's called. That's what actually caused
+# broken product-image thumbnails in production: every /media/... request fell through
+# (unmatched) to the SPA catch-all below, returning the HTML app shell — 200 text/html where
+# an image/png was expected — which the browser correctly refuses to render as an image.
+# django.views.static.serve itself has no such guard, so calling it directly here serves
+# unconditionally, regardless of DEBUG. This app has no other route for locally-stored media
+# (no nginx/whitenoise-for-media, and S3/R2 isn't provisioned yet) — still not a
+# production-grade solution on its own (Heroku's ephemeral filesystem means locally-stored
+# uploads don't survive a dyno restart/deploy) — see ims/storage.py's TenantS3Storage, which
+# activates automatically once AWS_STORAGE_BUCKET_NAME is set.
+urlpatterns += [
+    re_path(
+        r'^%s(?P<path>.*)$' % re.escape(settings.MEDIA_URL.lstrip('/')),
+        serve_static,
+        kwargs={'document_root': settings.MEDIA_ROOT},
+    ),
+]
 
 # Serves the built React app for '/' and any other path not matched above (client-side
 # routes like /products — a hard refresh there should still load the SPA, not 404).
