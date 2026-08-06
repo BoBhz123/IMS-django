@@ -50,6 +50,9 @@ const PERIOD_OPTIONS = [
 
 const PERIOD_WINDOW_DAYS = { last_month: 30, last_year: 365 }
 
+/** How many rows the "Recent orders" panel shows — and therefore how many we ask the API for. */
+const RECENT_ORDERS_COUNT = 8
+
 /**
  * Params for the selected stat-tile value plus a comparable prior window for the trend delta.
  * For last_month/last_year, "current" and "value" are the same query (the backend period filter);
@@ -103,7 +106,7 @@ export function Dashboard() {
         threeMonthsStart.setUTCDate(threeMonthsStart.getUTCDate() - 90)
         const alignedThreeMonthsStart = mondayOnOrBefore(threeMonthsStart)
 
-        const [weekRes, threeMonthRes, yearRes, ordersRes, productsRes] = await Promise.all([
+        const [weekRes, threeMonthRes, yearRes, ordersRes] = await Promise.all([
           api.get('/inventory/analytics/', {
             params: { start_date: isoDate(weekStart), end_date: today, group_by: 'day' },
             signal,
@@ -113,8 +116,13 @@ export function Dashboard() {
             signal,
           }),
           api.get('/inventory/analytics/', { params: { group_by: 'year' }, signal }),
-          api.get('/inventory/orders/', { params: { ordering: '-placed_at' }, signal }),
-          api.get('/inventory/products/', { signal }),
+          // Only the 8 rows the "Recent orders" panel renders. This previously fetched every
+          // order the tenant had ever placed — with all nested line items — and threw away
+          // everything past the first 8, which was the single slowest request on the page.
+          api.get('/inventory/orders/', {
+            params: { ordering: '-placed_at', page_size: RECENT_ORDERS_COUNT },
+            signal,
+          }),
         ])
 
         const weekSeries = fillSeriesGaps(weekRes.data.series, {
@@ -139,8 +147,11 @@ export function Dashboard() {
           data: {
             carouselTabs,
             sparkline: toChartSeries(weekSeries, 'day'),
-            recentOrders: ordersRes.data.slice(0, 8),
-            productsCount: productsRes.data.count,
+            recentOrders: ordersRes.data.results,
+            // Comes back on the analytics payload now, so the catalog-size tile no longer
+            // costs its own request to /products/ (a full serialized page, nested product
+            // images and all, read for a single integer).
+            productsCount: yearRes.data.products_count,
           },
           error: null,
         })
@@ -164,9 +175,19 @@ export function Dashboard() {
       try {
         const { valueParams, currentParams, previousParams, deltaLabel } = periodQuery(period, new Date())
 
+        // For last_month/last_year, periodQuery returns the *same params object* for the
+        // headline value and the "current" side of the trend delta — so firing both sent two
+        // byte-identical analytics queries every time the period changed. Reusing the one
+        // promise keeps the shape below unchanged while halving that work.
+        const valuePromise = api.get('/inventory/analytics/', { params: valueParams, signal })
+        const currentPromise =
+          currentParams === valueParams
+            ? valuePromise
+            : api.get('/inventory/analytics/', { params: currentParams, signal })
+
         const [valueRes, currentRes, previousRes] = await Promise.all([
-          api.get('/inventory/analytics/', { params: valueParams, signal }),
-          api.get('/inventory/analytics/', { params: currentParams, signal }),
+          valuePromise,
+          currentPromise,
           api.get('/inventory/analytics/', { params: previousParams, signal }),
         ])
 

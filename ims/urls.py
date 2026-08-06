@@ -17,8 +17,12 @@ urlpatterns = [
     path('auth/', include('djoser.urls')),
     path('auth/', include('djoser.urls.jwt')),
     path('auth/jwt/blacklist/', TokenBlacklistView.as_view(), name='jwt-blacklist'),
-    path('__debug__/', include('debug_toolbar.urls')),
 ]
+
+# Matches the DEBUG gate on debug_toolbar in settings.py (INSTALLED_APPS + MIDDLEWARE) —
+# the app isn't loaded in production, so its URLs must not be routed there either.
+if settings.DEBUG:
+    urlpatterns += [path('__debug__/', include('debug_toolbar.urls'))]
 
 # Deliberately built by hand instead of django.conf.urls.static.static() — that helper has
 # its own hardcoded `if not settings.DEBUG: return []` internally, so it silently produces

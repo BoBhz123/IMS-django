@@ -12,7 +12,7 @@ from rest_framework.viewsets import ModelViewSet
 from rest_framework.views import APIView
 from .filters import ProductFilter,PurchaseFilter,OrderFilter
 from .pagination import DefaultPagination
-from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order
+from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order,LINE_TOTAL
 from .serializers import *
 from datetime import date, timedelta
 from django.utils import timezone
@@ -64,48 +64,64 @@ class SupplierViewSet(ModelViewSet):
     ordering_fields= ['name']
     search_fields = ['name']
     
-class PurchaseViewSet(ModelViewSet):
+class _TotalAnnotationMixin:
+    """
+    Adds `annotated_total` only for requests that actually sort by it.
+
+    The annotation is a Sum over the reverse `items` relation, so it forces a JOIN plus a
+    GROUP BY across the whole filtered table on *every* list request — work the DB cannot
+    skip just because we only want ten rows. The serializers read the in-Python
+    `total_price` property off prefetched items, not this annotation, so for the common
+    `?ordering=-placed_at` case it was pure overhead.
+    """
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if 'annotated_total' in self.request.query_params.get('ordering', ''):
+            queryset = queryset.annotate(annotated_total=Sum(LINE_TOTAL))
+        return queryset
+
+
+class PurchaseViewSet(_TotalAnnotationMixin, ModelViewSet):
     http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
     queryset = Purchase.objects.select_related('supplier').prefetch_related(
         Prefetch(
-            'items', 
+            'items',
             queryset=PurchaseItem.objects.select_related('product')
         )
-    ).annotate(
-        annotated_total=Sum(F('items__quantity') * F('items__unit_price'))
     )
-    
+
     filterset_class = PurchaseFilter
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    pagination_class = DefaultPagination
     ordering_fields = ['annotated_total', 'placed_at']
-    
+
     def get_serializer_class(self):
         if self.request.method == 'POST':
             return CreatePurchaseSerializer
         return PurchaseSerializer
-    
-    
-    
-class OrderViewSet(ModelViewSet):
+
+
+
+class OrderViewSet(_TotalAnnotationMixin, ModelViewSet):
     queryset = Order.objects.select_related('customer').prefetch_related(
             Prefetch(
-                'items', 
+                'items',
                 queryset=OrderItem.objects.select_related('product')
             )
-        ).annotate(
-            annotated_total=Sum(F('items__quantity') * F('items__unit_price'))
         )
     filterset_class = OrderFilter
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    pagination_class = DefaultPagination
     ordering_fields = ['annotated_total', 'placed_at']
-    
+
     def get_serializer_class(self):
         if self.request.method == 'POST':
             return CreateOrderSerializer
         return OrderSerializer
-    
-    
-    
+
+
+
 GROUP_BY_TRUNC = {
     'day': TruncDate,
     'week': TruncWeek,
@@ -162,10 +178,10 @@ class AnalyticsView(APIView):
             products = products.filter(order__placed_at__date__lte=end_date)
 
         revenue_query = orders.aggregate(
-            total_revenue=Sum(F('items__quantity') * F('items__unit_price') * F('items__unit_multiplier'))
+            total_revenue=Sum(LINE_TOTAL)
         )
         cost_query = purchases.aggregate(
-            total_cost=Sum(F('items__quantity') * F('items__unit_price') * F('items__unit_multiplier'))
+            total_cost=Sum(LINE_TOTAL)
         )
 
         best_seller_query = products.values('product__name').annotate(
@@ -182,6 +198,11 @@ class AnalyticsView(APIView):
             "total_costs": f"${raw_cost:,.2f}",
             "net_profit": f"${raw_profit:,.2f}",
             "top_products": best_seller_query,
+            # Catalog size, deliberately NOT date-filtered — it's "how many products exist",
+            # not "how many were sold in this window". Served here so the dashboard's
+            # "Products in catalog" tile doesn't need a second round trip to /products/
+            # (which returned a full serialized page, nested images and all, for one number).
+            "products_count": Product.objects.count(),
         }
 
         if group_by in GROUP_BY_TRUNC:
@@ -194,13 +215,13 @@ class AnalyticsView(APIView):
             orders
             .annotate(period=trunc('placed_at', output_field=DateField()))
             .values('period')
-            .annotate(total=Sum(F('items__quantity') * F('items__unit_price') * F('items__unit_multiplier')))
+            .annotate(total=Sum(LINE_TOTAL))
         )
         cost_rows = (
             purchases
             .annotate(period=trunc('placed_at', output_field=DateField()))
             .values('period')
-            .annotate(total=Sum(F('items__quantity') * F('items__unit_price') * F('items__unit_multiplier')))
+            .annotate(total=Sum(LINE_TOTAL))
         )
 
         revenue_by_period = {row['period']: row['total'] or 0 for row in revenue_rows if row['period']}
@@ -316,14 +337,29 @@ class ExportOrdersCSVView(APIView):
         if order_id:
             items = items.filter(order__id=order_id)
 
+        # `item.order.total_profit` is a Python property that walks order.items.all(). Since
+        # select_related builds a distinct Order instance per row, nothing was cached: every
+        # single CSV line fired its own query for that order's items — a textbook N+1 that
+        # made a 2,000-line export 2,000 queries. One grouped aggregate replaces all of them.
+        profit_by_order = {
+            row['order_id']: row['profit'] or 0
+            for row in items.values('order_id').annotate(
+                profit=Sum(
+                    (F('unit_price') - F('product__cost_price'))
+                    * F('quantity')
+                    * F('unit_multiplier')
+                )
+            )
+        }
+
         for item in items:
             line_total = item.quantity * item.unit_multiplier * item.unit_price
             cost_price = item.product.cost_price if item.product else 0
-            
+
             writer.writerow([
-                item.order.id, 
-                item.order.customer.name if item.order.customer else "No Customer", 
-                item.order.placed_at.strftime("%Y-%m-%d %H:%M"), 
+                item.order.id,
+                item.order.customer.name if item.order.customer else "No Customer",
+                item.order.placed_at.strftime("%Y-%m-%d %H:%M"),
                 item.order.exchange_rate,
                 item.product.name if item.product else "Unknown Product",
                 item.quantity,
@@ -331,9 +367,9 @@ class ExportOrdersCSVView(APIView):
                 f"${item.unit_price:.2f}",
                 f"${cost_price:.2f}",
                 f"${line_total:.2f}",
-                f"${item.order.total_profit:.2f}"
+                f"${profit_by_order.get(item.order_id, 0):.2f}"
             ])
-            
+
         return response
     
     

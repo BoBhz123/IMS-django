@@ -1,0 +1,14 @@
+{
+  "name": "ims",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Root manifest that exists so Heroku's nodejs buildpack builds the React app in frontend/ during deploy. The python buildpack then serves the result from frontend/dist via WHITENOISE_ROOT (see ims/settings.py). Without this, frontend/dist had to be committed by hand with `git add -f` — it is gitignored — and any forgotten rebuild shipped an index.html pointing at a JS bundle that was not in the slug.",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "build": "npm ci --include=dev --prefix frontend && npm run build --prefix frontend",
+    "//": "--include=dev is deliberate: vite is a devDependency of frontend/, and a build environment that sets NPM_CONFIG_PRODUCTION=true would otherwise skip it and fail. node_modules is dropped afterwards so it doesn't ride along in the slug.",
+    "heroku-postbuild": "npm run build && rm -rf frontend/node_modules"
+  }
+}

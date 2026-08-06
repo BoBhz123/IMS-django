@@ -102,7 +102,7 @@ def export_orders_to_csv(modeladmin, request, queryset):
 
     # Annotate the queryset to calculate the math
     annotated_queryset = queryset.annotate(
-        total_value=Sum(F('items__quantity') * F('items__unit_price'))
+        total_value=Sum(models.LINE_TOTAL)
     )
 
     for order in annotated_queryset:
@@ -126,17 +126,22 @@ def export_purchases_to_csv(modeladmin, request, queryset):
     writer.writerow(['Purchase ID', 'Supplier Name', 'Date Placed', 'Total Cost (USD)'])
 
     annotated_queryset = queryset.annotate(
-        total_cost=Sum(F('items__quantity') * F('items__unit_price'))
+        total_cost=Sum(models.LINE_TOTAL)
     )
 
     for purchase in annotated_queryset:
         calculated_total = purchase.total_cost if purchase.total_cost is not None else 0
         writer.writerow([
-            purchase.id, 
-            purchase.supplier.name if purchase.supplier else "No Supplier", 
-            purchase.placed_at.strftime("%Y-%m-%d %H:%M"), 
+            purchase.id,
+            purchase.supplier.name if purchase.supplier else "No Supplier",
+            purchase.placed_at.strftime("%Y-%m-%d %H:%M"),
             f"${calculated_total:.2f}"
-        ]) 
+        ])
+
+    # Was missing: without this the action returns None, so the admin just redirects back to
+    # the changelist and no file is ever downloaded. export_orders_to_csv above returns its
+    # response correctly, which is why only the purchases action appeared to do nothing.
+    return response
 
 
 
@@ -165,7 +170,7 @@ class PurchaseAdmin(admin.ModelAdmin):
     
     def get_queryset(self, request):
         qs = super().get_queryset(request)
-        return qs.annotate(annotated_total=Sum(F('items__quantity') * F('items__unit_price')))
+        return qs.annotate(annotated_total=Sum(models.LINE_TOTAL))
 
     @admin.display(description='Total Value', ordering='annotated_total')
     def get_total(self, obj):
@@ -203,7 +208,7 @@ class OrderAdmin(admin.ModelAdmin):
         return order.customer.name
     def get_queryset(self, request):
         qs = super().get_queryset(request)
-        return qs.annotate(annotated_total=Sum(F('items__quantity') * F('items__unit_price')))
+        return qs.annotate(annotated_total=Sum(models.LINE_TOTAL))
     
     @admin.display(description='Total Cost', ordering='annotated_total')
     def get_total(self, obj):
