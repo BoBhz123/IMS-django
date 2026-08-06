@@ -314,6 +314,12 @@ AWS_SECRET_ACCESS_KEY = os.environ.get('AWS_SECRET_ACCESS_KEY')
 AWS_S3_ENDPOINT_URL = os.environ.get('AWS_S3_ENDPOINT_URL')  # set for R2; omit for AWS S3
 AWS_S3_REGION_NAME = os.environ.get('AWS_S3_REGION_NAME', 'auto')  # R2 has no real regions
 AWS_S3_ADDRESSING_STYLE = 'virtual'
+# R2's own *.r2.cloudflarestorage.com endpoint requires a signed Authorization header on
+# every request, including GETs — it's an API endpoint, not a public CDN, so browsers can't
+# load images from it directly. AWS_S3_CUSTOM_DOMAIN (a domain connected to the bucket via
+# Cloudflare's "Custom Domains" or the r2.dev public bucket URL) makes django-storages build
+# URLs against that instead. Left unset, URLs fall back to the private API endpoint above.
+AWS_S3_CUSTOM_DOMAIN = os.environ.get('AWS_S3_CUSTOM_DOMAIN')
 AWS_DEFAULT_ACL = None  # R2 doesn't support canned ACLs the way S3 does
 AWS_QUERYSTRING_AUTH = False  # serve plain URLs, not presigned ones
 
