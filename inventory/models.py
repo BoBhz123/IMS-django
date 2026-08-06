@@ -5,6 +5,30 @@ from .fields import ExternalOrLocalImageField
 from .validators import validate_file_size
 
 
+# The single definition of what a Purchase/Order line is worth:
+# quantity * unit_multiplier * unit_price.
+#
+# This used to be written out by hand in six places (both total_price properties, both item
+# serializers, AnalyticsView, both CSV export views, and the admin's list column + CSV
+# actions) and had drifted: the total_price properties omitted unit_multiplier while
+# everything else included it, so the API's `total_price` disagreed with the per-item
+# `total_price`, with the analytics revenue, and with what the UI displayed. Import from here
+# rather than re-typing the expression.
+#
+# Both Purchase and Order name the reverse relation 'items', so this path resolves for either.
+# Wrap it at the call site: .annotate(total=Sum(LINE_TOTAL)).
+LINE_TOTAL = (
+    models.F('items__quantity')
+    * models.F('items__unit_multiplier')
+    * models.F('items__unit_price')
+)
+
+
+def items_total(items):
+    """Python-side equivalent of Sum(LINE_TOTAL), for already-loaded (prefetched) items."""
+    return sum(item.quantity * item.unit_multiplier * item.unit_price for item in items)
+
+
 class Supplier(models.Model):
     id = models.AutoField(primary_key=True,
                           null=False,editable=False)
@@ -68,7 +92,7 @@ class Purchase(models.Model):
     exchange_rate = models.IntegerField(default=89000,blank=True)
     @property
     def total_price(self):
-        return sum(item.quantity * item.unit_price for item in self.items.all())
+        return items_total(self.items.all())
 
     class Meta:
         # Newest first — matches how every caller actually reads this table, and gives
@@ -109,7 +133,7 @@ class Order(models.Model):
     exchange_rate = models.IntegerField(default=89000,blank=True)
     @property
     def total_price(self):
-        return sum(item.quantity * item.unit_price for item in self.items.all())
+        return items_total(self.items.all())
     @property
     def total_profit(self):
         return sum((item.profit or 0) for item in self.items.all())

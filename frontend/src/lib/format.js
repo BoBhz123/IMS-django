@@ -36,7 +36,12 @@ export function invoiceFileName(placedAt, id) {
   return `Invoice_${datePart}_${shortId(id)}.pdf`
 }
 
-/** The `total_price` property on Order/Purchase ignores unit_multiplier — recompute from line items instead. */
+/**
+ * Line-items total: quantity * unit_multiplier * unit_price.
+ * Agrees with the API's `total_price` field (inventory/models.py::LINE_TOTAL is the shared
+ * definition on that side) — this stays because the tables already hold the items and can
+ * total them without trusting a second field to be present on every payload shape.
+ */
 export function computeItemsTotal(items) {
   return items.reduce((sum, item) => sum + item.quantity * item.unit_multiplier * item.unit_price, 0)
 }

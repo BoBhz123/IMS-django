@@ -361,3 +361,81 @@ class AnalyticsPayloadTests(TenantTestCase):
         # All six orders land in the current month -> exactly one series row.
         self.assertEqual(len(body["series"]), 1)
         self.assertEqual(body["series"][0]["total_revenue"], 12)
+
+
+class LineTotalConsistencyTests(TenantTestCase):
+    """
+    total_price on Order/Purchase used to omit unit_multiplier while the item serializers,
+    analytics, CSV exports and the frontend all included it. Everything now routes through
+    inventory.models.LINE_TOTAL / items_total; these pin the surfaces together.
+    """
+
+    def setUp(self):
+        category = Category.objects.create(name="Widgets")
+        self.product = Product.objects.create(
+            name="Widget", description="", cost_price="4.00",
+            default_sell_price="10.00", category=category,
+        )
+        # 2 units x multiplier 3 x $10 = $60. With the multiplier dropped it would read $20.
+        self.order = Order.objects.create(customer=Customer.objects.create(name="Acme"))
+        OrderItem.objects.create(
+            order=self.order, product=self.product, quantity=2,
+            unit_price="10.00", unit_multiplier=3,
+        )
+        self.purchase = Purchase.objects.create(
+            supplier=Supplier.objects.create(name="Supplier Co")
+        )
+        PurchaseItem.objects.create(
+            purchase_order=self.purchase, product=self.product, quantity=2,
+            unit_price="4.00", unit_multiplier=3,
+        )
+
+        self.user = User.objects.create_superuser(username="boss", password="pw12345!")
+        self.client = TenantClient(self.tenant)
+        self.auth_header = f"JWT {RefreshToken.for_user(self.user).access_token}"
+
+    def test_order_total_price_includes_unit_multiplier(self):
+        self.assertEqual(self.order.total_price, 60)
+
+    def test_purchase_total_price_includes_unit_multiplier(self):
+        self.assertEqual(self.purchase.total_price, 24)
+
+    def test_order_total_price_matches_the_sum_of_item_line_totals(self):
+        body = self.client.get(
+            "/inventory/orders/", HTTP_AUTHORIZATION=self.auth_header
+        ).json()["results"][0]
+        line_sum = sum(
+            i["quantity"] * i["unit_multiplier"] * i["unit_price"] for i in body["items"]
+        )
+        self.assertEqual(body["total_price"], line_sum)
+
+    def test_purchase_total_price_matches_its_items_total_price_fields(self):
+        body = self.client.get(
+            "/inventory/purchases/", HTTP_AUTHORIZATION=self.auth_header
+        ).json()["results"][0]
+        # PurchaseItemSerializer already exposed a multiplier-aware per-item total_price;
+        # the parent must now agree with the sum of them.
+        self.assertEqual(body["total_price"], sum(i["total_price"] for i in body["items"]))
+
+    def test_total_price_agrees_with_analytics_revenue_and_cost(self):
+        analytics = self.client.get(
+            "/inventory/analytics/", HTTP_AUTHORIZATION=self.auth_header
+        ).json()
+        self.assertEqual(analytics["total_revenue"], f"${self.order.total_price:,.2f}")
+        self.assertEqual(analytics["total_costs"], f"${self.purchase.total_price:,.2f}")
+
+    def test_sorting_annotation_agrees_with_the_total_price_field(self):
+        body = self.client.get(
+            "/inventory/orders/", {"ordering": "-annotated_total"},
+            HTTP_AUTHORIZATION=self.auth_header,
+        ).json()["results"][0]
+        self.assertEqual(body["total_price"], self.order.total_price)
+
+    def test_admin_csv_export_totals_match_total_price(self):
+        from inventory.admin import export_orders_to_csv, export_purchases_to_csv
+
+        orders_csv = export_orders_to_csv(None, None, Order.objects.all())
+        self.assertIn(f"${self.order.total_price:.2f}", orders_csv.content.decode())
+
+        purchases_csv = export_purchases_to_csv(None, None, Purchase.objects.all())
+        self.assertIn(f"${self.purchase.total_price:.2f}", purchases_csv.content.decode())

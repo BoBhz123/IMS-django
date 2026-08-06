@@ -12,7 +12,7 @@ from rest_framework.viewsets import ModelViewSet
 from rest_framework.views import APIView
 from .filters import ProductFilter,PurchaseFilter,OrderFilter
 from .pagination import DefaultPagination
-from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order
+from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order,LINE_TOTAL
 from .serializers import *
 from datetime import date, timedelta
 from django.utils import timezone
@@ -64,13 +64,6 @@ class SupplierViewSet(ModelViewSet):
     ordering_fields= ['name']
     search_fields = ['name']
     
-# Line total, matching how every other surface computes it (item serializers, the CSV
-# exports, AnalyticsView) — quantity * unit_multiplier * unit_price. Used to sort by "Total";
-# note the Purchase/Order.total_price properties omit unit_multiplier, which is a separate
-# pre-existing inconsistency (frontend lib/format.js::computeItemsTotal works around it).
-LINE_TOTAL = F('items__quantity') * F('items__unit_multiplier') * F('items__unit_price')
-
-
 class _TotalAnnotationMixin:
     """
     Adds `annotated_total` only for requests that actually sort by it.
@@ -185,10 +178,10 @@ class AnalyticsView(APIView):
             products = products.filter(order__placed_at__date__lte=end_date)
 
         revenue_query = orders.aggregate(
-            total_revenue=Sum(F('items__quantity') * F('items__unit_price') * F('items__unit_multiplier'))
+            total_revenue=Sum(LINE_TOTAL)
         )
         cost_query = purchases.aggregate(
-            total_cost=Sum(F('items__quantity') * F('items__unit_price') * F('items__unit_multiplier'))
+            total_cost=Sum(LINE_TOTAL)
         )
 
         best_seller_query = products.values('product__name').annotate(
@@ -222,13 +215,13 @@ class AnalyticsView(APIView):
             orders
             .annotate(period=trunc('placed_at', output_field=DateField()))
             .values('period')
-            .annotate(total=Sum(F('items__quantity') * F('items__unit_price') * F('items__unit_multiplier')))
+            .annotate(total=Sum(LINE_TOTAL))
         )
         cost_rows = (
             purchases
             .annotate(period=trunc('placed_at', output_field=DateField()))
             .values('period')
-            .annotate(total=Sum(F('items__quantity') * F('items__unit_price') * F('items__unit_multiplier')))
+            .annotate(total=Sum(LINE_TOTAL))
         )
 
         revenue_by_period = {row['period']: row['total'] or 0 for row in revenue_rows if row['period']}
