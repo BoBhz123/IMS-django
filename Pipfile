@@ -23,6 +23,7 @@ pillow = "*"
 faker = "*"
 whitenoise = "*"
 sentry-sdk = "*"
+django-ipware = "*"
 
 [dev-packages]
 
