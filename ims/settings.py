@@ -237,6 +237,14 @@ REST_FRAMEWORK = {
 }
 
 
+DJOSER = {
+    'SERIALIZERS': {
+        'user_create': 'accounts.serializers.UserCreateWithAccountSerializer',
+        'user_create_password_retype': 'accounts.serializers.UserCreateWithAccountSerializer',
+    },
+}
+
+
 SIMPLE_JWT = {
     'AUTH_HEADER_TYPES': ('JWT',),
     'ACCESS_TOKEN_LIFETIME': timedelta(days=1),

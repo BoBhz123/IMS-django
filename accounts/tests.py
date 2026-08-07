@@ -128,3 +128,55 @@ class SubscriptionEnforcementTests(TestCase):
         _, client, header = self.build()
         response = client.get('/inventory/orders/export/csv/', HTTP_AUTHORIZATION=header)
         self.assertEqual(response.status_code, 200)
+
+
+class SignupProvisioningTests(TestCase):
+    def signup(self, **payload):
+        return APIClient().post('/auth/users/', {
+            'username': payload.get('username', 'newbiz'),
+            'password': payload.get('password', 'sTr0ng-pw-2026'),
+            **({'business_name': payload['business_name']} if 'business_name' in payload else {}),
+        }, format='json')
+
+    def test_signup_creates_an_account_and_an_owner_membership(self):
+        response = self.signup(business_name='Corner Shop')
+        self.assertEqual(response.status_code, 201)
+        user = User.objects.get(username='newbiz')
+        self.assertEqual(user.membership.account.name, 'Corner Shop')
+        self.assertTrue(user.membership.is_owner)
+
+    def test_account_name_defaults_to_the_username(self):
+        self.signup()
+        self.assertEqual(User.objects.get(username='newbiz').membership.account.name, 'newbiz')
+
+    def test_new_accounts_start_on_a_fourteen_day_trial(self):
+        self.signup()
+        account = User.objects.get(username='newbiz').membership.account
+        self.assertEqual(account.subscription_status, Account.TRIAL)
+        self.assertEqual(account.plan_type, Account.FREE_TRIAL)
+        self.assertIsNotNone(account.expires_at)
+        self.assertAlmostEqual(
+            (account.expires_at - timezone.now()).days, 13, delta=1,
+        )
+
+    def test_new_users_are_never_staff(self):
+        self.signup()
+        user = User.objects.get(username='newbiz')
+        self.assertFalse(user.is_staff)
+        self.assertFalse(user.is_superuser)
+
+    def test_a_new_signup_can_immediately_use_the_api(self):
+        self.signup()
+        client = APIClient()
+        token = client.post(
+            '/auth/jwt/create/',
+            {'username': 'newbiz', 'password': 'sTr0ng-pw-2026'}, format='json',
+        ).json()['access']
+        response = client.get('/inventory/products/', HTTP_AUTHORIZATION=f'JWT {token}')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['count'], 0)
+
+    def test_createsuperuser_provisions_no_account(self):
+        # Platform admins are not subscribers and must not own a workspace.
+        admin = User.objects.create_superuser(username='platform', password='pw12345!')
+        self.assertIsNone(get_account(admin))
