@@ -28,26 +28,33 @@ There is no lint/format config (no ruff/flake8/black config files) and no CI in 
 **No real tests exist yet** — `inventory/tests.py` and `playground/tests.py` are both just the
 Django-generated stub (`# Create your tests here.`). Don't assume test coverage for existing behavior.
 
-**Pipfile is out of date**: `djoser` and `djangorestframework-simplejwt` are used in
-`ims/settings.py` (`INSTALLED_APPS`, `REST_FRAMEWORK`, `SIMPLE_JWT`) and are installed in the active
-env, but are *not* listed in `Pipfile`/`Pipfile.lock`. A fresh `pipenv install` from the Pipfile alone
-will not pull them in — if you touch dependency management, add them explicitly
-(`pipenv install djoser djangorestframework-simplejwt`) rather than assuming the lockfile is complete.
+**Settings are env-var driven** in `ims/settings.py`: `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`,
+`ALLOWED_HOSTS`, `DATABASE_URL`, `SENTRY_DSN`, and the `AWS_*` block (Cloudflare R2) all fall back to
+local-dev defaults when unset. The local DB is Postgres (`inventory` on localhost:5432, user
+`postgres`). `CORS_ALLOW_ALL_ORIGINS = True` is still on — dev-only, flag it rather than fixing it as a
+drive-by change.
 
-**Local dev settings are hardcoded** in `ims/settings.py`: MySQL creds (`root`/`MyPassword`,
-DB `inventory`), a plaintext `SECRET_KEY`, `DEBUG = True`, `CORS_ALLOW_ALL_ORIGINS = True`. This is a
-dev-only configuration, not something to "fix" incidentally — flag it if asked about deployment, but
-don't rewrite it as a drive-by change.
+**This app is deployed** (Heroku, with WhiteNoise serving the built React app and R2 for media).
+Deployment steps are not in scope for routine work — never run migrations, resets, or config changes
+against production without explicit authorization.
 
 ## Architecture
 
-Three Django apps under a single `ims` project:
+Django apps under a single `ims` project, plus a React frontend:
 
-- **`ims/`** — project config: `settings.py`, root `urls.py`, wsgi/asgi.
+- **`ims/`** — project config: `settings.py`, root `urls.py`, `storage.py`, wsgi/asgi.
 - **`inventory/`** — the actual product: models, DRF serializers/views/filters, admin. This is where
   almost all work happens.
+- **`accounts/`** — `Account` + `Membership`: who owns data, and subscription state. Added in the
+  Phase 2 migration below.
 - **`playground/`** — scratch/dev-only app (`say_hello` view rendering `hello.html`), not part of the
   real API surface. Don't extend it as if it were production code.
+- **`frontend/`** — React + Vite + Tailwind SPA. Built to `frontend/dist/` and served by WhiteNoise
+  via `ims/views.py::spa_index`, which is the catch-all route in `ims/urls.py`.
+
+**`tenants/` (removed in Phase 2).** This app used to hold `django-tenants` schema-per-tenant routing.
+If you see references to `TENANT_*` settings, `django_tenants`, `MULTITENANT_RELATIVE_MEDIA_ROOT`, or
+`TenantS3Storage`, they are leftovers — the app is single-database and account-scoped now.
 
 ### Request flow
 
@@ -55,11 +62,20 @@ Three Django apps under a single `ims` project:
 customers) plus a `NestedDefaultRouter` for `products/{id}/images/` (via `drf-nested-routers`), plus
 three plain `APIView`s: `analytics/`, `orders/export/csv/`, `purchases/export/csv/`.
 
-Auth is JWT (`djoser` + `rest_framework_simplejwt`), mounted at `/auth/`. The default permission class
-is `inventory.permissions.FullDjangoModelPermissions`, which extends DRF's `DjangoModelPermissions` to
-*also* require the Django `view_<model>` permission for GET (stock `DjangoModelPermissions` doesn't
-gate reads). This means every model needs explicit permissions assigned via Django auth
-groups/users — a user with no permissions gets 403 even on list/retrieve endpoints.
+Auth is JWT (`djoser` + `rest_framework_simplejwt`), mounted at `/auth/`. The default permission
+classes are `IsAuthenticated + HasActiveSubscription` (see `accounts/permissions.py`). Data access is
+gated by two independent things, and both must hold:
+
+1. **Account scoping** — `AccountScopedMixin` filters every viewset queryset to the requesting user's
+   account, and write serializers narrow their relational fields to that same account. Scoping
+   `get_queryset` alone protects reads only; without the serializer half, a user can POST a record
+   referencing another account's row by id.
+2. **Subscription** — `Account.has_active_subscription` is *computed* from status **and** `expires_at`.
+   Never trust `subscription_status` alone: nothing flips `active` → `past_due` without a scheduled
+   job, so the column goes stale and silently grants free service.
+
+Platform superadmins (`is_superuser`) have no `Membership`, bypass both gates, and are the only users
+who should ever have `is_staff`.
 
 ### Read/write serializer split
 
@@ -116,3 +132,74 @@ code with the API export views, so a formula/format fix usually needs to happen 
 - **Backend Boundaries**: You are encouraged to add useful frontend features and sorting logic, but **do not** alter the core transactional logic of the backend (e.g., how orders and purchases automatically adjust stock quantities).
 - **Seed Data**: Before building the full UI, write a Python script or Django management command to populate the database with fake products, suppliers, customers, and transactions to facilitate UI/Chart testing.
 - **No Deployment Yet**: Do NOT create Dockerfiles or prepare the application for publishing. Remain strictly in local development mode until explicitly authorized by the user.
+
+---
+
+# Active Plan — SaaS Migration & Feature Work
+
+**Branch:** `feature/saas-single-db-migration` · **Started:** 2026-08-07
+**Full design:** `docs/superpowers/specs/2026-08-07-saas-single-db-migration-design.md`
+**Completed work log:** `HISTORY.md` — read it at session start.
+
+**Status:** Phase 1 in progress.
+
+Phases are a dependency chain. 3–5 all touch models that Phase 2 restructures, so running them out of
+order means writing migrations twice. Finish each phase (including its tests) before starting the next.
+
+### Phase 1 — Order stock validation
+Reject orders exceeding `Product.stock_quantity` with HTTP 400; disable the frontend add/increment
+controls and show a limit badge at the cap.
+
+Three things the obvious implementation gets wrong:
+- Stock is deducted as `quantity * unit_multiplier`. Validating bare `quantity` lets an order pass and
+  then drive stock negative.
+- One order can list the same product on several lines — each under stock, together over. Sum requested
+  units per product id before comparing.
+- Two concurrent orders can both validate and both deduct. Re-read with `select_for_update()` inside
+  the existing `@transaction.atomic` block and re-check before deducting.
+
+### Phase 2 — Single DB, accounts, subscriptions
+Remove `django-tenants`; introduce `Account` + `Membership`; scope all data per account; gate on
+subscription status. Existing tenant data is **discarded** (approved) — clean-slate migrations, not
+additive ones, because inventory tables live only inside tenant schemas today and the public schema has
+none of them. Re-permission `AnalyticsView` and the CSV exports off `IsAdminUser`: under the new role
+model `is_staff` means platform superadmin, so leaving them would either break every subscriber's
+dashboard or hand every subscriber the platform. Drop the global `unique=True` on `Product`/`Supplier`/
+`Category`/`Customer` `.name` for per-account uniqueness, or the first account to name a product blocks
+every other account.
+
+### Phase 3 — Expenses
+`Expense` model + account-scoped CRUD. `net_profit = order profit − expenses`, with the *same* date
+window applied to both sides — extract the window logic into one helper rather than duplicating it.
+`created_at` uses `default=timezone.now`, not `auto_now_add`, so a receipt entered Friday for a Tuesday
+purchase lands in the right month.
+
+### Phase 4 — Barcodes
+Optional indexed `Product.barcode`; add it to `ProductViewSet.search_fields` so `?search=` covers it.
+Frontend input + list tag. Camera scanning is a later phase.
+
+### Phase 5 — CSV export totals row
+Append a TOTALS row to `ExportOrdersCSVView` (the API view the frontend calls — *not* the similarly
+named `export_orders_to_csv` admin action, which has no cost/profit columns; that one gets a matching
+row for its single Total Value column). The existing "Total Profit" column repeats the whole order's
+profit on every line of that order, so summing that column multiplies each order's profit by its line
+count. Sum per-line profit instead.
+
+---
+
+# Working Log — mistakes, gotchas, anti-patterns
+
+Append here when something bites. Do not repeat these.
+
+- **`CLAUDE.md` was badly stale** (2026-08-07): described MySQL, no frontend, no multi-tenancy, and a
+  Pipfile missing `djoser`. All four were wrong. Verify this file against the code before trusting it,
+  and update it when the architecture moves.
+- **`product.stock` does not exist** — the field is `Product.stock_quantity`. Requests referring to
+  `stock` mean this.
+- **Two different order-CSV exporters exist** with near-identical names and different columns:
+  `ExportOrdersCSVView` (`inventory/views.py`, API, what the frontend calls) and `export_orders_to_csv`
+  (`inventory/admin.py`, admin action). A formula fix usually needs both.
+- **DRF builds a separate `Product` instance per nested item**, so the `product.stock_quantity -= …;
+  product.save()` loop in `CreateOrderSerializer`/`CreatePurchaseSerializer` writes stale copies when a
+  product appears on two lines — the second save overwrites the first. Aggregate per product and use
+  `F()` updates. (Fixed in Phase 1.)
