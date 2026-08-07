@@ -1,7 +1,33 @@
+from collections import defaultdict
+
 from rest_framework import serializers
 from django.db import transaction
+from django.db.models import F
 from .models import Product , Category,Purchase,PurchaseItem,Order,OrderItem,Supplier,ProductImage,Customer
 import uuid
+
+
+def _units_by_product_id(items_data):
+    """
+    Units each product gives up (or gains), keyed by product id.
+
+    Aggregating by id — rather than walking items one at a time — is what makes duplicate
+    lines for the same product behave. DRF also hands back a *separate* Product instance
+    per item, so any per-item read-modify-write of stock_quantity operates on a stale copy.
+    """
+    totals = defaultdict(int)
+    for item in items_data:
+        totals[item['product'].id] += item['quantity'] * item.get('unit_multiplier', 1)
+    return totals
+
+
+def _insufficient_stock_errors(units_by_id, products):
+    return [
+        f"Insufficient stock for '{product.name}': "
+        f"requested {units_by_id[product.id]}, available {product.stock_quantity}."
+        for product in products
+        if units_by_id[product.id] > product.stock_quantity
+    ]
 
 class ProductImageSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
@@ -71,25 +97,22 @@ class CreatePurchaseSerializer(serializers.ModelSerializer):
         model = Purchase
         fields = ['id','supplier', 'exchange_rate', 'items']
 
-    @transaction.atomic 
+    @transaction.atomic
     def create(self, validated_data):
-        items_data = validated_data.pop('items')
-        
-        purchase = Purchase.objects.create(**validated_data)
-        
-        purchase_items_to_create = []
-        for item_data in items_data:
-            product = item_data['product']
-            quantity = item_data['quantity']
-            multiplier = item_data.get('unit_multiplier', 1)
-            
-            product.stock_quantity += (quantity * multiplier)
-            product.save()
-            purchase_items_to_create.append(
-                PurchaseItem(purchase_order=purchase, **item_data)
-            )
+        items_data = validated_data.pop('items', [])
+        units_by_id = _units_by_product_id(items_data)
 
-        PurchaseItem.objects.bulk_create(purchase_items_to_create)
+        purchase = Purchase.objects.create(**validated_data)
+        PurchaseItem.objects.bulk_create(
+            [PurchaseItem(purchase_order=purchase, **item_data) for item_data in items_data]
+        )
+
+        # Purchases have no ceiling to validate against, but they have the same
+        # stale-instance problem as orders when one product appears on two lines.
+        for product_id, units in units_by_id.items():
+            Product.objects.filter(id=product_id).update(
+                stock_quantity=F('stock_quantity') + units
+            )
         return purchase
     
 class SupplierSerializer(serializers.ModelSerializer):
@@ -127,24 +150,41 @@ class CreateOrderSerializer(serializers.ModelSerializer):
         model = Order
         fields = ['id','customer','exchange_rate','items']
         
-    @transaction.atomic  
+    def validate_items(self, items):
+        if not items:
+            raise serializers.ValidationError("An order must contain at least one item.")
+
+        units_by_id = _units_by_product_id(items)
+        products = Product.objects.filter(id__in=units_by_id)
+        errors = _insufficient_stock_errors(units_by_id, products)
+        if errors:
+            raise serializers.ValidationError(errors)
+        return items
+
+    @transaction.atomic
     def create(self, validated_data):
-        items_data = validated_data.pop('items',[])
+        items_data = validated_data.pop('items', [])
+        units_by_id = _units_by_product_id(items_data)
+
+        # validate_items ran outside this transaction, so two orders placed at the same
+        # instant can both pass it and both deduct. Re-reading under a row lock and
+        # re-checking makes the second one fail instead of driving stock negative.
+        locked = Product.objects.select_for_update().filter(id__in=units_by_id)
+        errors = _insufficient_stock_errors(units_by_id, locked)
+        if errors:
+            raise serializers.ValidationError({'items': errors})
+
         order = Order.objects.create(**validated_data)
-        
-        order_items_to_create = []
-        for item_data in items_data:
-            product = item_data['product']
-            quantity = item_data['quantity']
-            multiplier = item_data.get('unit_multiplier', 1)
-            
-            product.stock_quantity -= (quantity * multiplier)
-            product.save()
-            
-            order_items_to_create.append(OrderItem(order=order,**item_data))
-            
-        OrderItem.objects.bulk_create(order_items_to_create)
-        return order               
+        OrderItem.objects.bulk_create(
+            [OrderItem(order=order, **item_data) for item_data in items_data]
+        )
+
+        # One UPDATE per product, computed in the database, rather than a save() per line.
+        for product_id, units in units_by_id.items():
+            Product.objects.filter(id=product_id).update(
+                stock_quantity=F('stock_quantity') - units
+            )
+        return order
         
         
             

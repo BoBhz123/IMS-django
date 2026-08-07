@@ -439,3 +439,111 @@ class LineTotalConsistencyTests(TenantTestCase):
 
         purchases_csv = export_purchases_to_csv(None, None, Purchase.objects.all())
         self.assertIn(f"${self.purchase.total_price:.2f}", purchases_csv.content.decode())
+
+
+class OrderStockValidationTests(TenantTestCase):
+    """
+    Orders must never drive stock negative. Three things make this less trivial than it
+    looks: stock is consumed as quantity * unit_multiplier, one order may list the same
+    product on several lines, and two concurrent orders can both pass a naive check.
+    """
+
+    def setUp(self):
+        category = Category.objects.create(name="Widgets")
+        self.product = Product.objects.create(
+            name="Widget", description="", cost_price="4.00",
+            default_sell_price="10.00", category=category, stock_quantity=10,
+        )
+        self.user = User.objects.create_superuser(username="boss", password="pw12345!")
+        self.client = TenantClient(self.tenant)
+        self.auth_header = f"JWT {RefreshToken.for_user(self.user).access_token}"
+
+    def post_order(self, items):
+        return self.client.post(
+            "/inventory/orders/",
+            {"exchange_rate": 89000, "items": items},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=self.auth_header,
+        )
+
+    def line(self, quantity, multiplier=1, product=None):
+        return {
+            "product": (product or self.product).id,
+            "quantity": quantity,
+            "unit_multiplier": multiplier,
+            "unit_price": "10.00",
+        }
+
+    def stock(self):
+        self.product.refresh_from_db()
+        return self.product.stock_quantity
+
+    def test_order_exceeding_stock_is_rejected(self):
+        response = self.post_order([self.line(11)])
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("items", response.json())
+        self.assertIn("Insufficient stock", str(response.json()["items"]))
+
+    def test_rejected_order_leaves_stock_and_orders_untouched(self):
+        self.post_order([self.line(11)])
+        self.assertEqual(self.stock(), 10)
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_order_equal_to_available_stock_is_accepted(self):
+        response = self.post_order([self.line(10)])
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(self.stock(), 0)
+
+    def test_unit_multiplier_counts_against_stock(self):
+        # 4 * 3 = 12 units against 10 in stock. Validating bare quantity (4) would pass
+        # this and then deduct 12, leaving -2.
+        response = self.post_order([self.line(4, multiplier=3)])
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.stock(), 10)
+
+    def test_duplicate_lines_for_one_product_are_summed(self):
+        # 6 + 6 = 12 against 10. Each line alone fits; together they do not.
+        response = self.post_order([self.line(6), self.line(6)])
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.stock(), 10)
+
+    def test_duplicate_lines_deduct_every_line(self):
+        # Regression: DRF builds a separate Product instance per item, so the old
+        # `product.stock_quantity -= n; product.save()` loop wrote stale copies — the
+        # second save overwrote the first and only one line's units came off.
+        response = self.post_order([self.line(3), self.line(3)])
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(self.stock(), 4)
+
+    def test_out_of_stock_product_is_rejected(self):
+        self.product.stock_quantity = 0
+        self.product.save()
+        response = self.post_order([self.line(1)])
+        self.assertEqual(response.status_code, 400)
+
+    def test_error_message_names_the_product_and_both_numbers(self):
+        message = str(self.post_order([self.line(11)]).json()["items"])
+        self.assertIn("Widget", message)
+        self.assertIn("11", message)
+        self.assertIn("10", message)
+
+    def test_purchase_duplicate_lines_add_every_line(self):
+        # Same stale-instance bug on the increment side.
+        supplier = Supplier.objects.create(name="Supplier Co")
+        response = self.client.post(
+            "/inventory/purchases/",
+            {
+                "supplier": supplier.id,
+                "exchange_rate": 89000,
+                "items": [
+                    {"product": self.product.id, "quantity": 3,
+                     "unit_multiplier": 1, "unit_price": "4.00"},
+                    {"product": self.product.id, "quantity": 3,
+                     "unit_multiplier": 1, "unit_price": "4.00"},
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=self.auth_header,
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(self.stock(), 16)
