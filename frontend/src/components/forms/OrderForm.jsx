@@ -5,9 +5,31 @@ import { DEFAULT_EXCHANGE_RATE, useCurrency } from '@/context/CurrencyContext'
 import { SlideOver } from '@/components/ui/SlideOver'
 import { CurrencyInput } from '@/components/ui/CurrencyInput'
 import { ProductPicker } from '@/components/forms/ProductPicker'
+import { StockBadge } from '@/components/ui/StockBadge'
+import { hasBlockingStockError, stockStateFor } from '@/lib/stock'
 
 function emptyItem() {
-  return { product: '', quantity: 1, unit_multiplier: 1, unit_price: 0 }
+  return { product: '', quantity: 1, unit_multiplier: 1, unit_price: 0, stock_quantity: null, product_name: '' }
+}
+
+/**
+ * Largest quantity this line may take: the product's stock less whatever the other lines
+ * already claim, divided back out by this line's multiplier — because the input edits
+ * quantity, while stock is consumed in quantity × multiplier units.
+ */
+function maxQuantityFor(items, index) {
+  const item = items[index]
+  if (!item?.product) return undefined
+  const available = Number(item.stock_quantity)
+  if (!Number.isFinite(available)) return undefined
+
+  const claimedElsewhere = items.reduce((sum, other, i) => {
+    if (i === index || String(other.product) !== String(item.product)) return sum
+    return sum + (Number(other.quantity) || 0) * (Number(other.unit_multiplier) || 0)
+  }, 0)
+
+  const multiplier = Number(item.unit_multiplier) || 1
+  return Math.max(0, Math.floor((available - claimedElsewhere) / multiplier))
 }
 
 export function OrderForm({ open, onClose, onSaved, customers }) {
@@ -27,6 +49,8 @@ export function OrderForm({ open, onClose, onSaved, customers }) {
     updateItem(index, {
       product: productId,
       unit_price: product ? product.default_sell_price : 0,
+      stock_quantity: product ? product.stock_quantity : null,
+      product_name: product ? product.name : '',
     })
   }
 
@@ -138,10 +162,33 @@ export function OrderForm({ open, onClose, onSaved, customers }) {
                   </button>
                 )}
               </div>
+
+              {(() => {
+                const stock = stockStateFor(items, index)
+                if (stock.status === 'none') return null
+                return (
+                  <div className="mb-2 flex items-center gap-2">
+                    {stock.status === 'out' && <StockBadge quantity={0} />}
+                    {stock.status === 'limit' && (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-accent-orange/15 px-2 py-0.5 text-[12px] font-medium text-accent-orange">
+                        Reached limit — {stock.available} available
+                      </span>
+                    )}
+                    {stock.status === 'over' && (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-accent-red/15 px-2 py-0.5 text-[12px] font-medium text-accent-red">
+                        Over stock by {-stock.remaining} — only {stock.available} available
+                      </span>
+                    )}
+                    {stock.status === 'ok' && <StockBadge quantity={stock.remaining} />}
+                  </div>
+                )
+              })()}
+
               <div className="grid grid-cols-3 gap-2">
                 <NumberField
                   label="Qty"
                   value={item.quantity}
+                  max={maxQuantityFor(items, index)}
                   onChange={(v) => updateItem(index, { quantity: v })}
                 />
                 <NumberField
@@ -168,13 +215,23 @@ export function OrderForm({ open, onClose, onSaved, customers }) {
         </div>
 
         {errors.detail && <p className="text-[13px] text-accent-red">{errors.detail[0]}</p>}
-        {errors.items && typeof errors.items === 'string' && (
-          <p className="text-[13px] text-accent-red">{errors.items}</p>
+        {errors.items && (
+          <div className="text-[13px] text-accent-red">
+            {(Array.isArray(errors.items) ? errors.items : [errors.items]).map((message) => (
+              <p key={String(message)}>{String(message)}</p>
+            ))}
+          </div>
+        )}
+
+        {hasBlockingStockError(items) && (
+          <p className="text-[13px] text-accent-red">
+            Reduce quantities to available stock before creating this order.
+          </p>
         )}
 
         <button
           type="submit"
-          disabled={saving}
+          disabled={saving || hasBlockingStockError(items)}
           className="mt-1 flex items-center justify-center gap-2 rounded-xl bg-accent-blue py-2.5 text-[14px] font-semibold text-white hover:opacity-90 disabled:opacity-60"
         >
           {saving && <Loader2 size={14} className="animate-spin" />}
@@ -194,16 +251,21 @@ function Field({ label, children }) {
   )
 }
 
-function NumberField({ label, value, onChange }) {
+function NumberField({ label, value, onChange, max }) {
+  const atLimit = max !== undefined && Number(value) >= max
   return (
     <div>
       <span className="mb-1 block text-[11px] text-text-tertiary">{label}</span>
       <input
         type="number"
         min="1"
+        max={max}
         value={value}
         onChange={(event) => onChange(event.target.value)}
-        className="w-full rounded-lg border border-hairline bg-canvas px-2 py-1.5 text-[13px] text-text-primary tabular-nums focus:outline-none"
+        aria-invalid={max !== undefined && Number(value) > max}
+        className={`w-full rounded-lg border bg-canvas px-2 py-1.5 text-[13px] text-text-primary tabular-nums focus:outline-none ${
+          atLimit ? 'border-accent-orange' : 'border-hairline'
+        }`}
       />
     </div>
   )

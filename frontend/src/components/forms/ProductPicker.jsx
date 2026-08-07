@@ -74,13 +74,21 @@ export function ProductPicker({ value, onChange }) {
                 <button
                   key={product.id}
                   type="button"
+                  disabled={product.stock_quantity <= 0}
                   onClick={() => handleSelect(product)}
-                  className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[13px] hover:bg-canvas-2 ${
+                  className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[13px] enabled:hover:bg-canvas-2 disabled:cursor-not-allowed disabled:opacity-45 ${
                     String(product.id) === String(value) ? 'bg-accent-blue/10 text-accent-blue' : 'text-text-primary'
                   }`}
                 >
                   <ProductThumbnail image={product.images?.[0]?.image} name={product.name} size="xs" />
                   <span className="min-w-0 flex-1 truncate">{product.name}</span>
+                  <span
+                    className={`shrink-0 text-[11px] tabular-nums ${
+                      product.stock_quantity <= 0 ? 'text-accent-red' : 'text-text-tertiary'
+                    }`}
+                  >
+                    {product.stock_quantity <= 0 ? 'Out of stock' : `${product.stock_quantity} left`}
+                  </span>
                 </button>
               ))}
           </div>
