@@ -1,8 +1,22 @@
 from django.db import models
 import uuid
 from django.core.validators import MinValueValidator
+
+from accounts.managers import AccountScopedManager
+from accounts.models import Account
+
 from .fields import ExternalOrLocalImageField
 from .validators import validate_file_size
+
+
+def product_image_path(instance, filename):
+    """
+    Namespaces uploads per account, replacing the per-schema isolation
+    MULTITENANT_RELATIVE_MEDIA_ROOT used to provide. Applied here rather than in the storage
+    backend so the account is visible in the stored path instead of being injected
+    invisibly at write time.
+    """
+    return f'inventory/images/{instance.product.account_id}/{filename}'
 
 
 # The single definition of what a Purchase/Order line is worth:
@@ -32,25 +46,46 @@ def items_total(items):
 class Supplier(models.Model):
     id = models.AutoField(primary_key=True,
                           null=False,editable=False)
-    name = models.CharField(max_length=255,unique=True,null = False)
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name='suppliers')
+    name = models.CharField(max_length=255,null = False)
     phone_number= models.CharField(max_length=255,blank=True,null=True)
+
+    objects = AccountScopedManager()
+
     def __str__(self):
         return self.name
-    
+
+    class Meta:
+        ordering = ['name']
+        constraints = [
+            # Per-account, not global: globally unique names meant the first account to
+            # create "Acme Supplies" blocked every other account from ever using it.
+            models.UniqueConstraint(fields=['account', 'name'], name='uniq_supplier_account_name'),
+        ]
+
 class Category(models.Model):
     id = models.AutoField(primary_key=True,
                               null=False)
-    name = models.CharField(max_length=255,unique=True,null=False)
-        
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name='categories')
+    name = models.CharField(max_length=255,null=False)
+
+    objects = AccountScopedManager()
+
     def __str__(self):
             return self.name
-    
-    
+
+    class Meta:
+        ordering = ['name']
+        constraints = [
+            models.UniqueConstraint(fields=['account', 'name'], name='uniq_category_account_name'),
+        ]
+
+
 class Product(models.Model):
     id = models.AutoField(primary_key=True,
                           null=False,editable=False)
-   
-    name = models.CharField(max_length=255,unique=True,null=False)
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name='products')
+    name = models.CharField(max_length=255,null=False)
     description = models.TextField(null=True,blank=True)
     # Strict per-unit prices in USD — independent of stock_quantity. Purchase/Order line items carry
     # their own unit_price captured at transaction time; they don't read these live, so changing a
@@ -65,7 +100,9 @@ class Product(models.Model):
     stock_quantity = models.IntegerField(default=1,blank=False)
     supplier = models.ForeignKey(Supplier,on_delete=models.PROTECT,blank=True,null=True)
     category= models.ForeignKey(Category,on_delete=models.PROTECT,related_name='products')
-    
+
+    objects = AccountScopedManager()
+
     def __str__(self):
             return self.name
 
@@ -74,22 +111,32 @@ class Product(models.Model):
         indexes = [
             # The products list is almost always "filter by category, sorted by name"
             # (ProductFilter + the default ordering above). Leading with category_id lets one
-            # index serve both halves; name alone is already indexed via its unique constraint.
+            # index serve both halves; name is covered by the account+name constraint below.
             models.Index(fields=['category', 'name'], name='product_category_name_idx'),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=['account', 'name'], name='uniq_product_account_name'),
         ]
 
 
 
 class ProductImage(models.Model):
+    # No `account` field: the owner is reached through product__account. A second copy of the
+    # owner on the child row is a consistency bug waiting to happen. Same for OrderItem and
+    # PurchaseItem.
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='images')
-    image = ExternalOrLocalImageField(upload_to='inventory/images', validators=[validate_file_size])
+    image = ExternalOrLocalImageField(upload_to=product_image_path, validators=[validate_file_size])
     
 class Purchase(models.Model):
     id = models.UUIDField(default=uuid.uuid4,primary_key=True,null=False)
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name='purchases')
     placed_at= models.DateTimeField(auto_now_add=True,db_index=True)
     supplier= models.ForeignKey(Supplier,on_delete=models.SET_NULL,
                                     null=True)
     exchange_rate = models.IntegerField(default=89000,blank=True)
+
+    objects = AccountScopedManager()
+
     @property
     def total_price(self):
         return items_total(self.items.all())
@@ -117,20 +164,34 @@ class PurchaseItem(models.Model):
      
 class Customer(models.Model):
     id = models.AutoField(primary_key=True,unique=True)
-    name = models.CharField(max_length=255,unique=True)
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name='customers')
+    name = models.CharField(max_length=255)
     location = models.CharField(max_length=255,null=True,blank=True)
-    phone_number = models.CharField(max_length=255,blank=True,null= True)  
+    phone_number = models.CharField(max_length=255,blank=True,null= True)
+
+    objects = AccountScopedManager()
+
     def __str__(self):
             return self.name
-      
-    
-    
+
+    class Meta:
+        ordering = ['name']
+        constraints = [
+            models.UniqueConstraint(fields=['account', 'name'], name='uniq_customer_account_name'),
+        ]
+
+
+
 class Order(models.Model):
     id = models.UUIDField(primary_key=True,null=False,default=uuid.uuid4)
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name='orders')
     placed_at= models.DateTimeField(auto_now_add=True,db_index=True)
     customer= models.ForeignKey(Customer,on_delete=models.SET_NULL,
                                     null=True)
     exchange_rate = models.IntegerField(default=89000,blank=True)
+
+    objects = AccountScopedManager()
+
     @property
     def total_price(self):
         return items_total(self.items.all())
