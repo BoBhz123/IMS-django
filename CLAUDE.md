@@ -25,6 +25,23 @@ python manage.py test inventory.tests    # single app (currently empty — see b
 
 There is no lint/format config (no ruff/flake8/black config files) and no CI in this repo.
 
+## Testing policy
+
+**`pipenv run python manage.py test` is the mandatory final check at the end of every phase.**
+A phase is not complete until it passes. Expected output ends with:
+
+```
+Ran <N> tests in <T>s
+
+OK
+```
+
+Frontend: `cd frontend && npm test` (Vitest). Also `npm run lint` and `npm run build` before calling
+frontend work done — the build catches import errors that neither the tests nor the linter see.
+
+**Do not use browser automation / Claude-in-Chrome for verification.** Verify through the Django test
+runner, Vitest unit and component tests, or direct API response checks — never by driving a browser.
+
 **No real tests exist yet** — `inventory/tests.py` and `playground/tests.py` are both just the
 Django-generated stub (`# Create your tests here.`). Don't assume test coverage for existing behavior.
 
@@ -141,7 +158,7 @@ code with the API export views, so a formula/format fix usually needs to happen 
 **Full design:** `docs/superpowers/specs/2026-08-07-saas-single-db-migration-design.md`
 **Completed work log:** `HISTORY.md` — read it at session start.
 
-**Status:** Phase 1 in progress.
+**Status:** Phase 1 complete. Phase 2 next.
 
 Phases are a dependency chain. 3–5 all touch models that Phase 2 restructures, so running them out of
 order means writing migrations twice. Finish each phase (including its tests) before starting the next.
@@ -203,3 +220,14 @@ Append here when something bites. Do not repeat these.
   product.save()` loop in `CreateOrderSerializer`/`CreatePurchaseSerializer` writes stale copies when a
   product appears on two lines — the second save overwrites the first. Aggregate per product and use
   `F()` updates. (Fixed in Phase 1.)
+- **`inventory/tests.py` is not a stub** — it holds a real suite (28 tests before Phase 1) using
+  `TenantTestCase`/`TenantClient`, because `inventory` tables live only in tenant schemas. Phase 2 must
+  migrate every one of these to plain `TestCase`/`APIClient`.
+- **The frontend had no test runner** until Phase 1 added Vitest (`cd frontend && npm test`). Pure
+  logic belongs in `frontend/src/lib/*.js` where it can be tested without React.
+- **Node 22+ ships an experimental `localStorage` global** that resolves to undefined without
+  `--localstorage-file` and shadows jsdom's. `frontend/src/test/setup.js` installs an in-memory
+  implementation; without it every component test touching `CurrencyContext`, `ThemeContext`, or
+  `lib/api`'s token store dies on `localStorage.getItem` of undefined.
+- **`react-router-dom` has 2 open high-severity advisories** (`npm audit`). `npm audit fix --force`
+  downgrades to 7.11.0, a breaking change — left alone deliberately; raise it as its own decision.

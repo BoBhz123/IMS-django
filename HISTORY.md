@@ -8,6 +8,28 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-07 — Phase 1: order stock validation
+
+Orders exceeding available stock are rejected with HTTP 400 instead of silently driving
+`stock_quantity` negative. Validation compares `quantity * unit_multiplier` (the same
+expression the deduction uses), aggregated per product so duplicate lines cannot each
+pass on their own, and re-checks under `select_for_update()` inside the atomic block to
+close the concurrent-order race.
+
+Fixed alongside it: DRF builds a separate `Product` instance per nested item, so the old
+per-item `stock_quantity -= n; save()` loop wrote stale copies — ordering one product on
+two lines only ever applied the last line. Both orders and purchases now aggregate per
+product and update with `F()` expressions. This had been silently miscounting stock.
+
+Frontend: `lib/stock.js` (unit-tested) holds the arithmetic; the order form caps each
+line, disables out-of-stock products in the picker, badges the at-limit and over-limit
+states, and blocks submission. Testing tooling added in this phase: Vitest, plus
+@testing-library/react and jsdom for the `OrderForm` component tests.
+
+Verified: `manage.py test` 50 passed; `npm test` 22 passed; lint and build clean.
+
+---
+
 ## 2026-08-07 — SaaS migration planned
 
 **Design approved:** `docs/superpowers/specs/2026-08-07-saas-single-db-migration-design.md`
