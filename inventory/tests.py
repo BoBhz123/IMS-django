@@ -1,8 +1,6 @@
 from django.contrib.auth.models import Permission, User
 from django.test import TestCase
-from django_tenants.test.cases import TenantTestCase
-from django_tenants.test.client import TenantClient
-from rest_framework.test import APIClient
+from rest_framework.test import APIClient, APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from inventory.models import (
@@ -11,13 +9,8 @@ from inventory.models import (
 )
 
 
-class ProductSearchTests(TenantTestCase):
-    """
-    `inventory` is a TENANT_APPS model (see ims/settings.py) — its tables only exist
-    inside a tenant's own PostgreSQL schema, not in `public`. So this uses
-    TenantTestCase/TenantClient rather than a plain TestCase/APIClient, which would
-    hit a schema with no `inventory_product` table at all.
-    """
+class ProductSearchTests(APITestCase):
+    """Search behaviour of /inventory/products/: matching, escaping, and access control."""
 
     def setUp(self):
         category = Category.objects.create(name="Widgets")
@@ -39,7 +32,7 @@ class ProductSearchTests(TenantTestCase):
         self.user = User.objects.create_user(username="viewer", password="pw12345!")
         self.user.user_permissions.add(Permission.objects.get(codename="view_product"))
 
-        self.client = TenantClient(self.tenant)
+        self.client = APIClient()
         self.auth_header = f"JWT {RefreshToken.for_user(self.user).access_token}"
 
     def test_search_matches_name_case_insensitively(self):
@@ -126,7 +119,7 @@ class BruteForceLockoutTests(TestCase):
         self.assertNotEqual(locked_out.status_code, 200)
 
 
-class ExternalImageURLTests(TenantTestCase):
+class ExternalImageURLTests(APITestCase):
     """
     ProductImage.image uses ExternalOrLocalImageField (see inventory/fields.py):
     FileSystemStorage.url() percent-encodes ':', '?', '&', '=' in the stored name,
@@ -162,7 +155,7 @@ class ExternalImageURLTests(TenantTestCase):
         self.assertNotIn("%3A", image.image.url)
 
 
-class TransactionListPerformanceTests(TenantTestCase):
+class TransactionListPerformanceTests(APITestCase):
     """
     Guards the fixes for the /orders/ and /purchases/ list endpoints, which previously
     returned every row a tenant had (unpaginated, with all nested line items) and ran a
@@ -199,7 +192,7 @@ class TransactionListPerformanceTests(TenantTestCase):
             )
 
         self.user = User.objects.create_superuser(username="boss", password="pw12345!")
-        self.client = TenantClient(self.tenant)
+        self.client = APIClient()
         self.auth_header = f"JWT {RefreshToken.for_user(self.user).access_token}"
 
     def get(self, path, params=None):
@@ -275,7 +268,7 @@ class TransactionListPerformanceTests(TenantTestCase):
         self.assertEqual(len(before.captured_queries), len(after.captured_queries))
 
 
-class OrdersCSVExportQueryCountTests(TenantTestCase):
+class OrdersCSVExportQueryCountTests(APITestCase):
     """
     The export rendered `item.order.total_profit` per row. select_related builds a distinct
     Order instance for each OrderItem, so that property's `order.items.all()` was never
@@ -290,7 +283,7 @@ class OrdersCSVExportQueryCountTests(TenantTestCase):
         )
         self.customer = Customer.objects.create(name="Acme")
         self.user = User.objects.create_superuser(username="boss", password="pw12345!")
-        self.client = TenantClient(self.tenant)
+        self.client = APIClient()
         self.auth_header = f"JWT {RefreshToken.for_user(self.user).access_token}"
 
     def make_orders(self, count):
@@ -326,7 +319,7 @@ class OrdersCSVExportQueryCountTests(TenantTestCase):
             self.assertEqual(row.split(",")[-1], expected)
 
 
-class AnalyticsPayloadTests(TenantTestCase):
+class AnalyticsPayloadTests(APITestCase):
     def setUp(self):
         category = Category.objects.create(name="Widgets")
         for i in range(3):
@@ -335,7 +328,7 @@ class AnalyticsPayloadTests(TenantTestCase):
                 default_sell_price="2.00", category=category,
             )
         self.user = User.objects.create_superuser(username="boss", password="pw12345!")
-        self.client = TenantClient(self.tenant)
+        self.client = APIClient()
         self.auth_header = f"JWT {RefreshToken.for_user(self.user).access_token}"
 
     def test_products_count_is_served_with_analytics(self):
@@ -363,7 +356,7 @@ class AnalyticsPayloadTests(TenantTestCase):
         self.assertEqual(body["series"][0]["total_revenue"], 12)
 
 
-class LineTotalConsistencyTests(TenantTestCase):
+class LineTotalConsistencyTests(APITestCase):
     """
     total_price on Order/Purchase used to omit unit_multiplier while the item serializers,
     analytics, CSV exports and the frontend all included it. Everything now routes through
@@ -391,7 +384,7 @@ class LineTotalConsistencyTests(TenantTestCase):
         )
 
         self.user = User.objects.create_superuser(username="boss", password="pw12345!")
-        self.client = TenantClient(self.tenant)
+        self.client = APIClient()
         self.auth_header = f"JWT {RefreshToken.for_user(self.user).access_token}"
 
     def test_order_total_price_includes_unit_multiplier(self):
@@ -441,7 +434,7 @@ class LineTotalConsistencyTests(TenantTestCase):
         self.assertIn(f"${self.purchase.total_price:.2f}", purchases_csv.content.decode())
 
 
-class OrderStockValidationTests(TenantTestCase):
+class OrderStockValidationTests(APITestCase):
     """
     Orders must never drive stock negative. Three things make this less trivial than it
     looks: stock is consumed as quantity * unit_multiplier, one order may list the same
@@ -455,7 +448,7 @@ class OrderStockValidationTests(TenantTestCase):
             default_sell_price="10.00", category=category, stock_quantity=10,
         )
         self.user = User.objects.create_superuser(username="boss", password="pw12345!")
-        self.client = TenantClient(self.tenant)
+        self.client = APIClient()
         self.auth_header = f"JWT {RefreshToken.for_user(self.user).access_token}"
 
     def post_order(self, items):
