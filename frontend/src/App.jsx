@@ -3,6 +3,8 @@ import { AppShell } from '@/components/layout/AppShell'
 import { ProtectedRoute } from '@/routes/ProtectedRoute'
 import { ToastContainer } from '@/components/ui/ToastContainer'
 import { Login } from '@/pages/Login'
+import { Signup } from '@/pages/Signup'
+import { SubscriptionExpired } from '@/pages/SubscriptionExpired'
 import { Dashboard } from '@/pages/Dashboard'
 import { Products } from '@/pages/Products'
 import { Orders } from '@/pages/Orders'
@@ -16,6 +18,8 @@ function App() {
       <ToastContainer />
       <Routes>
         <Route path="/login" element={<Login />} />
+        <Route path="/signup" element={<Signup />} />
+        <Route path="/subscription" element={<SubscriptionExpired />} />
 
         <Route element={<ProtectedRoute />}>
           <Route element={<AppShell />}>

@@ -3,12 +3,13 @@ import urllib.parse
 from datetime import timedelta
 from decimal import Decimal
 
-from django.contrib.auth.models import Permission, User
+from django.contrib.auth.models import User
 from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.utils import timezone
-from django_tenants.utils import tenant_context
 from faker import Faker
+
+from accounts.models import Account, Membership
 
 from inventory.models import (
     Category,
@@ -21,7 +22,6 @@ from inventory.models import (
     PurchaseItem,
     Supplier,
 )
-from tenants.models import Domain, Tenant
 
 fake = Faker()
 
@@ -81,16 +81,14 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument(
-            "--tenant", type=str, default=None,
-            help="Tenant schema name to seed into (e.g. tenant1). Created — along with a "
-                 "<schema>.localhost domain — if it doesn't already exist. If omitted, seeds "
-                 "whatever schema is already active (the old, pre-multi-tenancy behavior).",
+            "--account", type=str, default="Demo Business",
+            help="Name of the Account to seed into. Created if it doesn't exist, along with "
+                 "an owner login (see --owner).",
         )
         parser.add_argument(
-            "--superuser", type=str, default="admin",
-            help="Username to confirm/grant explicit inventory permissions for (superusers "
-                 "already bypass permission checks, but this makes access explicit and "
-                 "verifiable). Skipped if the user doesn't exist.",
+            "--owner", type=str, default="demo",
+            help="Username of the account's owner. Created with password 'demo12345!' if "
+                 "missing, and given an owner Membership of --account.",
         )
         parser.add_argument(
             "--products", type=int, default=40, help="Number of products to create."
@@ -109,86 +107,85 @@ class Command(BaseCommand):
         Faker.seed()
         random.seed()
 
-        tenant_name = options["tenant"]
-        if tenant_name:
-            tenant = self._ensure_tenant(tenant_name)
-            with tenant_context(tenant):
-                self._seed_all(options)
-        else:
-            self._seed_all(options)
+        account = self._ensure_account(options["account"], options["owner"])
+        self._seed_all(account, options)
 
-        self._grant_superuser_access(options["superuser"])
-
-    def _ensure_tenant(self, schema_name):
-        tenant, created = Tenant.objects.get_or_create(
-            schema_name=schema_name, defaults={"name": schema_name.capitalize()}
+    def _ensure_account(self, name, owner_username):
+        """
+        The account replaces the tenant schema as the thing being seeded. Its owner is a
+        plain subscriber, never is_staff — under the new role model that flag means
+        platform admin over every account, not "can use the app".
+        """
+        account, created = Account.objects.get_or_create(
+            name=name,
+            defaults={
+                "subscription_status": Account.ACTIVE,
+                "plan_type": Account.MONTHLY,
+            },
         )
         if created:
-            self.stdout.write(f"Tenant schema created: {schema_name}")
-        domain_name = f"{schema_name}.localhost"
-        domain, created = Domain.objects.get_or_create(
-            domain=domain_name, defaults={"tenant": tenant, "is_primary": True}
+            self.stdout.write(f"Account created: {name}")
+
+        user, created = User.objects.get_or_create(username=owner_username)
+        if created:
+            user.set_password("demo12345!")
+            user.save()
+            self.stdout.write(f"Owner login created: {owner_username} / demo12345!")
+
+        membership, created = Membership.objects.get_or_create(
+            user=user, defaults={"account": account, "is_owner": True}
         )
         if created:
-            self.stdout.write(f"Domain created: {domain_name}")
-        return tenant
+            self.stdout.write(f"Membership: {owner_username} -> {name}")
+        elif membership.account_id != account.id:
+            self.stdout.write(self.style.WARNING(
+                f"'{owner_username}' already belongs to '{membership.account.name}' — "
+                f"seeding into that account instead."
+            ))
+            return membership.account
 
-    def _seed_all(self, options):
+        return account
+
+    def _seed_all(self, account, options):
         with transaction.atomic():
-            categories = self._seed_categories()
-            suppliers = self._seed_suppliers()
-            customers = self._seed_customers(options["customers"])
-            products = self._seed_products(categories, suppliers, options["products"])
-            self._seed_purchases(products, suppliers, options["purchases"])
-            self._seed_orders(products, customers, options["orders"])
+            categories = self._seed_categories(account)
+            suppliers = self._seed_suppliers(account)
+            customers = self._seed_customers(account, options["customers"])
+            products = self._seed_products(account, categories, suppliers, options["products"])
+            self._seed_purchases(account, products, suppliers, options["purchases"])
+            self._seed_orders(account, products, customers, options["orders"])
 
+        scoped = lambda model: model.objects.for_account(account).count()
         self.stdout.write(self.style.SUCCESS(
-            f"Seed complete — categories={Category.objects.count()} "
-            f"suppliers={Supplier.objects.count()} customers={Customer.objects.count()} "
-            f"products={Product.objects.count()} purchases={Purchase.objects.count()} "
-            f"orders={Order.objects.count()}"
+            f"Seed complete for '{account.name}' — categories={scoped(Category)} "
+            f"suppliers={scoped(Supplier)} customers={scoped(Customer)} "
+            f"products={scoped(Product)} purchases={scoped(Purchase)} "
+            f"orders={scoped(Order)}"
         ))
 
-    def _grant_superuser_access(self, username):
-        # auth.User/Permission are SHARED_APPS (public schema) — access isn't tenant-scoped,
-        # and a real superuser already bypasses permission checks entirely. This just makes
-        # that access explicit and independently verifiable, rather than implicit.
-        try:
-            user = User.objects.get(username=username)
-        except User.DoesNotExist:
-            self.stdout.write(self.style.WARNING(
-                f"Superuser '{username}' not found — skipping permission grant."
-            ))
-            return
-
-        permissions = Permission.objects.filter(content_type__app_label="inventory")
-        user.user_permissions.add(*permissions)
-        self.stdout.write(
-            f"Granted {permissions.count()} inventory permissions to '{username}' "
-            f"(is_superuser={user.is_superuser})"
-        )
-
-    def _seed_categories(self):
+    def _seed_categories(self, account):
         categories = {}
         for name in CATEGORY_PRODUCTS:
-            category, _ = Category.objects.get_or_create(name=name)
+            category, _ = Category.objects.get_or_create(name=name, account=account)
             categories[name] = category
         self.stdout.write(f"Categories ready: {len(categories)}")
         return categories
 
-    def _seed_suppliers(self):
+    def _seed_suppliers(self, account):
         suppliers = []
         for name in SUPPLIER_NAMES:
             supplier, _ = Supplier.objects.get_or_create(
-                name=name, defaults={"phone_number": fake.phone_number()}
+                name=name, account=account, defaults={"phone_number": fake.phone_number()}
             )
             suppliers.append(supplier)
         self.stdout.write(f"Suppliers ready: {len(suppliers)}")
         return suppliers
 
-    def _seed_customers(self, count):
+    def _seed_customers(self, account, count):
         customers = []
-        existing_names = set(Customer.objects.values_list("name", flat=True))
+        existing_names = set(
+            Customer.objects.for_account(account).values_list("name", flat=True)
+        )
         attempts = 0
         while len(customers) < count and attempts < count * 5:
             attempts += 1
@@ -200,10 +197,11 @@ class Command(BaseCommand):
                 name=name,
                 location=fake.city(),
                 phone_number=fake.phone_number(),
+                account=account,
             )
             customers.append(customer)
-        self.stdout.write(f"Customers ready: {Customer.objects.count()}")
-        return list(Customer.objects.all())
+        self.stdout.write(f"Customers ready: {Customer.objects.for_account(account).count()}")
+        return list(Customer.objects.for_account(account))
 
     def _placeholder_image_url(self, label):
         """
@@ -222,8 +220,10 @@ class Command(BaseCommand):
         text = urllib.parse.quote(initials)
         return f"https://placehold.co/400x400/{hex_color}/ffffff.webp?text={text}&font=roboto"
 
-    def _seed_products(self, categories, suppliers, count):
-        existing_names = set(Product.objects.values_list("name", flat=True))
+    def _seed_products(self, account, categories, suppliers, count):
+        existing_names = set(
+            Product.objects.for_account(account).values_list("name", flat=True)
+        )
         pool = []
         for category_name, names in CATEGORY_PRODUCTS.items():
             for name in names:
@@ -250,6 +250,7 @@ class Command(BaseCommand):
                 stock_quantity=random.randint(0, 300),
                 supplier=random.choice(suppliers) if random.random() > 0.1 else None,
                 category=categories[category_name],
+                account=account,
             )
             for _ in range(random.randint(1, 3)):
                 ProductImage.objects.create(
@@ -258,20 +259,21 @@ class Command(BaseCommand):
             created.append(product)
 
         self.stdout.write(f"Products created: {len(created)}")
-        return list(Product.objects.all())
+        return list(Product.objects.for_account(account))
 
     def _random_datetime_within(self, days_back):
         now = timezone.now()
         delta_seconds = random.randint(0, days_back * 24 * 3600)
         return now - timedelta(seconds=delta_seconds)
 
-    def _seed_purchases(self, products, suppliers, count):
+    def _seed_purchases(self, account, products, suppliers, count):
         created_ids = []
         for _ in range(count):
             supplier = random.choice(suppliers)
             purchase = Purchase.objects.create(
                 supplier=supplier,
                 exchange_rate=random.randint(88000, 90000),
+                account=account,
             )
             for product in random.sample(products, k=random.randint(1, 4)):
                 unit_price = (product.cost_price * Decimal(str(round(random.uniform(0.9, 1.1), 2)))).quantize(Decimal("0.01"))
@@ -293,13 +295,14 @@ class Command(BaseCommand):
             )
         self.stdout.write(f"Purchases created: {len(created_ids)}")
 
-    def _seed_orders(self, products, customers, count):
+    def _seed_orders(self, account, products, customers, count):
         created_ids = []
         for _ in range(count):
             customer = random.choice(customers)
             order = Order.objects.create(
                 customer=customer,
                 exchange_rate=random.randint(88000, 90000),
+                account=account,
             )
             for product in random.sample(products, k=random.randint(1, 4)):
                 unit_price = (product.default_sell_price * Decimal(str(round(random.uniform(0.95, 1.05), 2)))).quantize(Decimal("0.01"))

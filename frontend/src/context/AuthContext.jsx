@@ -43,6 +43,15 @@ export function AuthProvider({ children }) {
     setStatus('authenticated')
   }
 
+  async function register(username, password, businessName) {
+    await api.post('/auth/users/', {
+      username,
+      password,
+      business_name: businessName,
+    })
+    await login(username, password)
+  }
+
   async function logout() {
     const refresh = tokenStore.getRefresh()
     tokenStore.clear()
@@ -59,7 +68,9 @@ export function AuthProvider({ children }) {
   }
 
   return (
-    <AuthContext.Provider value={{ user, status, login, logout }}>{children}</AuthContext.Provider>
+    <AuthContext.Provider value={{ user, status, login, register, logout }}>
+      {children}
+    </AuthContext.Provider>
   )
 }
 

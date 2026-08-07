@@ -1,15 +1,16 @@
 import { useState } from 'react'
-import { Link, useLocation, useNavigate } from 'react-router-dom'
-import { Lock, User } from 'lucide-react'
+import { Link, useNavigate } from 'react-router-dom'
+import { Building2, Lock, User } from 'lucide-react'
 import { useAuth } from '@/context/AuthContext'
 import { GlassCard } from '@/components/ui/GlassCard'
 
-export function Login() {
-  const { login } = useAuth()
+export function Signup() {
+  const { register } = useAuth()
   const navigate = useNavigate()
-  const location = useLocation()
+  const [businessName, setBusinessName] = useState('')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [fieldErrors, setFieldErrors] = useState({})
   const [error, setError] = useState(null)
   const [submitting, setSubmitting] = useState(false)
 
@@ -17,18 +18,29 @@ export function Login() {
     event.preventDefault()
     setSubmitting(true)
     setError(null)
+    setFieldErrors({})
     try {
-      await login(username, password)
-      navigate(location.state?.from?.pathname ?? '/', { replace: true })
-    } catch {
-      setError('Incorrect username or password.')
+      await register(username, password, businessName)
+      navigate('/', { replace: true })
+    } catch (caught) {
+      // Djoser returns per-field arrays: {username: ["..."], password: ["...", "..."]}.
+      // Show them beside the field they belong to rather than collapsing to one line.
+      const body = caught?.response?.data
+      if (body && typeof body === 'object' && !Array.isArray(body)) {
+        setFieldErrors(body)
+        if (!body.username && !body.password && !body.business_name) {
+          setError('Could not create your account. Please try again.')
+        }
+      } else {
+        setError('Could not create your account. Please try again.')
+      }
     } finally {
       setSubmitting(false)
     }
   }
 
   return (
-    <div className="relative flex min-h-screen items-center justify-center bg-canvas px-4">
+    <div className="relative flex min-h-screen items-center justify-center bg-canvas px-4 py-10">
       <AmbientBackground />
 
       <GlassCard
@@ -42,13 +54,26 @@ export function Login() {
             IMS
           </div>
           <div>
-            <h1 className="font-display text-[20px] font-semibold text-text-primary">Sign in</h1>
-            <p className="text-[13px] text-text-secondary">Access your inventory dashboard</p>
+            <h1 className="font-display text-[20px] font-semibold text-text-primary">
+              Create your account
+            </h1>
+            <p className="text-[13px] text-text-secondary">Free for 14 days — no card needed</p>
           </div>
         </div>
 
         <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-          <Field icon={User} label="Username">
+          <Field icon={Building2} label="Business name" error={fieldErrors.business_name}>
+            <input
+              type="text"
+              autoComplete="organization"
+              value={businessName}
+              onChange={(event) => setBusinessName(event.target.value)}
+              className="w-full bg-transparent text-[14px] text-text-primary placeholder:text-text-tertiary focus:outline-none"
+              placeholder="Corner Shop"
+            />
+          </Field>
+
+          <Field icon={User} label="Username" error={fieldErrors.username}>
             <input
               type="text"
               autoComplete="username"
@@ -56,14 +81,14 @@ export function Login() {
               onChange={(event) => setUsername(event.target.value)}
               required
               className="w-full bg-transparent text-[14px] text-text-primary placeholder:text-text-tertiary focus:outline-none"
-              placeholder="admin"
+              placeholder="yourname"
             />
           </Field>
 
-          <Field icon={Lock} label="Password">
+          <Field icon={Lock} label="Password" error={fieldErrors.password}>
             <input
               type="password"
-              autoComplete="current-password"
+              autoComplete="new-password"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
               required
@@ -79,14 +104,14 @@ export function Login() {
             disabled={submitting}
             className="mt-2 rounded-xl bg-accent-blue py-2.5 text-[14px] font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-50"
           >
-            {submitting ? 'Signing in…' : 'Sign In'}
+            {submitting ? 'Creating account…' : 'Create Account'}
           </button>
         </form>
 
         <p className="mt-6 text-center text-[13px] text-text-secondary">
-          New here?{' '}
-          <Link to="/signup" className="font-medium text-accent-blue hover:underline">
-            Create an account
+          Already have an account?{' '}
+          <Link to="/login" className="font-medium text-accent-blue hover:underline">
+            Sign in
           </Link>
         </p>
       </GlassCard>
@@ -94,7 +119,7 @@ export function Login() {
   )
 }
 
-function Field({ icon: Icon, label, children }) {
+function Field({ icon: Icon, label, error, children }) {
   return (
     <label className="flex flex-col gap-1.5">
       <span className="text-[12px] font-medium text-text-secondary">{label}</span>
@@ -102,6 +127,11 @@ function Field({ icon: Icon, label, children }) {
         <Icon size={16} className="text-text-tertiary" />
         {children}
       </div>
+      {error && (
+        <span className="text-[12px] text-accent-red">
+          {Array.isArray(error) ? error[0] : error}
+        </span>
+      )}
     </label>
   )
 }
