@@ -16,23 +16,32 @@ from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,Ord
 from .serializers import *
 from datetime import date, timedelta
 from django.utils import timezone
-from rest_framework.permissions import IsAdminUser
 import csv
 
+from accounts.mixins import AccountScopedMixin
+from accounts.models import get_account
 
-class ProductImageViewSet(ModelViewSet):
+
+class ProductImageViewSet(AccountScopedMixin, ModelViewSet):
+    # ProductImage has no account column — it is owned through its product.
+    account_lookup = 'product__account'
+
     serializer_class = ProductImageSerializer
     parser_classes = [MultiPartParser, FormParser]
 
     def get_serializer_context(self):
-        return {'product_id': self.kwargs['product_pk']}
+        return {**super().get_serializer_context(), 'product_id': self.kwargs['product_pk']}
 
     def get_queryset(self):
         return ProductImage.objects.filter(product_id=self.kwargs['product_pk'])
 
+    def perform_create(self, serializer):
+        # Not AccountScopedMixin's save(account=...): there is no such field to stamp.
+        serializer.save()
 
 
-class ProductViewSet(ModelViewSet):
+
+class ProductViewSet(AccountScopedMixin, ModelViewSet):
    queryset = Product.objects.select_related('category', 'supplier').prefetch_related('images')
    serializer_class = ProductSerializer
    filter_backends = [DjangoFilterBackend,SearchFilter,OrderingFilter]
@@ -43,21 +52,21 @@ class ProductViewSet(ModelViewSet):
    
     
 
-class  CategoryViewSet(ModelViewSet):
+class  CategoryViewSet(AccountScopedMixin, ModelViewSet):
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
     filter_backends = [SearchFilter,OrderingFilter]
     ordering_fields= ['name']
     search_fields = ['name']
 
-class CustomerViewSet(ModelViewSet):
+class CustomerViewSet(AccountScopedMixin, ModelViewSet):
     queryset = Customer.objects.all()
     serializer_class = CustomerSerializer
     filter_backends = [SearchFilter,OrderingFilter]
     ordering_fields= ['name']
     search_fields = ['name']
     
-class SupplierViewSet(ModelViewSet):
+class SupplierViewSet(AccountScopedMixin, ModelViewSet):
     queryset = Supplier.objects.all()
     serializer_class = SupplierSerializer
     filter_backends = [SearchFilter,OrderingFilter]
@@ -82,7 +91,7 @@ class _TotalAnnotationMixin:
         return queryset
 
 
-class PurchaseViewSet(_TotalAnnotationMixin, ModelViewSet):
+class PurchaseViewSet(AccountScopedMixin, _TotalAnnotationMixin, ModelViewSet):
     http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
     queryset = Purchase.objects.select_related('supplier').prefetch_related(
         Prefetch(
@@ -103,7 +112,7 @@ class PurchaseViewSet(_TotalAnnotationMixin, ModelViewSet):
 
 
 
-class OrderViewSet(_TotalAnnotationMixin, ModelViewSet):
+class OrderViewSet(AccountScopedMixin, _TotalAnnotationMixin, ModelViewSet):
     queryset = Order.objects.select_related('customer').prefetch_related(
             Prefetch(
                 'items',
@@ -137,12 +146,18 @@ PERIOD_WINDOW_DAYS = {
 
 
 class AnalyticsView(APIView):
-    permission_classes = [IsAdminUser]
+    # Deliberately not IsAdminUser. The dashboard calls this on every load, so admin-only
+    # would force every subscriber to be is_staff — which now means platform admin over
+    # every account. The default IsAuthenticated + HasActiveSubscription is the right gate.
 
     def get(self, request):
-        purchases = Purchase.objects.all()
-        orders = Order.objects.all()
-        products = OrderItem.objects.all()
+        account = get_account(request.user)
+        purchases = Purchase.objects.for_account(account)
+        orders = Order.objects.for_account(account)
+        products = (
+            OrderItem.objects.filter(order__account=account)
+            if account else OrderItem.objects.none()
+        )
 
         year = request.query_params.get('year')
         month = request.query_params.get('month')
@@ -202,7 +217,7 @@ class AnalyticsView(APIView):
             # not "how many were sold in this window". Served here so the dashboard's
             # "Products in catalog" tile doesn't need a second round trip to /products/
             # (which returned a full serialized page, nested images and all, for one number).
-            "products_count": Product.objects.count(),
+            "products_count": Product.objects.for_account(account).count(),
         }
 
         if group_by in GROUP_BY_TRUNC:
@@ -248,8 +263,6 @@ def _csv_safe(value):
 
 
 class ExportProductsCSVView(APIView):
-    permission_classes = [IsAdminUser]
-
     def get(self, request):
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = 'attachment; filename="products_export.csv"'
@@ -265,7 +278,9 @@ class ExportProductsCSVView(APIView):
             'Profit (USD)',
         ])
 
-        products = Product.objects.select_related('category', 'supplier').all()
+        products = Product.objects.for_account(
+            get_account(request.user)
+        ).select_related('category', 'supplier')
 
         search = request.query_params.get('search')
         category_id = request.query_params.get('category_id')
@@ -299,8 +314,6 @@ class ExportProductsCSVView(APIView):
 
 
 class ExportOrdersCSVView(APIView):
-    permission_classes = [IsAdminUser] 
-
     def get(self, request):
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = 'attachment; filename="orders_detailed_export.csv"'
@@ -320,7 +333,10 @@ class ExportOrdersCSVView(APIView):
             'Total Profit (USD)'
         ])
 
-        items = OrderItem.objects.select_related('order', 'order__customer', 'product').all()
+        account = get_account(request.user)
+        items = OrderItem.objects.select_related(
+            'order', 'order__customer', 'product'
+        ).filter(order__account=account) if account else OrderItem.objects.none()
         
         # Capture all possible filter parameters from the URL
         year = request.query_params.get('year')
@@ -374,8 +390,6 @@ class ExportOrdersCSVView(APIView):
     
     
 class ExportPurchasesCSVView(APIView):
-    permission_classes = [IsAdminUser] 
-
     def get(self, request):
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = 'attachment; filename="purchases_detailed_export.csv"'
@@ -394,7 +408,10 @@ class ExportPurchasesCSVView(APIView):
         ])
 
         # Query PurchaseItems directly for the row-by-row breakdown
-        items = PurchaseItem.objects.select_related('purchase_order', 'purchase_order__supplier', 'product').all()
+        account = get_account(request.user)
+        items = PurchaseItem.objects.select_related(
+            'purchase_order', 'purchase_order__supplier', 'product'
+        ).filter(purchase_order__account=account) if account else PurchaseItem.objects.none()
         
         # Capture filter parameters from the URL
         year = request.query_params.get('year')

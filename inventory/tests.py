@@ -1,5 +1,7 @@
-from django.contrib.auth.models import Permission, User
-from django.test import TestCase
+import tempfile
+
+from django.contrib.auth.models import User
+from django.test import TestCase, override_settings
 from rest_framework.test import APIClient, APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
@@ -9,17 +11,37 @@ from inventory.models import (
 )
 
 
-class ProductSearchTests(APITestCase):
+class AccountFixtureMixin:
+    """
+    Builds an account, an owner, and an authenticated APIClient for it. Every scoping test
+    needs a *second* account to prove isolation, so make_account_user returns a full set.
+    """
+
+    def make_account_user(self, username, account_name=None):
+        from accounts.models import Account, Membership
+
+        account = Account.objects.create(name=account_name or f'{username} Co')
+        user = User.objects.create_user(username=username, password='pw12345!')
+        Membership.objects.create(user=user, account=account, is_owner=True)
+        client = APIClient()
+        header = f'JWT {RefreshToken.for_user(user).access_token}'
+        return account, user, client, header
+
+
+class ProductSearchTests(AccountFixtureMixin, APITestCase):
     """Search behaviour of /inventory/products/: matching, escaping, and access control."""
 
     def setUp(self):
-        category = Category.objects.create(name="Widgets")
+        self.account, self.user, self.client, self.auth_header = self.make_account_user("viewer")
+
+        category = Category.objects.create(name="Widgets", account=self.account)
         Product.objects.create(
             name="Blue Widget",
             description="A widget that is blue",
             cost_price="5.00",
             default_sell_price="9.99",
             category=category,
+            account=self.account,
         )
         Product.objects.create(
             name="Red Gadget",
@@ -27,13 +49,8 @@ class ProductSearchTests(APITestCase):
             cost_price="3.00",
             default_sell_price="6.99",
             category=category,
+            account=self.account,
         )
-
-        self.user = User.objects.create_user(username="viewer", password="pw12345!")
-        self.user.user_permissions.add(Permission.objects.get(codename="view_product"))
-
-        self.client = APIClient()
-        self.auth_header = f"JWT {RefreshToken.for_user(self.user).access_token}"
 
     def test_search_matches_name_case_insensitively(self):
         response = self.client.get(
@@ -61,7 +78,9 @@ class ProductSearchTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["results"], [])
 
-    def test_search_requires_view_permission(self):
+    def test_search_requires_an_account(self):
+        # Was a per-model view_product check. Model permissions are retired: the gate is now
+        # HasActiveSubscription, and a user with no membership has no live subscription.
         unprivileged = User.objects.create_user(username="nobody", password="pw12345!")
         auth_header = f"JWT {RefreshToken.for_user(unprivileged).access_token}"
 
@@ -119,7 +138,7 @@ class BruteForceLockoutTests(TestCase):
         self.assertNotEqual(locked_out.status_code, 200)
 
 
-class ExternalImageURLTests(APITestCase):
+class ExternalImageURLTests(AccountFixtureMixin, APITestCase):
     """
     ProductImage.image uses ExternalOrLocalImageField (see inventory/fields.py):
     FileSystemStorage.url() percent-encodes ':', '?', '&', '=' in the stored name,
@@ -128,14 +147,32 @@ class ExternalImageURLTests(APITestCase):
     that regressing.
     """
 
+    @classmethod
+    def setUpClass(cls):
+        # test_locally_stored_file_still_uses_storage_url writes a real file. Without a
+        # throwaway MEDIA_ROOT it lands in the repo's tracked media/ directory and gets
+        # committed as a stray artifact.
+        super().setUpClass()
+        cls._media_dir = tempfile.TemporaryDirectory()
+        cls._media_override = override_settings(MEDIA_ROOT=cls._media_dir.name)
+        cls._media_override.enable()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._media_override.disable()
+        cls._media_dir.cleanup()
+        super().tearDownClass()
+
     def setUp(self):
-        category = Category.objects.create(name="Widgets")
+        self.account, self.user, self.client, self.auth_header = self.make_account_user("imgowner")
+        category = Category.objects.create(name="Widgets", account=self.account)
         self.product = Product.objects.create(
             name="Widget",
             description="",
             cost_price="1.00",
             default_sell_price="2.00",
             category=category,
+            account=self.account,
         )
 
     def test_external_url_is_returned_unmodified(self):
@@ -155,7 +192,7 @@ class ExternalImageURLTests(APITestCase):
         self.assertNotIn("%3A", image.image.url)
 
 
-class TransactionListPerformanceTests(APITestCase):
+class TransactionListPerformanceTests(AccountFixtureMixin, APITestCase):
     """
     Guards the fixes for the /orders/ and /purchases/ list endpoints, which previously
     returned every row a tenant had (unpaginated, with all nested line items) and ran a
@@ -166,34 +203,33 @@ class TransactionListPerformanceTests(APITestCase):
     ORDER_COUNT = 25
 
     def setUp(self):
-        category = Category.objects.create(name="Widgets")
+        self.account, self.user, self.client, self.auth_header = self.make_account_user("boss")
+
+        category = Category.objects.create(name="Widgets", account=self.account)
         self.product = Product.objects.create(
             name="Widget",
             description="",
             cost_price="4.00",
             default_sell_price="10.00",
             category=category,
+            account=self.account,
         )
-        customer = Customer.objects.create(name="Acme")
+        customer = Customer.objects.create(name="Acme", account=self.account)
 
         for _ in range(self.ORDER_COUNT):
-            order = Order.objects.create(customer=customer)
+            order = Order.objects.create(customer=customer, account=self.account)
             OrderItem.objects.create(
                 order=order, product=self.product, quantity=2,
                 unit_price="10.00", unit_multiplier=3,
             )
 
-        supplier = Supplier.objects.create(name="Supplier Co")
+        supplier = Supplier.objects.create(name="Supplier Co", account=self.account)
         for _ in range(self.ORDER_COUNT):
-            purchase = Purchase.objects.create(supplier=supplier)
+            purchase = Purchase.objects.create(supplier=supplier, account=self.account)
             PurchaseItem.objects.create(
                 purchase_order=purchase, product=self.product, quantity=2,
                 unit_price="4.00", unit_multiplier=3,
             )
-
-        self.user = User.objects.create_superuser(username="boss", password="pw12345!")
-        self.client = APIClient()
-        self.auth_header = f"JWT {RefreshToken.for_user(self.user).access_token}"
 
     def get(self, path, params=None):
         return self.client.get(path, params or {}, HTTP_AUTHORIZATION=self.auth_header)
@@ -256,7 +292,7 @@ class TransactionListPerformanceTests(APITestCase):
 
         customer = Customer.objects.get(name="Acme")
         for _ in range(40):
-            order = Order.objects.create(customer=customer)
+            order = Order.objects.create(customer=customer, account=self.account)
             OrderItem.objects.create(
                 order=order, product=self.product, quantity=1,
                 unit_price="10.00", unit_multiplier=1,
@@ -268,7 +304,7 @@ class TransactionListPerformanceTests(APITestCase):
         self.assertEqual(len(before.captured_queries), len(after.captured_queries))
 
 
-class OrdersCSVExportQueryCountTests(APITestCase):
+class OrdersCSVExportQueryCountTests(AccountFixtureMixin, APITestCase):
     """
     The export rendered `item.order.total_profit` per row. select_related builds a distinct
     Order instance for each OrderItem, so that property's `order.items.all()` was never
@@ -276,19 +312,17 @@ class OrdersCSVExportQueryCountTests(APITestCase):
     """
 
     def setUp(self):
-        category = Category.objects.create(name="Widgets")
+        self.account, self.user, self.client, self.auth_header = self.make_account_user("boss")
+        category = Category.objects.create(name="Widgets", account=self.account)
         self.product = Product.objects.create(
             name="Widget", description="", cost_price="4.00",
-            default_sell_price="10.00", category=category,
+            default_sell_price="10.00", category=category, account=self.account,
         )
-        self.customer = Customer.objects.create(name="Acme")
-        self.user = User.objects.create_superuser(username="boss", password="pw12345!")
-        self.client = APIClient()
-        self.auth_header = f"JWT {RefreshToken.for_user(self.user).access_token}"
+        self.customer = Customer.objects.create(name="Acme", account=self.account)
 
     def make_orders(self, count):
         for _ in range(count):
-            order = Order.objects.create(customer=self.customer)
+            order = Order.objects.create(customer=self.customer, account=self.account)
             OrderItem.objects.create(
                 order=order, product=self.product, quantity=2,
                 unit_price="10.00", unit_multiplier=3,
@@ -319,17 +353,15 @@ class OrdersCSVExportQueryCountTests(APITestCase):
             self.assertEqual(row.split(",")[-1], expected)
 
 
-class AnalyticsPayloadTests(APITestCase):
+class AnalyticsPayloadTests(AccountFixtureMixin, APITestCase):
     def setUp(self):
-        category = Category.objects.create(name="Widgets")
+        self.account, self.user, self.client, self.auth_header = self.make_account_user("boss")
+        category = Category.objects.create(name="Widgets", account=self.account)
         for i in range(3):
             Product.objects.create(
                 name=f"Widget {i}", description="", cost_price="1.00",
-                default_sell_price="2.00", category=category,
+                default_sell_price="2.00", category=category, account=self.account,
             )
-        self.user = User.objects.create_superuser(username="boss", password="pw12345!")
-        self.client = APIClient()
-        self.auth_header = f"JWT {RefreshToken.for_user(self.user).access_token}"
 
     def test_products_count_is_served_with_analytics(self):
         # Lets the dashboard's catalog-size tile drop its separate /products/ request.
@@ -339,10 +371,10 @@ class AnalyticsPayloadTests(APITestCase):
         self.assertEqual(body["products_count"], 3)
 
     def test_grouped_series_has_one_row_per_period_not_per_order(self):
-        customer = Customer.objects.create(name="Acme")
+        customer = Customer.objects.create(name="Acme", account=self.account)
         product = Product.objects.first()
         for _ in range(6):
-            order = Order.objects.create(customer=customer)
+            order = Order.objects.create(customer=customer, account=self.account)
             OrderItem.objects.create(
                 order=order, product=product, quantity=1,
                 unit_price="2.00", unit_multiplier=1,
@@ -356,7 +388,7 @@ class AnalyticsPayloadTests(APITestCase):
         self.assertEqual(body["series"][0]["total_revenue"], 12)
 
 
-class LineTotalConsistencyTests(APITestCase):
+class LineTotalConsistencyTests(AccountFixtureMixin, APITestCase):
     """
     total_price on Order/Purchase used to omit unit_multiplier while the item serializers,
     analytics, CSV exports and the frontend all included it. Everything now routes through
@@ -364,28 +396,29 @@ class LineTotalConsistencyTests(APITestCase):
     """
 
     def setUp(self):
-        category = Category.objects.create(name="Widgets")
+        self.account, self.user, self.client, self.auth_header = self.make_account_user("boss")
+        category = Category.objects.create(name="Widgets", account=self.account)
         self.product = Product.objects.create(
             name="Widget", description="", cost_price="4.00",
-            default_sell_price="10.00", category=category,
+            default_sell_price="10.00", category=category, account=self.account,
         )
         # 2 units x multiplier 3 x $10 = $60. With the multiplier dropped it would read $20.
-        self.order = Order.objects.create(customer=Customer.objects.create(name="Acme"))
+        self.order = Order.objects.create(
+            customer=Customer.objects.create(name="Acme", account=self.account),
+            account=self.account,
+        )
         OrderItem.objects.create(
             order=self.order, product=self.product, quantity=2,
             unit_price="10.00", unit_multiplier=3,
         )
         self.purchase = Purchase.objects.create(
-            supplier=Supplier.objects.create(name="Supplier Co")
+            supplier=Supplier.objects.create(name="Supplier Co", account=self.account),
+            account=self.account,
         )
         PurchaseItem.objects.create(
             purchase_order=self.purchase, product=self.product, quantity=2,
             unit_price="4.00", unit_multiplier=3,
         )
-
-        self.user = User.objects.create_superuser(username="boss", password="pw12345!")
-        self.client = APIClient()
-        self.auth_header = f"JWT {RefreshToken.for_user(self.user).access_token}"
 
     def test_order_total_price_includes_unit_multiplier(self):
         self.assertEqual(self.order.total_price, 60)
@@ -434,7 +467,7 @@ class LineTotalConsistencyTests(APITestCase):
         self.assertIn(f"${self.purchase.total_price:.2f}", purchases_csv.content.decode())
 
 
-class OrderStockValidationTests(APITestCase):
+class OrderStockValidationTests(AccountFixtureMixin, APITestCase):
     """
     Orders must never drive stock negative. Three things make this less trivial than it
     looks: stock is consumed as quantity * unit_multiplier, one order may list the same
@@ -442,14 +475,13 @@ class OrderStockValidationTests(APITestCase):
     """
 
     def setUp(self):
-        category = Category.objects.create(name="Widgets")
+        self.account, self.user, self.client, self.auth_header = self.make_account_user("boss")
+        category = Category.objects.create(name="Widgets", account=self.account)
         self.product = Product.objects.create(
             name="Widget", description="", cost_price="4.00",
             default_sell_price="10.00", category=category, stock_quantity=10,
+            account=self.account,
         )
-        self.user = User.objects.create_superuser(username="boss", password="pw12345!")
-        self.client = APIClient()
-        self.auth_header = f"JWT {RefreshToken.for_user(self.user).access_token}"
 
     def post_order(self, items):
         return self.client.post(
@@ -522,7 +554,7 @@ class OrderStockValidationTests(APITestCase):
 
     def test_purchase_duplicate_lines_add_every_line(self):
         # Same stale-instance bug on the increment side.
-        supplier = Supplier.objects.create(name="Supplier Co")
+        supplier = Supplier.objects.create(name="Supplier Co", account=self.account)
         response = self.client.post(
             "/inventory/purchases/",
             {
@@ -540,3 +572,133 @@ class OrderStockValidationTests(APITestCase):
         )
         self.assertEqual(response.status_code, 201)
         self.assertEqual(self.stock(), 16)
+
+
+class CrossAccountIsolationTests(AccountFixtureMixin, APITestCase):
+    def setUp(self):
+        self.account_a, self.user_a, self.client_a, self.header_a = self.make_account_user('alice')
+        self.account_b, self.user_b, self.client_b, self.header_b = self.make_account_user('bob')
+
+        self.category_a = Category.objects.create(name='Widgets', account=self.account_a)
+        self.product_a = Product.objects.create(
+            name='Alice Widget', description='', cost_price='4.00',
+            default_sell_price='10.00', category=self.category_a,
+            stock_quantity=50, account=self.account_a,
+        )
+        self.customer_a = Customer.objects.create(name='Acme', account=self.account_a)
+
+        self.category_b = Category.objects.create(name='Widgets', account=self.account_b)
+        self.product_b = Product.objects.create(
+            name='Bob Widget', description='', cost_price='4.00',
+            default_sell_price='10.00', category=self.category_b,
+            stock_quantity=50, account=self.account_b,
+        )
+
+    def test_list_returns_only_the_callers_products(self):
+        body = self.client_b.get('/inventory/products/', HTTP_AUTHORIZATION=self.header_b).json()
+        names = [p['name'] for p in body['results']]
+        self.assertEqual(names, ['Bob Widget'])
+
+    def test_retrieving_another_accounts_product_is_404(self):
+        response = self.client_b.get(
+            f'/inventory/products/{self.product_a.id}/', HTTP_AUTHORIZATION=self.header_b
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_cannot_delete_another_accounts_product(self):
+        response = self.client_b.delete(
+            f'/inventory/products/{self.product_a.id}/', HTTP_AUTHORIZATION=self.header_b
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertTrue(Product.objects.filter(id=self.product_a.id).exists())
+
+    def test_creating_a_product_stamps_the_callers_account(self):
+        response = self.client_b.post(
+            '/inventory/products/',
+            {
+                'name': 'New Thing', 'description': '', 'cost_price': '1.00',
+                'default_sell_price': '2.00', 'category': self.category_b.id,
+                'stock_quantity': 5,
+            },
+            format='json', HTTP_AUTHORIZATION=self.header_b,
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Product.objects.get(name='New Thing').account, self.account_b)
+
+    def test_cannot_create_a_product_in_another_accounts_category(self):
+        # The FK-injection vector: scoping get_queryset protects reads only.
+        response = self.client_b.post(
+            '/inventory/products/',
+            {
+                'name': 'Injected', 'description': '', 'cost_price': '1.00',
+                'default_sell_price': '2.00', 'category': self.category_a.id,
+                'stock_quantity': 5,
+            },
+            format='json', HTTP_AUTHORIZATION=self.header_b,
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(Product.objects.filter(name='Injected').exists())
+
+    def test_cannot_order_another_accounts_product(self):
+        response = self.client_b.post(
+            '/inventory/orders/',
+            {
+                'exchange_rate': 89000,
+                'items': [{
+                    'product': self.product_a.id, 'quantity': 1,
+                    'unit_multiplier': 1, 'unit_price': '10.00',
+                }],
+            },
+            format='json', HTTP_AUTHORIZATION=self.header_b,
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_cannot_attach_another_accounts_customer_to_an_order(self):
+        response = self.client_b.post(
+            '/inventory/orders/',
+            {
+                'customer': self.customer_a.id,
+                'exchange_rate': 89000,
+                'items': [{
+                    'product': self.product_b.id, 'quantity': 1,
+                    'unit_multiplier': 1, 'unit_price': '10.00',
+                }],
+            },
+            format='json', HTTP_AUTHORIZATION=self.header_b,
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_two_accounts_may_use_the_same_product_name(self):
+        # Previously impossible: name was globally unique.
+        response = self.client_b.post(
+            '/inventory/products/',
+            {
+                'name': 'Alice Widget', 'description': '', 'cost_price': '1.00',
+                'default_sell_price': '2.00', 'category': self.category_b.id,
+                'stock_quantity': 5,
+            },
+            format='json', HTTP_AUTHORIZATION=self.header_b,
+        )
+        self.assertEqual(response.status_code, 201)
+
+    def test_analytics_covers_only_the_callers_account(self):
+        order = Order.objects.create(account=self.account_a, customer=self.customer_a)
+        OrderItem.objects.create(
+            order=order, product=self.product_a, quantity=2,
+            unit_price='10.00', unit_multiplier=1,
+        )
+        body = self.client_b.get('/inventory/analytics/', HTTP_AUTHORIZATION=self.header_b).json()
+        self.assertEqual(body['total_revenue'], '$0.00')
+
+    def test_orders_csv_export_covers_only_the_callers_account(self):
+        order = Order.objects.create(account=self.account_a, customer=self.customer_a)
+        OrderItem.objects.create(
+            order=order, product=self.product_a, quantity=2,
+            unit_price='10.00', unit_multiplier=1,
+        )
+        response = self.client_b.get(
+            '/inventory/orders/export/csv/', HTTP_AUTHORIZATION=self.header_b
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn('Alice Widget', response.content.decode())

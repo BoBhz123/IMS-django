@@ -7,6 +7,38 @@ from .models import Product , Category,Purchase,PurchaseItem,Order,OrderItem,Sup
 import uuid
 
 
+class AccountScopedSerializerMixin:
+    """
+    Narrows every relational field's queryset to the requesting account.
+
+    Scoping get_queryset protects reads. Without this, a caller can still POST a payload
+    referencing another account's row by id and DRF will resolve it happily — the write
+    path is where cross-account data actually leaks.
+
+    Applied in get_fields() rather than __init__ because a nested serializer is constructed
+    twice before it ever sees a request — once when the class body runs, and again by DRF's
+    Field.__deepcopy__ — both times unbound, with an empty context. Reading the account there
+    would freeze `product` to .none() permanently and reject every order. get_fields() is
+    called lazily on first access to .fields, by which point the child is bound and
+    self.context resolves through root to the viewset's context.
+    """
+
+    #: field name -> model, for fields whose queryset must be account-scoped.
+    account_scoped_fields = {}
+
+    def get_fields(self):
+        fields = super().get_fields()
+        account = self.context.get('account')
+        for field_name, model in self.account_scoped_fields.items():
+            field = fields.get(field_name)
+            if field is None:
+                continue
+            field.queryset = (
+                model.objects.for_account(account) if account else model.objects.none()
+            )
+        return fields
+
+
 def _units_by_product_id(items_data):
     """
     Units each product gives up (or gains), keyed by product id.
@@ -42,7 +74,9 @@ class ProductImageSerializer(serializers.ModelSerializer):
 
 
 
-class ProductSerializer(serializers.ModelSerializer):
+class ProductSerializer(AccountScopedSerializerMixin, serializers.ModelSerializer):
+    account_scoped_fields = {'category': Category, 'supplier': Supplier}
+
     images = ProductImageSerializer(many=True, read_only=True)
     class Meta():
         model = Product
@@ -59,7 +93,9 @@ class CategorySerializer(serializers.ModelSerializer):
         fields = ['id','name']
         
         
-class CreatePurchaseItemSerializer(serializers.ModelSerializer):
+class CreatePurchaseItemSerializer(AccountScopedSerializerMixin, serializers.ModelSerializer):
+    account_scoped_fields = {'product': Product}
+
     class Meta:
         model = PurchaseItem
         fields = ['product', 'quantity', 'unit_multiplier', 'unit_price']   
@@ -85,7 +121,9 @@ class PurchaseSerializer(serializers.ModelSerializer):
         model = Purchase
         fields = ['id','placed_at','supplier','exchange_rate','items','total_price']
         
-class CreatePurchaseSerializer(serializers.ModelSerializer):
+class CreatePurchaseSerializer(AccountScopedSerializerMixin, serializers.ModelSerializer):
+    account_scoped_fields = {'supplier': Supplier}
+
     id = serializers.UUIDField(read_only = True)
     items = CreatePurchaseItemSerializer(many=True)
     supplier = serializers.PrimaryKeyRelatedField(
@@ -126,7 +164,9 @@ class CustomerSerializer(serializers.ModelSerializer):
         fields = ['id','name','phone_number','location']
         
         
-class CreateOrderItemSerializer(serializers.ModelSerializer):
+class CreateOrderItemSerializer(AccountScopedSerializerMixin, serializers.ModelSerializer):
+    account_scoped_fields = {'product': Product}
+
     class Meta:
         model = OrderItem
         fields = ['product', 'quantity', 'unit_multiplier', 'unit_price']
@@ -138,7 +178,9 @@ class OrderItemSerializer(serializers.ModelSerializer):
         fields = ['product','quantity','unit_multiplier','unit_price','profit']
         
         
-class CreateOrderSerializer(serializers.ModelSerializer):
+class CreateOrderSerializer(AccountScopedSerializerMixin, serializers.ModelSerializer):
+    account_scoped_fields = {'customer': Customer}
+
     items = CreateOrderItemSerializer(many = True)
     id = serializers.UUIDField(read_only=True)
     customer = serializers.PrimaryKeyRelatedField(

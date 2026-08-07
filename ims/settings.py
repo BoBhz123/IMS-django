@@ -226,9 +226,14 @@ REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
+    # Per-model Django permissions were a proxy for "may this person use the app" in a
+    # single-tenant install. In SaaS the real gates are account scoping (which row can you
+    # see) and subscription status (may you see anything at all). Per-model roles come back
+    # when accounts get staff members with different capabilities.
     'DEFAULT_PERMISSION_CLASSES': (
-        'inventory.permissions.FullDjangoModelPermissions', 
-    )
+        'rest_framework.permissions.IsAuthenticated',
+        'accounts.permissions.HasActiveSubscription',
+    ),
 }
 
 
