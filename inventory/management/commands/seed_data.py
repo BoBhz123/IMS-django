@@ -86,9 +86,10 @@ class Command(BaseCommand):
                  "an owner login (see --owner).",
         )
         parser.add_argument(
-            "--owner", type=str, default="demo",
-            help="Username of the account's owner. Created with password 'demo12345!' if "
-                 "missing, and given an owner Membership of --account.",
+            "--owner", type=str, default="demo@example.com",
+            help="Email address of the account's owner, which doubles as the login "
+                 "username. Created with password 'demo12345!' if missing, and given an "
+                 "owner Membership of --account.",
         )
         parser.add_argument(
             "--products", type=int, default=40, help="Number of products to create."
@@ -110,11 +111,14 @@ class Command(BaseCommand):
         account = self._ensure_account(options["account"], options["owner"])
         self._seed_all(account, options)
 
-    def _ensure_account(self, name, owner_username):
+    def _ensure_account(self, name, owner_email):
         """
         The account replaces the tenant schema as the thing being seeded. Its owner is a
         plain subscriber, never is_staff — under the new role model that flag means
         platform admin over every account, not "can use the app".
+
+        The seeded account is created ACTIVE. Since Phase 2.5a a new Account defaults to
+        pending_verification, which 403s every endpoint — demo data nobody can read.
         """
         account, created = Account.objects.get_or_create(
             name=name,
@@ -126,20 +130,25 @@ class Command(BaseCommand):
         if created:
             self.stdout.write(f"Account created: {name}")
 
-        user, created = User.objects.get_or_create(username=owner_username)
+        # Registration lowercases the email into username; do the same here so a seeded
+        # login and a signed-up one are the same shape.
+        owner_email = owner_email.strip().lower()
+        user, created = User.objects.get_or_create(
+            username=owner_email, defaults={"email": owner_email}
+        )
         if created:
             user.set_password("demo12345!")
             user.save()
-            self.stdout.write(f"Owner login created: {owner_username} / demo12345!")
+            self.stdout.write(f"Owner login created: {owner_email} / demo12345!")
 
         membership, created = Membership.objects.get_or_create(
             user=user, defaults={"account": account, "is_owner": True}
         )
         if created:
-            self.stdout.write(f"Membership: {owner_username} -> {name}")
+            self.stdout.write(f"Membership: {owner_email} -> {name}")
         elif membership.account_id != account.id:
             self.stdout.write(self.style.WARNING(
-                f"'{owner_username}' already belongs to '{membership.account.name}' — "
+                f"'{owner_email}' already belongs to '{membership.account.name}' — "
                 f"seeding into that account instead."
             ))
             return membership.account

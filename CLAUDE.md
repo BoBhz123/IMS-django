@@ -191,7 +191,7 @@ dashboard or hand every subscriber the platform. Drop the global `unique=True` o
 `Category`/`Customer` `.name` for per-account uniqueness, or the first account to name a product blocks
 every other account.
 
-### Phase 2.5 — Secure onboarding & payment gateway — **in progress**
+### Phase 2.5 — Secure onboarding & payment gateway — **2.5a done, 2.5b in progress**
 **Design:** `docs/superpowers/specs/2026-08-08-secure-onboarding-payment-gateway-design.md`
 
 Signup takes email + password + phone, emails a 6-digit code, and grants no access until either a
@@ -203,8 +203,10 @@ entity. Paddle is a merchant of record, so no local acquiring relationship is ne
 interface (`accounts/billing/`) fronts it, with a dummy implementation for tests and credential-free
 local dev — the gateway is the one piece a third party can refuse (see the spec's Risks).
 
-Split for sequencing: **2.5a** identity + email verification (no third party but Resend), **2.5b**
-payments + discount keys (needs live Paddle credentials, which take days to weeks to approve).
+Split for sequencing: **2.5a** identity + email verification (no third party but Resend) — **done**,
+see `HISTORY.md`; **2.5b** payments + discount keys (needs live Paddle credentials, which take days
+to weeks to approve) — **in progress**. Until 2.5b lands, the only route from `pending_payment` to
+`active` is the `activate_accounts` Django admin action.
 
 What the obvious implementation gets wrong:
 - **"No account until paid" is not implementable.** You cannot charge a card or verify an email before
@@ -287,5 +289,18 @@ Append here when something bites. Do not repeat these.
   `--localstorage-file` and shadows jsdom's. `frontend/src/test/setup.js` installs an in-memory
   implementation; without it every component test touching `CurrencyContext`, `ThemeContext`, or
   `lib/api`'s token store dies on `localStorage.getItem` of undefined.
+- **A new `Account` defaults to `pending_verification`, not active.** Since Phase 2.5a `LIVE_STATUSES`
+  is `(ACTIVE,)`, so any fixture that does `Account.objects.create(name=…)` without
+  `subscription_status=Account.ACTIVE` produces an account that 403s every request — the test then
+  fails somewhere far from the cause. `AccountFixtureMixin.make_account_user()` already passes it;
+  `seed_data` forces it too, or the demo data would be unreachable.
+- **`EmailVerification.created_at` is `default=timezone.now`, not `auto_now_add`** — deliberately, so
+  the resend rate-limit tests can shift a row backwards in time instead of sleeping through a real
+  60-second cooldown. `auto_now_add` is not writable and would make those tests impossible.
+- **There is a unique index on `auth_user.email` that `makemigrations` cannot see.** It is raw SQL in
+  `accounts/migrations/0004_auth_user_email_unique.py` (functional on `LOWER(email)`, partial on
+  `email <> ''`), because Django cannot cleanly `AlterField` another app's model. `makemigrations`
+  will never report it as missing and never recreate it — don't assume the constraint is absent
+  because no model field declares it.
 - **`react-router-dom` has 2 open high-severity advisories** (`npm audit`). `npm audit fix --force`
   downgrades to 7.11.0, a breaking change — left alone deliberately; raise it as its own decision.
