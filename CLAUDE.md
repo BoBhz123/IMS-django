@@ -20,7 +20,8 @@ python manage.py makemigrations inventory
 python manage.py migrate
 python manage.py createsuperuser
 python manage.py test                    # whole suite
-python manage.py test inventory.tests    # single app (currently empty — see below)
+python manage.py test inventory.tests    # single module
+python manage.py seed_data               # demo account + fake data (--account/--owner)
 ```
 
 There is no lint/format config (no ruff/flake8/black config files) and no CI in this repo.
@@ -42,8 +43,9 @@ frontend work done — the build catches import errors that neither the tests no
 **Do not use browser automation / Claude-in-Chrome for verification.** Verify through the Django test
 runner, Vitest unit and component tests, or direct API response checks — never by driving a browser.
 
-**No real tests exist yet** — `inventory/tests.py` and `playground/tests.py` are both just the
-Django-generated stub (`# Create your tests here.`). Don't assume test coverage for existing behavior.
+**Tests live in `inventory/tests.py` (69) and `accounts/tests.py` (22)**, all plain
+`TestCase`/`APIClient`. `playground/tests.py` is still the Django-generated stub. Coverage is real but
+not total — it is strongest on stock arithmetic, account isolation, and subscription gating.
 
 **Settings are env-var driven** in `ims/settings.py`: `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`,
 `ALLOWED_HOSTS`, `DATABASE_URL`, `SENTRY_DSN`, and the `AWS_*` block (Cloudflare R2) all fall back to
@@ -62,16 +64,18 @@ Django apps under a single `ims` project, plus a React frontend:
 - **`ims/`** — project config: `settings.py`, root `urls.py`, `storage.py`, wsgi/asgi.
 - **`inventory/`** — the actual product: models, DRF serializers/views/filters, admin. This is where
   almost all work happens.
-- **`accounts/`** — `Account` + `Membership`: who owns data, and subscription state. Added in the
-  Phase 2 migration below.
+- **`accounts/`** — `Account` + `Membership`: who owns data, and subscription state. Also holds
+  `permissions.py` (`HasActiveSubscription`), `mixins.py` (`AccountScopedMixin`), and the signup
+  serializer that provisions an account.
 - **`playground/`** — scratch/dev-only app (`say_hello` view rendering `hello.html`), not part of the
   real API surface. Don't extend it as if it were production code.
 - **`frontend/`** — React + Vite + Tailwind SPA. Built to `frontend/dist/` and served by WhiteNoise
   via `ims/views.py::spa_index`, which is the catch-all route in `ims/urls.py`.
 
-**`tenants/` (removed in Phase 2).** This app used to hold `django-tenants` schema-per-tenant routing.
-If you see references to `TENANT_*` settings, `django_tenants`, `MULTITENANT_RELATIVE_MEDIA_ROOT`, or
-`TenantS3Storage`, they are leftovers — the app is single-database and account-scoped now.
+**There is no `tenants/` app.** It held `django-tenants` schema-per-tenant routing and was deleted in
+Phase 2, along with the dependency itself. Any surviving mention of `TENANT_*` settings,
+`django_tenants`, `MULTITENANT_RELATIVE_MEDIA_ROOT`, or `TenantS3Storage` is a stale comment, not live
+code — the app is single-database and account-scoped.
 
 ### Request flow
 
@@ -118,8 +122,10 @@ Standard DRF pattern repeated per viewset in `inventory/views.py`: `DjangoFilter
 
 ### Reporting/export endpoints
 
-`AnalyticsView`, `ExportOrdersCSVView`, `ExportPurchasesCSVView` in `inventory/views.py` are all
-admin-only (`IsAdminUser`) and support the same ad-hoc `?year=`/`?month=` (and for CSV exports,
+`AnalyticsView`, `ExportOrdersCSVView`, `ExportPurchasesCSVView` in `inventory/views.py` run on the
+default permissions (any subscriber, own account only — they scope by `get_account(request.user)`
+manually, since they are `APIView`s and not viewsets, so `AccountScopedMixin` does not apply). They
+support the same ad-hoc `?year=`/`?month=` (and for CSV exports,
 `?date=`/`?order_id=`/`?purchase_id=`) query-param filtering, applied manually rather than through a
 `FilterSet`. The Django admin (`inventory/admin.py`) has its own, separate CSV-export admin actions
 (`export_orders_to_csv`/`export_purchases_to_csv`) and its own totals annotation — these are not shared
@@ -158,12 +164,12 @@ code with the API export views, so a formula/format fix usually needs to happen 
 **Full design:** `docs/superpowers/specs/2026-08-07-saas-single-db-migration-design.md`
 **Completed work log:** `HISTORY.md` — read it at session start.
 
-**Status:** Phase 1 complete. Phase 2 next.
+**Status:** Phases 1–2 complete. Phase 3 next.
 
 Phases are a dependency chain. 3–5 all touch models that Phase 2 restructures, so running them out of
 order means writing migrations twice. Finish each phase (including its tests) before starting the next.
 
-### Phase 1 — Order stock validation
+### Phase 1 — Order stock validation — **done**
 Reject orders exceeding `Product.stock_quantity` with HTTP 400; disable the frontend add/increment
 controls and show a limit badge at the cap.
 
@@ -175,8 +181,8 @@ Three things the obvious implementation gets wrong:
 - Two concurrent orders can both validate and both deduct. Re-read with `select_for_update()` inside
   the existing `@transaction.atomic` block and re-check before deducting.
 
-### Phase 2 — Single DB, accounts, subscriptions
-Remove `django-tenants`; introduce `Account` + `Membership`; scope all data per account; gate on
+### Phase 2 — Single DB, accounts, subscriptions — **done**
+Removed `django-tenants`; introduce `Account` + `Membership`; scope all data per account; gate on
 subscription status. Existing tenant data is **discarded** (approved) — clean-slate migrations, not
 additive ones, because inventory tables live only inside tenant schemas today and the public schema has
 none of them. Re-permission `AnalyticsView` and the CSV exports off `IsAdminUser`: under the new role
@@ -220,9 +226,22 @@ Append here when something bites. Do not repeat these.
   product.save()` loop in `CreateOrderSerializer`/`CreatePurchaseSerializer` writes stale copies when a
   product appears on two lines — the second save overwrites the first. Aggregate per product and use
   `F()` updates. (Fixed in Phase 1.)
-- **`inventory/tests.py` is not a stub** — it holds a real suite (28 tests before Phase 1) using
-  `TenantTestCase`/`TenantClient`, because `inventory` tables live only in tenant schemas. Phase 2 must
-  migrate every one of these to plain `TestCase`/`APIClient`.
+- **Every test needs an `Account`** — models carry a non-null `account` FK, so a bare
+  `Product.objects.create(name=…)` in a new test fails on the not-null constraint. Use
+  `AccountFixtureMixin.make_account_user()` (top of `inventory/tests.py`), which returns the account,
+  user, authenticated client, and JWT header together.
+- **Tests that write files need an isolated `MEDIA_ROOT`** — `ExternalImageURLTests` saves a real image
+  and, without the `override_settings(MEDIA_ROOT=tempdir)` in its `setUpClass`, drops it into the
+  repo's tracked `media/` directory where it gets committed as a stray artifact.
+- **Account scoping is two independent halves.** `AccountScopedMixin` on the viewset, *and*
+  `AccountScopedSerializerMixin.account_scoped_fields` on every write serializer with a relational
+  field. Adding a new FK to an inventory model without the second half lets a caller POST another
+  account's row by id. The narrowing must stay in `get_fields()`, not `__init__` — nested serializers
+  are constructed unbound with an empty context, twice, before any request exists.
+- **`pipenv uninstall` relocks everything.** Removing `django-tenants` that way silently bumped Django
+  6.0.8 → 6.1 and DRF 3.17 → 3.18 in `Pipfile.lock` (then failed anyway). To drop a package without a
+  drive-by upgrade: delete it from the `Pipfile`, remove just its block from the lock, `pipenv verify`,
+  then `pipenv run pip uninstall <pkg>`.
 - **The frontend had no test runner** until Phase 1 added Vitest (`cd frontend && npm test`). Pure
   logic belongs in `frontend/src/lib/*.js` where it can be tested without React.
 - **Node 22+ ships an experimental `localStorage` global** that resolves to undefined without
