@@ -1,4 +1,5 @@
 from django.contrib.auth.models import User
+from django.core.exceptions import ValidationError
 from django.core.validators import RegexValidator
 from django.db import models
 from django.utils import timezone
@@ -141,3 +142,97 @@ class EmailVerification(models.Model):
 
     def __str__(self):
         return f'code for {self.user.username} ({self.created_at:%Y-%m-%d %H:%M})'
+
+
+class DiscountKey(models.Model):
+    """
+    A prepaid activation code, issued by us rather than by the payment gateway.
+
+    Deliberately not a gateway coupon. A coupon still requires the customer to complete a
+    checkout round trip, and the requirement here is to bypass card checkout entirely for a
+    customer who paid cash, Whish, or OMT. Local keys also record the sale where Phase 3's
+    reporting can see it, and keep working if the gateway is down or never approved.
+    """
+
+    MONTHS = 'months'
+    LIFETIME = 'lifetime'
+    GRANT_CHOICES = [
+        (MONTHS, 'A number of months'),
+        (LIFETIME, 'Lifetime licence'),
+    ]
+
+    code = models.CharField(max_length=32, unique=True, db_index=True)
+    # v1 honours 100 only; anything less needs a second gateway integration to charge the
+    # remainder. The column exists so partial support is additive rather than a migration.
+    percent_off = models.PositiveSmallIntegerField(default=100)
+    grants = models.CharField(max_length=16, choices=GRANT_CHOICES, default=LIFETIME)
+    grant_months = models.PositiveSmallIntegerField(
+        null=True, blank=True, help_text='Required when the key grants months.',
+    )
+    max_redemptions = models.PositiveIntegerField(default=1)
+    redemption_count = models.PositiveIntegerField(default=0)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    is_active = models.BooleanField(default=True, help_text='Kill switch.')
+
+    # What was actually collected, and how. Without this a key is an unexplained free
+    # activation, and there is no way to reconcile keys against cash a year later.
+    amount_paid_usd = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    note = models.CharField(max_length=255, blank=True)
+
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='discount_keys_created',
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return self.formatted_code
+
+    @property
+    def formatted_code(self):
+        from .billing.keys import format_key
+        return format_key(self.code)
+
+    def clean(self):
+        if self.grants == self.MONTHS and not self.grant_months:
+            raise ValidationError(
+                {'grant_months': 'A key that grants months needs a number of months.'}
+            )
+
+    def is_redeemable(self, now=None):
+        """
+        Whether the key may still be used. Read-only — the redeem endpoint re-checks this
+        under a row lock, because two concurrent posts can both see the same True here.
+        """
+        now = now or timezone.now()
+        if not self.is_active:
+            return False
+        if self.expires_at and self.expires_at <= now:
+            return False
+        return self.redemption_count < self.max_redemptions
+
+
+class DiscountKeyRedemption(models.Model):
+    """One account's use of one key. The unique constraint blocks double-dipping."""
+
+    key = models.ForeignKey(
+        DiscountKey, on_delete=models.CASCADE, related_name='redemptions',
+    )
+    account = models.ForeignKey(
+        Account, on_delete=models.CASCADE, related_name='key_redemptions',
+    )
+    redeemed_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ['-redeemed_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['key', 'account'], name='uniq_discount_key_per_account',
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.key.formatted_code} → {self.account.name}'

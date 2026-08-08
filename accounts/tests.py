@@ -5,16 +5,21 @@ from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from django.core import mail
-from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db import IntegrityError, transaction
-from django.test import TestCase, override_settings
+from django.test import Client, TestCase, override_settings
 from django.utils import timezone
 
 from accounts import emails, verification
 from accounts.billing import get_provider
 from accounts.billing.activation import activate_account, add_months
 from accounts.billing.base import PLAN_KEYS, ProviderUnavailable, UnknownPlan
-from accounts.models import Account, EmailVerification, Membership, get_account
+from accounts.billing.keys import (
+    ALPHABET, KEY_LENGTH, format_key, generate_code, normalize_key,
+)
+from accounts.models import (
+    Account, DiscountKey, DiscountKeyRedemption, EmailVerification, Membership, get_account,
+)
 
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -708,3 +713,90 @@ class BillingProviderTests(TestCase):
         # These two lists drifting apart would let checkout accept a plan that
         # activate_account then rejects with a ValueError — a 500, not a 400.
         self.assertEqual(set(PLAN_KEYS), {choice[0] for choice in Account.PLAN_TYPE_CHOICES})
+
+
+class DiscountKeyCodeTests(TestCase):
+    def test_generated_codes_are_the_right_shape(self):
+        code = generate_code()
+        self.assertEqual(len(code), KEY_LENGTH)
+        self.assertTrue(set(code) <= set(ALPHABET))
+
+    def test_the_alphabet_excludes_ambiguous_characters(self):
+        # These keys get read aloud off WhatsApp and copied by hand. O/0 and I/1/L are the
+        # pairs that generate support calls.
+        for character in '01OIL':
+            self.assertNotIn(character, ALPHABET)
+
+    def test_generated_codes_differ(self):
+        self.assertNotEqual(generate_code(), generate_code())
+
+    def test_normalize_strips_the_formatting_people_type(self):
+        self.assertEqual(normalize_key('abcd-efgh-jkmn'), 'ABCDEFGHJKMN')
+        self.assertEqual(normalize_key('  ABCD EFGH JKMN '), 'ABCDEFGHJKMN')
+
+    def test_normalize_survives_none(self):
+        self.assertEqual(normalize_key(None), '')
+
+    def test_format_groups_in_fours(self):
+        self.assertEqual(format_key('ABCDEFGHJKMN'), 'ABCD-EFGH-JKMN')
+
+
+class DiscountKeyModelTests(TestCase):
+    def test_a_fresh_key_is_redeemable(self):
+        key = DiscountKey.objects.create(code=generate_code(), grants=DiscountKey.LIFETIME)
+        self.assertTrue(key.is_redeemable())
+
+    def test_a_deactivated_key_is_not(self):
+        key = DiscountKey.objects.create(
+            code=generate_code(), grants=DiscountKey.LIFETIME, is_active=False,
+        )
+        self.assertFalse(key.is_redeemable())
+
+    def test_an_expired_key_is_not(self):
+        key = DiscountKey.objects.create(
+            code=generate_code(),
+            grants=DiscountKey.LIFETIME,
+            expires_at=timezone.now() - timedelta(minutes=1),
+        )
+        self.assertFalse(key.is_redeemable())
+
+    def test_an_exhausted_key_is_not(self):
+        key = DiscountKey.objects.create(
+            code=generate_code(),
+            grants=DiscountKey.LIFETIME,
+            max_redemptions=2,
+            redemption_count=2,
+        )
+        self.assertFalse(key.is_redeemable())
+
+    def test_a_multi_use_key_with_room_left_is(self):
+        key = DiscountKey.objects.create(
+            code=generate_code(),
+            grants=DiscountKey.LIFETIME,
+            max_redemptions=5,
+            redemption_count=4,
+        )
+        self.assertTrue(key.is_redeemable())
+
+    def test_codes_are_unique(self):
+        DiscountKey.objects.create(code='ABCDEFGHJKMN', grants=DiscountKey.LIFETIME)
+        with self.assertRaises(IntegrityError):
+            DiscountKey.objects.create(code='ABCDEFGHJKMN', grants=DiscountKey.LIFETIME)
+
+    def test_a_months_key_requires_a_month_count(self):
+        key = DiscountKey(code=generate_code(), grants=DiscountKey.MONTHS, grant_months=None)
+        with self.assertRaises(ValidationError):
+            key.full_clean()
+
+    def test_a_lifetime_key_needs_no_month_count(self):
+        key = DiscountKey(code=generate_code(), grants=DiscountKey.LIFETIME)
+        key.full_clean()  # must not raise
+
+    def test_the_same_account_cannot_redeem_one_key_twice(self):
+        account = Account.objects.create(name='Acme')
+        key = DiscountKey.objects.create(
+            code=generate_code(), grants=DiscountKey.LIFETIME, max_redemptions=5,
+        )
+        DiscountKeyRedemption.objects.create(key=key, account=account)
+        with self.assertRaises(IntegrityError):
+            DiscountKeyRedemption.objects.create(key=key, account=account)
