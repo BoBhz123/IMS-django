@@ -1,8 +1,11 @@
+from django.contrib.auth.models import User
 from django.db import transaction
 from djoser.serializers import UserCreateSerializer
 from rest_framework import serializers
 
+from .emails import send_verification_code
 from .models import Account, Membership
+from .verification import issue_code
 
 
 class UserCreateWithAccountSerializer(UserCreateSerializer):
@@ -14,33 +17,66 @@ class UserCreateWithAccountSerializer(UserCreateSerializer):
     Deliberately a serializer override rather than a post_save signal on User: a signal
     would also fire for createsuperuser, giving platform admins a workspace they should not
     have. Provisioning belongs to the registration endpoint, not to user creation generally.
+
+    `username` is derived from the email rather than collected. AUTH_USER_MODEL is not
+    swapped — that is a now-or-never migration against live users, and nothing here needs it
+    — so `username` remains the field simplejwt authenticates against, and the frontend
+    simply posts the email into it at login.
     """
 
+    email = serializers.EmailField(required=True, max_length=150)
+    phone = serializers.CharField(required=True, max_length=32, write_only=True)
     business_name = serializers.CharField(
         required=False, allow_blank=True, write_only=True, max_length=255,
     )
 
     class Meta(UserCreateSerializer.Meta):
-        fields = tuple(UserCreateSerializer.Meta.fields) + ('business_name',)
+        model = User
+        fields = ('id', 'email', 'password', 'phone', 'business_name')
+
+    def validate_email(self, value):
+        email = value.strip().lower()
+        if len(email) > 150:
+            # username is a 150-char column. Longer addresses are legal but effectively
+            # nonexistent; failing loudly beats silently truncating someone's login.
+            raise serializers.ValidationError('This email address is too long.')
+        # The database has a case-insensitive unique index as the real backstop — two
+        # concurrent posts can both pass this check. This exists so the normal case gets a
+        # field error instead of a 500.
+        if User.objects.filter(email__iexact=email).exists():
+            raise serializers.ValidationError('An account with this email already exists.')
+        return email
+
+    def validate_phone(self, value):
+        phone = ' '.join(value.split())
+        Account._meta.get_field('phone').run_validators(phone)
+        return phone
 
     def validate(self, attrs):
-        # djoser's validate() runs `User(**attrs)` to feed Django's password validators.
-        # business_name is not a User column, so it has to be lifted out for that call and
-        # put back for create().
-        business_name = attrs.pop('business_name', None)
+        # djoser's validate() runs `User(**attrs)` to feed Django's password validators, so
+        # anything that is not a User column has to be lifted out for that call and put back
+        # for create(). username is injected here because create_user() requires it.
+        extras = {key: attrs.pop(key) for key in ('phone', 'business_name') if key in attrs}
+        attrs['username'] = attrs['email']
         attrs = super().validate(attrs)
-        if business_name is not None:
-            attrs['business_name'] = business_name
+        attrs.update(extras)
         return attrs
 
     @transaction.atomic
     def create(self, validated_data):
+        phone = validated_data.pop('phone')
         business_name = (validated_data.pop('business_name', '') or '').strip()
-        user = super().create(validated_data)
 
+        user = super().create(validated_data)
         account = Account.objects.create(
-            name=business_name or user.username,
+            name=business_name or user.email,
+            phone=phone,
             subscription_status=Account.PENDING_VERIFICATION,
         )
         Membership.objects.create(user=user, account=account, is_owner=True)
+
+        _, code = issue_code(user)
+        # on_commit, not inline: a send failure must not roll back a perfectly good account,
+        # and the email must not go out if the transaction is about to fail. The user resends.
+        transaction.on_commit(lambda: send_verification_code(user, code))
         return user

@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from django.core import mail
+from django.db import IntegrityError, transaction
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
@@ -164,55 +165,131 @@ class SubscriptionEnforcementTests(TestCase):
         self.assertEqual(response.status_code, 200)
 
 
-class SignupProvisioningTests(TestCase):
-    def signup(self, **payload):
-        return APIClient().post('/auth/users/', {
-            'username': payload.get('username', 'newbiz'),
-            'password': payload.get('password', 'sTr0ng-pw-2026'),
-            **({'business_name': payload['business_name']} if 'business_name' in payload else {}),
-        }, format='json')
+@override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')
+class RegistrationTests(TestCase):
+    URL = '/auth/users/'
+    PAYLOAD = {
+        'email': 'Owner@Example.com',
+        'password': 'sTr0ng-pw-2026',
+        'phone': '+961 70 123 456',
+        'business_name': 'Corner Shop',
+    }
 
-    def test_signup_creates_an_account_and_an_owner_membership(self):
-        response = self.signup(business_name='Corner Shop')
-        self.assertEqual(response.status_code, 201)
-        user = User.objects.get(username='newbiz')
-        self.assertEqual(user.membership.account.name, 'Corner Shop')
+    def setUp(self):
+        self.client = APIClient()
+        mail.outbox = []
+
+    def post(self, **overrides):
+        # The verification email is sent from transaction.on_commit, and TestCase wraps each
+        # test in a transaction it never commits — so without capturing them the callbacks
+        # silently never run and the email assertions test nothing.
+        with self.captureOnCommitCallbacks(execute=True):
+            return self.client.post(self.URL, {**self.PAYLOAD, **overrides}, format='json')
+
+    def test_registration_provisions_user_account_and_membership(self):
+        response = self.post()
+        self.assertEqual(response.status_code, 201, response.data)
+        user = User.objects.get(email__iexact='owner@example.com')
+        # username is derived from the email, lowercased. AUTH_USER_MODEL was not swapped, so
+        # username remains the column simplejwt authenticates against.
+        self.assertEqual(user.username, 'owner@example.com')
+        self.assertEqual(user.email, 'owner@example.com')
+        account = user.membership.account
+        self.assertEqual(account.name, 'Corner Shop')
+        self.assertEqual(account.phone, '+961 70 123 456')
         self.assertTrue(user.membership.is_owner)
 
-    def test_account_name_defaults_to_the_username(self):
-        self.signup()
-        self.assertEqual(User.objects.get(username='newbiz').membership.account.name, 'newbiz')
-
     def test_a_fresh_signup_grants_no_access(self):
-        # The payment wall's whole premise. Signup provisions an account that exists and is
-        # inert; nothing about registering earns a single request.
-        self.signup()
-        account = User.objects.get(username='newbiz').membership.account
+        # The payment wall's whole premise. Registering earns exactly nothing.
+        self.post()
+        account = Account.objects.get(memberships__user__email__iexact='owner@example.com')
         self.assertEqual(account.subscription_status, Account.PENDING_VERIFICATION)
         self.assertEqual(account.plan_type, '')
         self.assertIsNone(account.expires_at)
         self.assertFalse(account.has_active_subscription)
 
+    def test_registration_emails_a_code(self):
+        self.post()
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ['owner@example.com'])
+        self.assertEqual(EmailVerification.objects.count(), 1)
+
+    def test_the_new_user_can_log_in_but_not_use_the_api(self):
+        # Login must work or they could never reach the verify endpoint; everything else stays
+        # shut until payment.
+        self.post()
+        login = self.client.post(
+            '/auth/jwt/create/',
+            {'username': 'owner@example.com', 'password': self.PAYLOAD['password']},
+            format='json',
+        )
+        self.assertEqual(login.status_code, 200, login.data)
+        token = login.json()['access']
+        blocked = self.client.get('/inventory/products/', HTTP_AUTHORIZATION=f'JWT {token}')
+        self.assertEqual(blocked.status_code, 403)
+        self.assertEqual(blocked.json()['code'], 'subscription_expired')
+
+    def test_email_is_required(self):
+        response = self.post(email='')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('email', response.data)
+
+    def test_phone_is_required(self):
+        response = self.post(phone='')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('phone', response.data)
+
+    def test_a_junk_phone_is_rejected(self):
+        response = self.post(phone='call me')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('phone', response.data)
+
+    def test_a_duplicate_email_is_rejected_case_insensitively(self):
+        self.post()
+        response = self.post(email='OWNER@example.com')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('email', response.data)
+        self.assertEqual(User.objects.filter(email__iexact='owner@example.com').count(), 1)
+
+    def test_the_database_enforces_email_uniqueness_too(self):
+        # The serializer's check is racy — two concurrent posts can both pass it. This proves
+        # the case-insensitive index behind it exists and is doing the real work.
+        User.objects.create_user(
+            username='a@example.com', email='a@example.com', password='pw12345!',
+        )
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            User.objects.create_user(
+                username='b@example.com', email='A@Example.com', password='pw12345!',
+            )
+
+    def test_blank_emails_do_not_collide(self):
+        # The index is partial for exactly this reason: superusers made without an address
+        # would otherwise all collide on the empty string.
+        User.objects.create_user(username='one', email='', password='pw12345!')
+        User.objects.create_user(username='two', email='', password='pw12345!')
+        self.assertEqual(User.objects.filter(email='').count(), 2)
+
+    def test_a_weak_password_is_rejected(self):
+        response = self.post(password='pw')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('password', response.data)
+
+    def test_business_name_falls_back_to_the_email(self):
+        self.post(business_name='')
+        account = Account.objects.get(memberships__user__email__iexact='owner@example.com')
+        self.assertEqual(account.name, 'owner@example.com')
+
+    def test_a_failed_email_send_still_produces_a_usable_account(self):
+        with patch('accounts.serializers.send_verification_code', return_value=False):
+            response = self.post()
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertTrue(User.objects.filter(email__iexact='owner@example.com').exists())
+
     def test_new_users_are_never_staff(self):
-        self.signup()
-        user = User.objects.get(username='newbiz')
+        self.post()
+        user = User.objects.get(email__iexact='owner@example.com')
         self.assertFalse(user.is_staff)
         self.assertFalse(user.is_superuser)
-
-    def test_a_new_signup_can_log_in_but_not_use_the_api(self):
-        # Both halves matter. Login must work — otherwise the user cannot reach the verify
-        # endpoint at all — while every business endpoint stays shut.
-        self.signup()
-        client = APIClient()
-        login = client.post(
-            '/auth/jwt/create/',
-            {'username': 'newbiz', 'password': 'sTr0ng-pw-2026'}, format='json',
-        )
-        self.assertEqual(login.status_code, 200)
-        token = login.json()['access']
-        response = client.get('/inventory/products/', HTTP_AUTHORIZATION=f'JWT {token}')
-        self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()['code'], 'subscription_expired')
 
     def test_createsuperuser_provisions_no_account(self):
         # Platform admins are not subscribers and must not own a workspace.
