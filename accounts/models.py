@@ -109,3 +109,35 @@ def get_account(user):
         return None
     membership = getattr(user, 'membership', None)
     return membership.account if membership else None
+
+
+class EmailVerification(models.Model):
+    """
+    One issued code. A row per send rather than one overwritten row: the hourly send cap and
+    any later abuse investigation both need something to count.
+
+    The code is stored as an HMAC, not plaintext — but be clear about what that buys. Any
+    hash of a six-digit space falls instantly to an offline attacker, so hashing only keeps
+    the code out of logs, backups and the admin, and makes a database-only leak useless
+    without SECRET_KEY. The real defence is `attempts` plus `expires_at`.
+    """
+
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='email_verifications',
+    )
+    code_hash = models.CharField(max_length=64)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    # default=timezone.now, not auto_now_add: auto_now_add ignores assignment, which would
+    # make the resend rate limits untestable without real sleeping.
+    created_at = models.DateTimeField(default=timezone.now)
+    expires_at = models.DateTimeField()
+    consumed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', '-created_at'], name='emailverif_user_created_idx'),
+        ]
+
+    def __str__(self):
+        return f'code for {self.user.username} ({self.created_at:%Y-%m-%d %H:%M})'

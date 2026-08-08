@@ -1,10 +1,14 @@
 from datetime import timedelta
+from smtplib import SMTPException
+from unittest.mock import patch
 
 from django.contrib.auth.models import User
-from django.test import TestCase
+from django.core import mail
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from accounts.models import Account, Membership, get_account
+from accounts import emails, verification
+from accounts.models import Account, EmailVerification, Membership, get_account
 
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -214,3 +218,135 @@ class SignupProvisioningTests(TestCase):
         # Platform admins are not subscribers and must not own a workspace.
         admin = User.objects.create_superuser(username='platform', password='pw12345!')
         self.assertIsNone(get_account(admin))
+
+
+def _shift_sends_back(user, seconds=120):
+    """
+    Moves a user's issued codes back in time so the next issue_code clears the 60-second
+    cooldown without clearing the hourly cap. Faster and far less brittle than sleeping.
+    """
+    for row in EmailVerification.objects.filter(user=user):
+        EmailVerification.objects.filter(pk=row.pk).update(
+            created_at=row.created_at - timedelta(seconds=seconds),
+        )
+
+
+class VerificationCodeTests(TestCase):
+    """
+    A 6-digit code is 1,000,000 guesses — a few minutes of scripting. Expiry alone does not
+    protect it; the attempt cap and the resend limits are the actual defence.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='owner@example.com', email='owner@example.com', password='pw12345!',
+        )
+
+    def test_generated_codes_are_six_digits(self):
+        for _ in range(50):
+            code = verification.generate_code()
+            self.assertEqual(len(code), 6)
+            self.assertTrue(code.isdigit())
+
+    def test_the_code_is_not_stored_in_plaintext(self):
+        row, code = verification.issue_code(self.user)
+        self.assertNotIn(code, row.code_hash)
+        self.assertEqual(row.code_hash, verification.hash_code(code))
+        self.assertEqual(len(row.code_hash), 64)
+
+    def test_correct_code_verifies(self):
+        _, code = verification.issue_code(self.user)
+        self.assertEqual(verification.verify_code(self.user, code), verification.OK)
+
+    def test_a_consumed_code_cannot_be_replayed(self):
+        _, code = verification.issue_code(self.user)
+        verification.verify_code(self.user, code)
+        self.assertEqual(verification.verify_code(self.user, code), verification.NO_CODE)
+
+    def test_wrong_code_is_rejected_and_counted(self):
+        row, _ = verification.issue_code(self.user)
+        self.assertEqual(verification.verify_code(self.user, '000000'), verification.INVALID)
+        row.refresh_from_db()
+        self.assertEqual(row.attempts, 1)
+
+    def test_the_code_dies_after_five_wrong_attempts(self):
+        _, code = verification.issue_code(self.user)
+        for _ in range(verification.MAX_ATTEMPTS):
+            verification.verify_code(self.user, '000000')
+        # Even the *correct* code is refused now — this is what stops brute force.
+        self.assertEqual(verification.verify_code(self.user, code), verification.LOCKED)
+
+    def test_an_expired_code_is_rejected(self):
+        row, code = verification.issue_code(self.user)
+        row.expires_at = timezone.now() - timedelta(seconds=1)
+        row.save(update_fields=['expires_at'])
+        self.assertEqual(verification.verify_code(self.user, code), verification.EXPIRED)
+
+    def test_verifying_with_no_outstanding_code(self):
+        self.assertEqual(verification.verify_code(self.user, '123456'), verification.NO_CODE)
+
+    def test_an_empty_submission_does_not_blow_up(self):
+        verification.issue_code(self.user)
+        self.assertEqual(verification.verify_code(self.user, None), verification.INVALID)
+        self.assertEqual(verification.verify_code(self.user, ''), verification.INVALID)
+
+    def test_reissuing_invalidates_the_previous_code(self):
+        _, first = verification.issue_code(self.user)
+        _shift_sends_back(self.user)
+        _, second = verification.issue_code(self.user)
+        self.assertEqual(verification.verify_code(self.user, first), verification.INVALID)
+        self.assertEqual(verification.verify_code(self.user, second), verification.OK)
+
+    def test_resend_is_rate_limited_to_one_a_minute(self):
+        verification.issue_code(self.user)
+        with self.assertRaises(verification.ResendThrottled) as caught:
+            verification.issue_code(self.user)
+        self.assertGreater(caught.exception.retry_after, 0)
+
+    def test_resend_is_capped_per_hour(self):
+        # An unthrottled resend endpoint is an email bomb aimed at a third party, and a bill.
+        for _ in range(verification.MAX_SENDS_PER_HOUR):
+            verification.issue_code(self.user)
+            _shift_sends_back(self.user)
+        with self.assertRaises(verification.ResendThrottled):
+            verification.issue_code(self.user)
+
+    def test_one_users_codes_do_not_affect_another(self):
+        other = User.objects.create_user(
+            username='other@example.com', email='other@example.com', password='pw12345!',
+        )
+        _, mine = verification.issue_code(self.user)
+        _, theirs = verification.issue_code(other)
+        self.assertEqual(verification.verify_code(other, mine), verification.INVALID)
+        self.assertEqual(verification.verify_code(other, theirs), verification.OK)
+
+
+@override_settings(
+    EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend',
+    DEFAULT_FROM_EMAIL='ims@example.com',
+)
+class VerificationEmailTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='owner@example.com', email='owner@example.com', password='pw12345!',
+        )
+        mail.outbox = []
+
+    def test_the_code_is_in_the_email(self):
+        self.assertTrue(emails.send_verification_code(self.user, '123456'))
+        self.assertEqual(len(mail.outbox), 1)
+        message = mail.outbox[0]
+        self.assertEqual(message.to, ['owner@example.com'])
+        self.assertIn('123456', message.body)
+        self.assertIn('10 minutes', message.body)
+
+    def test_a_send_failure_is_reported_not_raised(self):
+        # Signup must not die because a third party's SMTP is down — the user can resend.
+        with patch('accounts.emails.send_mail', side_effect=SMTPException('boom')):
+            self.assertFalse(emails.send_verification_code(self.user, '123456'))
+
+    def test_no_email_address_is_not_an_error(self):
+        self.user.email = ''
+        self.user.save(update_fields=['email'])
+        self.assertFalse(emails.send_verification_code(self.user, '123456'))
+        self.assertEqual(len(mail.outbox), 0)

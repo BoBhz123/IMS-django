@@ -331,11 +331,14 @@ AWS_QUERYSTRING_AUTH = False  # serve plain URLs, not presigned ones
 if AWS_STORAGE_BUCKET_NAME:
     STORAGES['default']['BACKEND'] = 'ims.storage.MediaS3Storage'
 
+# Resend over plain SMTP (smtp.resend.com:587, user 'resend', password = the API key), so
+# Django's own backend is reused and no SDK dependency is added. Left unset, these fall back
+# to the local smtp4dev container.
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-EMAIL_HOST = 'localhost'
-EMAIL_PORT = 25  # Matches the smtp4dev container port mapping
-EMAIL_HOST_USER = ''
-EMAIL_HOST_PASSWORD = ''
-EMAIL_USE_TLS = False
-EMAIL_USE_SSL = False
-DEFAULT_FROM_EMAIL = 'ims-system@local.test'
+EMAIL_HOST = os.environ.get('EMAIL_HOST', 'localhost')
+EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '25'))  # 25 matches smtp4dev's port mapping
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'False') == 'True'
+EMAIL_USE_SSL = os.environ.get('EMAIL_USE_SSL', 'False') == 'True'
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'ims-system@local.test')
