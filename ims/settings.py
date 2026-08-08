@@ -353,3 +353,15 @@ EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
 EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'False') == 'True'
 EMAIL_USE_SSL = os.environ.get('EMAIL_USE_SSL', 'False') == 'True'
 DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'ims-system@local.test')
+
+# --- Billing -------------------------------------------------------------------------
+# 'dummy' refuses card checkout and leaves discount keys as the only activation route.
+# 'paddle' is reserved for Phase 2.5b-2 and currently raises ImproperlyConfigured rather
+# than half-working.
+BILLING_PROVIDER = os.environ.get('BILLING_PROVIDER', 'dummy')
+
+# Display only — what the plan cards show. The server never accepts an amount from the
+# client; when Paddle lands, the charged amount comes from a configured price id, and these
+# exist purely so the SPA has something to render.
+BILLING_PRICE_MONTHLY_USD = os.environ.get('BILLING_PRICE_MONTHLY_USD', '15')
+BILLING_PRICE_ONE_TIME_USD = os.environ.get('BILLING_PRICE_ONE_TIME_USD', '299')

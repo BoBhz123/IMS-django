@@ -5,12 +5,15 @@ from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from django.core import mail
+from django.core.exceptions import ImproperlyConfigured
 from django.db import IntegrityError, transaction
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from accounts import emails, verification
+from accounts.billing import get_provider
 from accounts.billing.activation import activate_account, add_months
+from accounts.billing.base import PLAN_KEYS, ProviderUnavailable, UnknownPlan
 from accounts.models import Account, EmailVerification, Membership, get_account
 
 from rest_framework.test import APIClient
@@ -668,3 +671,40 @@ class AddMonthsTests(TestCase):
         moment = datetime(2026, 6, 10, 9, 30, tzinfo=dt_timezone.utc)
         self.assertEqual(add_months(moment, 1).hour, 9)
         self.assertEqual(add_months(moment, 1).minute, 30)
+
+
+class BillingProviderTests(TestCase):
+    def setUp(self):
+        self.account = Account.objects.create(
+            name='Acme', subscription_status=Account.PENDING_PAYMENT,
+        )
+
+    def test_the_default_provider_is_the_dummy(self):
+        self.assertEqual(get_provider().name, 'dummy')
+
+    def test_the_dummy_refuses_checkout_rather_than_pretending(self):
+        # A dummy that returned a plausible checkout would let a broken deployment look
+        # like a working one right up to the point somebody expects money.
+        with self.assertRaises(ProviderUnavailable):
+            get_provider().create_checkout(self.account, 'monthly')
+
+    def test_an_unknown_plan_is_rejected_before_the_provider_is_reached(self):
+        with self.assertRaises(UnknownPlan):
+            get_provider().create_checkout(self.account, 'enterprise')
+
+    @override_settings(BILLING_PROVIDER='paddle')
+    def test_paddle_is_not_wired_yet_and_says_so(self):
+        # Better a loud error naming the phase than a mystery ImportError.
+        with self.assertRaises(ImproperlyConfigured) as caught:
+            get_provider()
+        self.assertIn('2.5b-2', str(caught.exception))
+
+    @override_settings(BILLING_PROVIDER='nonsense')
+    def test_an_unrecognised_provider_is_a_configuration_error(self):
+        with self.assertRaises(ImproperlyConfigured):
+            get_provider()
+
+    def test_plan_keys_match_the_account_model(self):
+        # These two lists drifting apart would let checkout accept a plan that
+        # activate_account then rejects with a ValueError — a 500, not a 400.
+        self.assertEqual(set(PLAN_KEYS), {choice[0] for choice in Account.PLAN_TYPE_CHOICES})
