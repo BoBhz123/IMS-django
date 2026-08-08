@@ -1,4 +1,5 @@
-from datetime import timedelta
+from datetime import date, datetime, timedelta
+from datetime import timezone as dt_timezone
 from smtplib import SMTPException
 from unittest.mock import patch
 
@@ -9,6 +10,7 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from accounts import emails, verification
+from accounts.billing.activation import activate_account, add_months
 from accounts.models import Account, EmailVerification, Membership, get_account
 
 from rest_framework.test import APIClient
@@ -566,3 +568,103 @@ class OnboardingEndpointTests(TestCase):
             anonymous.post('/accounts/verify-email/', {'code': '1'}).status_code, 401,
         )
         self.assertEqual(anonymous.post('/accounts/resend-code/').status_code, 401)
+
+
+class ActivationTests(TestCase):
+    """
+    activate_account is the single place an account becomes usable. The webhook in 2.5b-2
+    will call it too, so the expiry arithmetic is tested here rather than through whichever
+    endpoint happens to reach it.
+    """
+
+    def setUp(self):
+        self.account = Account.objects.create(
+            name='Acme', subscription_status=Account.PENDING_PAYMENT,
+        )
+
+    def test_lifetime_never_expires(self):
+        activate_account(self.account, plan_type=Account.ONE_TIME)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.subscription_status, Account.ACTIVE)
+        self.assertEqual(self.account.plan_type, Account.ONE_TIME)
+        self.assertIsNone(self.account.expires_at)
+        self.assertTrue(self.account.has_active_subscription)
+
+    def test_months_set_an_expiry_in_the_future(self):
+        activate_account(self.account, plan_type=Account.MONTHLY, months=3)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.subscription_status, Account.ACTIVE)
+        self.assertEqual(self.account.plan_type, Account.MONTHLY)
+        expected = add_months(timezone.now(), 3)
+        self.assertLess(abs((self.account.expires_at - expected).total_seconds()), 60)
+
+    def test_renewing_early_adds_to_the_time_left(self):
+        # Redeeming a second key with a month still on the clock must not throw that month
+        # away — extend from the existing expiry, not from now.
+        future = timezone.now() + timedelta(days=30)
+        self.account.expires_at = future
+        self.account.subscription_status = Account.ACTIVE
+        self.account.save()
+
+        activate_account(self.account, plan_type=Account.MONTHLY, months=1)
+        self.account.refresh_from_db()
+        expected = add_months(future, 1)
+        self.assertLess(abs((self.account.expires_at - expected).total_seconds()), 60)
+
+    def test_renewing_after_lapsing_starts_from_now(self):
+        # The mirror of the above: a lapsed account must not have its new month consumed by
+        # the time it spent expired.
+        self.account.expires_at = timezone.now() - timedelta(days=90)
+        self.account.subscription_status = Account.PAST_DUE
+        self.account.save()
+
+        activate_account(self.account, plan_type=Account.MONTHLY, months=1)
+        self.account.refresh_from_db()
+        expected = add_months(timezone.now(), 1)
+        self.assertLess(abs((self.account.expires_at - expected).total_seconds()), 60)
+
+    def test_a_lifetime_grant_clears_an_earlier_expiry(self):
+        self.account.expires_at = timezone.now() + timedelta(days=5)
+        self.account.save()
+        activate_account(self.account, plan_type=Account.ONE_TIME)
+        self.account.refresh_from_db()
+        self.assertIsNone(self.account.expires_at)
+
+    def test_grace_days_extend_the_expiry(self):
+        activate_account(self.account, plan_type=Account.MONTHLY, months=1, grace_days=3)
+        self.account.refresh_from_db()
+        expected = add_months(timezone.now(), 1) + timedelta(days=3)
+        self.assertLess(abs((self.account.expires_at - expected).total_seconds()), 60)
+
+    def test_monthly_without_months_is_a_programming_error(self):
+        with self.assertRaises(ValueError):
+            activate_account(self.account, plan_type=Account.MONTHLY)
+
+    def test_unknown_plan_type_is_rejected(self):
+        with self.assertRaises(ValueError):
+            activate_account(self.account, plan_type='enterprise', months=1)
+
+
+class AddMonthsTests(TestCase):
+    def test_adds_a_calendar_month(self):
+        moment = datetime(2026, 1, 15, 12, 0, tzinfo=dt_timezone.utc)
+        self.assertEqual(add_months(moment, 1).date(), date(2026, 2, 15))
+
+    def test_clamps_to_the_end_of_a_short_month(self):
+        # 31 January + 1 month has no 31 February. Rolling over to 3 March would hand out
+        # days nobody paid for and drift further with every renewal.
+        moment = datetime(2026, 1, 31, 12, 0, tzinfo=dt_timezone.utc)
+        self.assertEqual(add_months(moment, 1).date(), date(2026, 2, 28))
+
+    def test_crosses_a_year_boundary(self):
+        moment = datetime(2026, 11, 30, 12, 0, tzinfo=dt_timezone.utc)
+        self.assertEqual(add_months(moment, 3).date(), date(2027, 2, 28))
+
+    def test_twelve_months_is_the_same_date_next_year(self):
+        moment = datetime(2026, 6, 10, 12, 0, tzinfo=dt_timezone.utc)
+        self.assertEqual(add_months(moment, 12).date(), date(2027, 6, 10))
+
+    def test_preserves_the_time_of_day(self):
+        moment = datetime(2026, 6, 10, 9, 30, tzinfo=dt_timezone.utc)
+        self.assertEqual(add_months(moment, 1).hour, 9)
+        self.assertEqual(add_months(moment, 1).minute, 30)
