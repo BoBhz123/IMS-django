@@ -203,6 +203,22 @@ entity. Paddle is a merchant of record, so no local acquiring relationship is ne
 interface (`accounts/billing/`) fronts it, with a dummy implementation for tests and credential-free
 local dev — the gateway is the one piece a third party can refuse (see the spec's Risks).
 
+**💵 Card payments and subscriptions are USD-only. Non-negotiable.** Every card charge, plan price,
+checkout session, and subscription renewal is denominated in USD and nothing else. Do not add a
+currency parameter to any billing endpoint, do not pass LBP or a local amount to the gateway, and do
+not convert an amount before charging it. `BILLING_PRICE_*_USD` are USD by name and by contract.
+
+LBP exists in this app for exactly two things, neither of which touches billing:
+1. the **frontend display toggle** (`CurrencyContext`, `DEFAULT_EXCHANGE_RATE = 89000`), which
+   reformats USD figures for reading and never changes a stored value; and
+2. **local cash bookkeeping** — `Purchase`/`Order`/`Expense` amounts are stored in USD with an
+   `exchange_rate` recorded alongside for the informal dual-currency record-keeping this business
+   does.
+
+The rule to hold onto: the exchange rate is a *presentation and record-keeping* detail. The moment an
+amount is on its way to a payment gateway it is USD, it came from a server-side configured price, and
+it is never multiplied by anything.
+
 Split for sequencing, and 2.5b split again once the Paddle dependency was isolated:
 
 - **2.5a** identity + email verification (no third party but Resend) — **done**, see `HISTORY.md`.
@@ -259,7 +275,8 @@ What the obvious implementation gets wrong:
   polls status and never reports success. Verify Paddle's signature before parsing, and record
   `event_id` for idempotency — providers retry, and a double-activation double-extends `expires_at`.
 - **Never accept an amount from the client.** It sends a plan *key*; the server maps it to a configured
-  price id.
+  price id. It never sends a currency either — see the USD-only rule above; the only correct answer to
+  "which currency?" at checkout is USD, so there is no parameter to get wrong.
 - **Discount keys are local, not Paddle coupons.** A gateway coupon still needs the checkout round
   trip, and the requirement is to bypass card checkout entirely. Local keys also record the cash sale
   where Phase 3's reporting can see it, and keep working if Paddle is down or unapproved. Redeem under

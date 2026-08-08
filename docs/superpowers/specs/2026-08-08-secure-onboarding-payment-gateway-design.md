@@ -132,6 +132,19 @@ protect it. Therefore:
 
 ### 3. Pay
 
+**Currency: USD only, everywhere in this flow.** Every card charge, plan price, checkout session and
+subscription renewal is denominated in USD. No billing endpoint takes a currency parameter, no amount
+is converted before it reaches the gateway, and no local-currency figure is ever sent to Paddle. This
+is a hard constraint, not a v1 simplification — a second billing currency would need its own price
+ids, its own reconciliation, and a rate source the business does not have.
+
+LBP is confined to two places, neither of which is billing: the SPA's display toggle
+(`CurrencyContext`, default rate 89000), which reformats USD for reading without changing any stored
+value; and local cash bookkeeping, where `Purchase`/`Order`/`Expense` amounts are stored in USD with
+an `exchange_rate` recorded alongside for the informal dual-currency records this business keeps. The
+exchange rate is a presentation and record-keeping detail. An amount on its way to the gateway is USD,
+came from a server-side configured price id, and is never multiplied by anything.
+
 - `POST /billing/checkout/` `{plan: "monthly" | "one_time"}` → server maps the plan **key** to a
   configured Paddle price id, creates the transaction server-side, returns what Paddle.js needs.
   The client never sends a price, an amount, or a currency. Accepting any of them means someone edits
@@ -193,6 +206,12 @@ committed.
 `BILLING_PROVIDER` (`paddle` | `dummy`), `PADDLE_API_KEY`, `PADDLE_WEBHOOK_SECRET`,
 `PADDLE_PRICE_MONTHLY`, `PADDLE_PRICE_ONE_TIME`, `PADDLE_ENVIRONMENT` (`sandbox` | `production`),
 `PADDLE_CLIENT_TOKEN` (public, exposed to the SPA as `VITE_PADDLE_CLIENT_TOKEN`).
+
+Both configured Paddle prices must be created as **USD** prices in the Paddle dashboard, per the
+USD-only rule in Flows §3. There is deliberately no currency setting: adding one would be the first
+step toward a second billing currency, which is out of scope. `BILLING_PRICE_MONTHLY_USD` and
+`BILLING_PRICE_ONE_TIME_USD` are display-only figures for the plan cards and are USD by name and by
+contract; they never reach the gateway.
 
 Email goes through Resend over plain SMTP (`smtp.resend.com:587`, user `resend`, password = API key),
 so Django's existing `EmailBackend` is reused and **no new dependency is added**. The current
