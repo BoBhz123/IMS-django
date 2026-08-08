@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { Building2, Lock, User } from 'lucide-react'
+import { Building2, Lock, Mail, Phone } from 'lucide-react'
 import { useAuth } from '@/context/AuthContext'
 import { GlassCard } from '@/components/ui/GlassCard'
 
@@ -8,7 +8,8 @@ export function Signup() {
   const { register } = useAuth()
   const navigate = useNavigate()
   const [businessName, setBusinessName] = useState('')
-  const [username, setUsername] = useState('')
+  const [email, setEmail] = useState('')
+  const [phone, setPhone] = useState('')
   const [password, setPassword] = useState('')
   const [fieldErrors, setFieldErrors] = useState({})
   const [error, setError] = useState(null)
@@ -20,15 +21,16 @@ export function Signup() {
     setError(null)
     setFieldErrors({})
     try {
-      await register(username, password, businessName)
-      navigate('/', { replace: true })
+      await register({ email, password, phone, businessName })
+      // Straight to the code screen — the account exists but is inert until verified and paid.
+      navigate('/signup/verify', { replace: true })
     } catch (caught) {
       // Djoser returns per-field arrays: {username: ["..."], password: ["...", "..."]}.
       // Show them beside the field they belong to rather than collapsing to one line.
       const body = caught?.response?.data
       if (body && typeof body === 'object' && !Array.isArray(body)) {
         setFieldErrors(body)
-        if (!body.username && !body.password && !body.business_name) {
+        if (!body.email && !body.phone && !body.password && !body.business_name) {
           setError('Could not create your account. Please try again.')
         }
       } else {
@@ -57,7 +59,7 @@ export function Signup() {
             <h1 className="font-display text-[20px] font-semibold text-text-primary">
               Create your account
             </h1>
-            <p className="text-[13px] text-text-secondary">Free for 14 days — no card needed</p>
+            <p className="text-[13px] text-text-secondary">Verify your email, then choose a plan</p>
           </div>
         </div>
 
@@ -73,15 +75,27 @@ export function Signup() {
             />
           </Field>
 
-          <Field icon={User} label="Username" error={fieldErrors.username}>
+          <Field icon={Mail} label="Email" error={fieldErrors.email}>
             <input
-              type="text"
-              autoComplete="username"
-              value={username}
-              onChange={(event) => setUsername(event.target.value)}
+              type="email"
+              autoComplete="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
               required
               className="w-full bg-transparent text-[14px] text-text-primary placeholder:text-text-tertiary focus:outline-none"
-              placeholder="yourname"
+              placeholder="you@example.com"
+            />
+          </Field>
+
+          <Field icon={Phone} label="Phone number" error={fieldErrors.phone}>
+            <input
+              type="tel"
+              autoComplete="tel"
+              value={phone}
+              onChange={(event) => setPhone(event.target.value)}
+              required
+              className="w-full bg-transparent text-[14px] text-text-primary placeholder:text-text-tertiary focus:outline-none"
+              placeholder="+961 70 123 456"
             />
           </Field>
 
