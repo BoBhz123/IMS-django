@@ -1009,3 +1009,75 @@ class BillingEndpointTests(TestCase):
             anonymous.post('/billing/checkout/', {'plan': 'monthly'}, format='json').status_code,
             401,
         )
+
+
+class DiscountKeyAdminTests(TestCase):
+    def setUp(self):
+        self.admin_user = User.objects.create_superuser(
+            username='root', email='root@example.com', password='pw12345!',
+        )
+        self.client = Client()
+        self.client.force_login(self.admin_user)
+
+    def add_payload(self, **overrides):
+        payload = {
+            'code': '',
+            'percent_off': 100,
+            'grants': DiscountKey.LIFETIME,
+            'grant_months': '',
+            'max_redemptions': 1,
+            'expires_at_0': '', 'expires_at_1': '',
+            'is_active': 'on',
+            'amount_paid_usd': '0',
+            'note': '',
+            'created_at_0': '2026-08-08', 'created_at_1': '12:00:00',
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_saving_a_key_without_a_code_generates_one(self):
+        # The owner should never have to invent a code by hand — hand-typed codes are short,
+        # guessable, and collide.
+        response = self.client.post(
+            '/admin/accounts/discountkey/add/',
+            self.add_payload(amount_paid_usd='250.00', note='Paid cash, Hamra branch'),
+        )
+        self.assertEqual(response.status_code, 302)
+        key = DiscountKey.objects.get()
+        self.assertEqual(len(key.code), KEY_LENGTH)
+        self.assertTrue(set(key.code) <= set(ALPHABET))
+
+    def test_the_creating_admin_is_recorded(self):
+        self.client.post('/admin/accounts/discountkey/add/', self.add_payload())
+        self.assertEqual(DiscountKey.objects.get().created_by, self.admin_user)
+
+    def test_a_typed_code_is_normalized_not_stored_as_typed(self):
+        self.client.post(
+            '/admin/accounts/discountkey/add/', self.add_payload(code='abcd-efgh-jkmn'),
+        )
+        self.assertEqual(DiscountKey.objects.get().code, 'ABCDEFGHJKMN')
+
+    def test_the_deactivate_action_kills_selected_keys(self):
+        keys = [
+            DiscountKey.objects.create(code=generate_code(), grants=DiscountKey.LIFETIME)
+            for _ in range(2)
+        ]
+        self.client.post('/admin/accounts/discountkey/', {
+            'action': 'deactivate_keys',
+            '_selected_action': [str(key.pk) for key in keys],
+        })
+        self.assertEqual(DiscountKey.objects.filter(is_active=True).count(), 0)
+
+    def test_the_changelist_renders(self):
+        DiscountKey.objects.create(code=generate_code(), grants=DiscountKey.LIFETIME)
+        self.assertEqual(
+            self.client.get('/admin/accounts/discountkey/').status_code, 200,
+        )
+
+    def test_the_redemption_changelist_renders(self):
+        account = Account.objects.create(name='Acme')
+        key = DiscountKey.objects.create(code=generate_code(), grants=DiscountKey.LIFETIME)
+        DiscountKeyRedemption.objects.create(key=key, account=account)
+        self.assertEqual(
+            self.client.get('/admin/accounts/discountkeyredemption/').status_code, 200,
+        )
