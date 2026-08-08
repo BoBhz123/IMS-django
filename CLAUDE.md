@@ -191,7 +191,7 @@ dashboard or hand every subscriber the platform. Drop the global `unique=True` o
 `Category`/`Customer` `.name` for per-account uniqueness, or the first account to name a product blocks
 every other account.
 
-### Phase 2.5 — Secure onboarding & payment gateway — **2.5a done, 2.5b in progress**
+### Phase 2.5 — Secure onboarding & payment gateway — **2.5a + 2.5b-1 done, 2.5b-2 blocked on Paddle approval**
 **Design:** `docs/superpowers/specs/2026-08-08-secure-onboarding-payment-gateway-design.md`
 
 Signup takes email + password + phone, emails a 6-digit code, and grants no access until either a
@@ -203,10 +203,17 @@ entity. Paddle is a merchant of record, so no local acquiring relationship is ne
 interface (`accounts/billing/`) fronts it, with a dummy implementation for tests and credential-free
 local dev — the gateway is the one piece a third party can refuse (see the spec's Risks).
 
-Split for sequencing: **2.5a** identity + email verification (no third party but Resend) — **done**,
-see `HISTORY.md`; **2.5b** payments + discount keys (needs live Paddle credentials, which take days
-to weeks to approve) — **in progress**. Until 2.5b lands, the only route from `pending_payment` to
-`active` is the `activate_accounts` Django admin action.
+Split for sequencing, and 2.5b split again once the Paddle dependency was isolated:
+
+- **2.5a** identity + email verification (no third party but Resend) — **done**, see `HISTORY.md`.
+- **2.5b-1** activation, the provider seam, discount keys, and the `/subscription` screen — **done**.
+  Plan: `docs/superpowers/plans/2026-08-08-phase-2.5b1-billing-foundation-discount-keys.md`. None of
+  it depends on Paddle, so a cash-only business is fully operational today.
+- **2.5b-2** Paddle checkout, the signed webhook, and `ProcessedWebhookEvent` — **blocked**. Needs
+  live credentials, and the design requires the "will Paddle accept a Lebanon-registered seller?"
+  risk validated *before* this is built, not after. Sandbox access unblocks development either way.
+
+Routes to `active` today: redeeming a discount key, or the `activate_accounts` Django admin action.
 
 What the obvious implementation gets wrong:
 - **"No account until paid" is not implementable.** You cannot charge a card or verify an email before
@@ -302,5 +309,13 @@ Append here when something bites. Do not repeat these.
   `email <> ''`), because Django cannot cleanly `AlterField` another app's model. `makemigrations`
   will never report it as missing and never recreate it — don't assume the constraint is absent
   because no model field declares it.
+- **`activate_account` (`accounts/billing/activation.py`) is the only supported way to set
+  `subscription_status = ACTIVE`** outside the admin action. Assigning the column directly skips the
+  expiry arithmetic — the account reads as live with a stale or absent `expires_at`.
+- **`BILLING_PROVIDER='paddle'` raises `ImproperlyConfigured` by design** until 2.5b-2. That is not a
+  broken import; the error message names the phase.
+- **Discount key codes are stored normalized** — uppercase, no dashes. Querying `DiscountKey` by the
+  dash-separated form the user was shown never matches; run it through
+  `accounts.billing.keys.normalize_key` first.
 - **`react-router-dom` has 2 open high-severity advisories** (`npm audit`). `npm audit fix --force`
   downgrades to 7.11.0, a breaking change — left alone deliberately; raise it as its own decision.

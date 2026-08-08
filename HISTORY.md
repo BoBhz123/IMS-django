@@ -8,6 +8,83 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-08 — Phase 2.5b-1: billing foundation and discount keys
+
+Everything in Phase 2.5b that does not need a live Paddle account: one activation function, a
+provider seam with a dummy behind it, locally-issued discount keys, three billing endpoints, and the
+`/subscription` plan screen. A cash-only business is now fully operational whether or not Paddle ever
+approves a Lebanon-registered seller — which is the whole reason the phase was split this way.
+
+**`accounts/billing/activation.py::activate_account` is the only code that grants access.** Key
+redemption calls it today; 2.5b-2's webhook will call the same function instead of reimplementing
+expiry arithmetic somewhere it can drift. It already takes `grace_days` for that caller — a renewal
+notification that arrives ten minutes late must not lock out a paying customer at midnight — and key
+redemption passes 0, because there is no third party to be late.
+
+Months extend from `max(now, expires_at)`. Extending from `now` would discard the time left on an
+early renewal; extending from `expires_at` unconditionally would let a lapsed account's new month be
+eaten by the months it spent expired. Both directions are tested.
+
+`add_months` does calendar arithmetic with a clamp, not `timedelta(days=30 * n)`. Thirty-day months
+drift about five days a year against the date the customer thinks they bought, and the drift
+compounds on every renewal. Clamping is why 31 January + 1 month is 28 February rather than rolling
+into 3 March and handing out days nobody paid for.
+
+**The dummy provider refuses instead of faking success.** A dummy that activated accounts would make
+a misconfigured production deployment indistinguishable from a working one until somebody went
+looking for the money. `BILLING_PROVIDER='paddle'` raises `ImproperlyConfigured` naming the phase,
+rather than half-working. `PLAN_KEYS` is derived from `Account.PLAN_TYPE_CHOICES` instead of retyped,
+with a test pinning them together — drift there would let checkout accept a plan `activate_account`
+rejects with a `ValueError`, which is a 500 where a 400 belongs.
+
+**Keys are ours, not gateway coupons.** A coupon still needs the checkout round trip, and the
+requirement is to bypass card checkout entirely for someone who paid cash, Whish, or OMT. Local keys
+also record the sale where Phase 3's reporting can see it, and keep working if the gateway is down.
+The alphabet excludes `0/O` and `1/I/L` because these get read aloud off WhatsApp; codes are stored
+normalized (uppercase, no dashes) and displayed in dash-separated fours.
+
+Redemption holds `select_for_update()` inside the atomic block. Without the row lock, two concurrent
+posts both read `redemption_count = 0`, both pass the check, and both redeem a single-use key. The
+unique `(key, account)` constraint is the second half — it catches the same account double-dipping on
+a multi-use key.
+
+**Unknown, expired, exhausted, and deactivated keys all return one identical body**, so the endpoint
+is not an oracle that confirms which codes exist; a test asserts all four responses are byte-identical
+rather than merely all being 400s. Two failures are deliberately distinguishable, and the trade is
+worth stating: `already_redeemed` leaks nothing the caller cannot already see, and
+`partial_discount_unsupported` tells the owner the key is real but unsupported instead of sending them
+hunting for a typo. v1 honours `percent_off = 100` only — a partial discount needs a gateway charge
+for the remainder, which does not exist yet.
+
+All three billing endpoints declare `permission_classes = [IsAuthenticated]` explicitly, shedding the
+`HasActiveSubscription` default, and each has a test asserting it is reachable while `pending_payment`.
+This is the same trap Phase 2.5a documented: these are the endpoints an unpaid account needs in order
+to stop being unpaid.
+
+Keys are issued from the Django admin, where the owner already works. Leaving the code field blank
+generates one — the generation happens in the admin form's `clean_code`, not `save_model`, because
+`ModelForm` runs the model's `full_clean()` in between and that rejects a blank code. The model field
+stays required, so no other path can create a key without one.
+
+Frontend: `/subscription` replaces `SubscriptionExpired.jsx` and its `mailto:` renew button, and
+doubles as the lapsed-subscription screen the Phase 2 axios interceptor already redirects to. Card
+availability is a server fact from `GET /billing/config/`, so the screen hides the pay buttons rather
+than offering one that always fails. `lib/billing.js` mirrors the Python alphabet and drops characters
+outside it as the user types — silently keeping an `O` the customer substituted for a `0` guarantees a
+failed redemption with no explanation.
+
+**Deferred to 2.5b-2, still blocked on credentials:** `accounts/billing/paddle.py`, `POST
+/billing/webhook/` with signature verification, `ProcessedWebhookEvent` idempotency, the `paddle_*`
+columns, and Paddle.js. The design requires the seller-approval risk validated before they are built.
+
+Prices are display-only settings (`BILLING_PRICE_MONTHLY_USD` = 15, `BILLING_PRICE_ONE_TIME_USD` =
+299) and are placeholders — the real amounts will come from configured Paddle price ids, and the
+server never accepts an amount from the client.
+
+Verified: `manage.py test` 175 passed; `npm test` 55 passed; lint and build clean.
+
+---
+
 ## 2026-08-08 — Phase 2.5a: onboarding identity and email verification
 
 Registration now takes email + password + phone, emails a 6-digit code, and grants no access until
