@@ -12,6 +12,7 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('inventory/', include('inventory.urls')),
     path('accounts/', include('accounts.urls')),
+    path('billing/', include('accounts.billing.urls')),
 
     # Djoser Authentication Endpoints
     path('auth/', include('djoser.urls')),

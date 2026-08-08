@@ -244,6 +244,7 @@ REST_FRAMEWORK = {
     'DEFAULT_THROTTLE_RATES': {
         'verify_email': '30/hour',
         'resend_code': '10/hour',
+        'redeem_key': '20/hour',
     },
 }
 

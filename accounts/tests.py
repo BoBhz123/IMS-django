@@ -800,3 +800,150 @@ class DiscountKeyModelTests(TestCase):
         DiscountKeyRedemption.objects.create(key=key, account=account)
         with self.assertRaises(IntegrityError):
             DiscountKeyRedemption.objects.create(key=key, account=account)
+
+
+class RedeemKeyTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='owner@example.com', email='owner@example.com', password='pw12345!',
+        )
+        self.account = Account.objects.create(
+            name='Acme', subscription_status=Account.PENDING_PAYMENT,
+        )
+        Membership.objects.create(user=self.user, account=self.account, is_owner=True)
+        self.client = APIClient()
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f'JWT {RefreshToken.for_user(self.user).access_token}'
+        )
+        self.url = '/billing/redeem-key/'
+
+    def make_key(self, **overrides):
+        fields = {'code': generate_code(), 'grants': DiscountKey.LIFETIME}
+        fields.update(overrides)
+        return DiscountKey.objects.create(**fields)
+
+    def test_a_pending_account_can_reach_the_endpoint(self):
+        # The whole point: this is an escape from the paywall, so it must not be behind it.
+        # A 403 here strands every unpaid account with no route out.
+        key = self.make_key()
+        response = self.client.post(self.url, {'code': key.code}, format='json')
+        self.assertEqual(response.status_code, 200)
+
+    def test_a_lifetime_key_activates_the_account(self):
+        key = self.make_key()
+        self.client.post(self.url, {'code': key.code}, format='json')
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.subscription_status, Account.ACTIVE)
+        self.assertEqual(self.account.plan_type, Account.ONE_TIME)
+        self.assertIsNone(self.account.expires_at)
+
+    def test_a_months_key_sets_an_expiry(self):
+        key = self.make_key(grants=DiscountKey.MONTHS, grant_months=6)
+        self.client.post(self.url, {'code': key.code}, format='json')
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.plan_type, Account.MONTHLY)
+        expected = add_months(timezone.now(), 6)
+        self.assertLess(abs((self.account.expires_at - expected).total_seconds()), 60)
+
+    def test_the_response_carries_the_new_status_for_the_router(self):
+        key = self.make_key()
+        response = self.client.post(self.url, {'code': key.code}, format='json')
+        self.assertEqual(response.data['status'], Account.ACTIVE)
+        self.assertTrue(response.data['has_active_subscription'])
+
+    def test_redemption_is_recorded_and_counted(self):
+        key = self.make_key()
+        self.client.post(self.url, {'code': key.code}, format='json')
+        key.refresh_from_db()
+        self.assertEqual(key.redemption_count, 1)
+        self.assertTrue(
+            DiscountKeyRedemption.objects.filter(key=key, account=self.account).exists()
+        )
+
+    def test_dashes_and_lowercase_are_accepted(self):
+        key = self.make_key()
+        typed = format_key(key.code).lower()
+        response = self.client.post(self.url, {'code': typed}, format='json')
+        self.assertEqual(response.status_code, 200)
+
+    def test_a_single_use_key_cannot_be_used_twice(self):
+        key = self.make_key()
+        other_user = User.objects.create_user(
+            username='other@example.com', email='other@example.com', password='pw12345!',
+        )
+        other_account = Account.objects.create(
+            name='Other', subscription_status=Account.PENDING_PAYMENT,
+        )
+        Membership.objects.create(user=other_user, account=other_account, is_owner=True)
+
+        self.client.post(self.url, {'code': key.code}, format='json')
+
+        other_client = APIClient()
+        other_client.credentials(
+            HTTP_AUTHORIZATION=f'JWT {RefreshToken.for_user(other_user).access_token}'
+        )
+        response = other_client.post(self.url, {'code': key.code}, format='json')
+        self.assertEqual(response.status_code, 400)
+        other_account.refresh_from_db()
+        self.assertEqual(other_account.subscription_status, Account.PENDING_PAYMENT)
+
+    def test_the_same_account_redeeming_twice_is_told_so(self):
+        key = self.make_key(max_redemptions=5)
+        self.client.post(self.url, {'code': key.code}, format='json')
+        response = self.client.post(self.url, {'code': key.code}, format='json')
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['code'], 'already_redeemed')
+        key.refresh_from_db()
+        self.assertEqual(key.redemption_count, 1)
+
+    def test_unknown_expired_exhausted_and_inactive_keys_are_indistinguishable(self):
+        # The endpoint must not be an oracle that confirms a key exists. Every one of these
+        # returns the identical body, so probing tells an attacker nothing.
+        expired = self.make_key(expires_at=timezone.now() - timedelta(minutes=1))
+        exhausted = self.make_key(max_redemptions=1, redemption_count=1)
+        inactive = self.make_key(is_active=False)
+
+        bodies = []
+        for code in ['ZZZZZZZZZZZZ', expired.code, exhausted.code, inactive.code]:
+            response = self.client.post(self.url, {'code': code}, format='json')
+            self.assertEqual(response.status_code, 400)
+            bodies.append(response.data)
+
+        self.assertEqual(len(set(str(body) for body in bodies)), 1)
+
+    def test_a_partial_discount_key_is_refused(self):
+        key = self.make_key(percent_off=50)
+        response = self.client.post(self.url, {'code': key.code}, format='json')
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['code'], 'partial_discount_unsupported')
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.subscription_status, Account.PENDING_PAYMENT)
+
+    def test_a_failed_redemption_does_not_consume_the_key(self):
+        key = self.make_key(percent_off=50)
+        self.client.post(self.url, {'code': key.code}, format='json')
+        key.refresh_from_db()
+        self.assertEqual(key.redemption_count, 0)
+
+    def test_anonymous_callers_are_rejected(self):
+        key = self.make_key()
+        response = APIClient().post(self.url, {'code': key.code}, format='json')
+        self.assertEqual(response.status_code, 401)
+
+    def test_a_user_with_no_account_cannot_redeem(self):
+        # A superadmin has no membership. Redeeming would activate nothing and 500 on the
+        # None account.
+        admin = User.objects.create_superuser(
+            username='root', email='root@example.com', password='pw12345!',
+        )
+        client = APIClient()
+        client.credentials(
+            HTTP_AUTHORIZATION=f'JWT {RefreshToken.for_user(admin).access_token}'
+        )
+        response = client.post(self.url, {'code': self.make_key().code}, format='json')
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['code'], 'no_account')
+
+    def test_an_empty_code_is_a_field_error(self):
+        response = self.client.post(self.url, {'code': ''}, format='json')
+        self.assertEqual(response.status_code, 400)

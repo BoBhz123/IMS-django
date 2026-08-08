@@ -16,3 +16,13 @@ class VerifyEmailThrottle(ScopedRateThrottle):
 
 class ResendCodeThrottle(ScopedRateThrottle):
     scope = 'resend_code'
+
+
+class RedeemKeyThrottle(ScopedRateThrottle):
+    """
+    The key space is about 10^17, so this is not the primary defence — it exists so a
+    compromised login cannot be used to grind the endpoint, and so a key that leaks cannot
+    be sprayed at every account at speed.
+    """
+
+    scope = 'redeem_key'
