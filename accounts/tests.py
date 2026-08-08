@@ -947,3 +947,65 @@ class RedeemKeyTests(TestCase):
     def test_an_empty_code_is_a_field_error(self):
         response = self.client.post(self.url, {'code': ''}, format='json')
         self.assertEqual(response.status_code, 400)
+
+
+class BillingEndpointTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='owner@example.com', email='owner@example.com', password='pw12345!',
+        )
+        self.account = Account.objects.create(
+            name='Acme', subscription_status=Account.PENDING_PAYMENT,
+        )
+        Membership.objects.create(user=self.user, account=self.account, is_owner=True)
+        self.client = APIClient()
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f'JWT {RefreshToken.for_user(self.user).access_token}'
+        )
+
+    def test_config_is_reachable_while_pending(self):
+        response = self.client.get('/billing/config/')
+        self.assertEqual(response.status_code, 200)
+
+    def test_config_reports_card_checkout_off_under_the_dummy(self):
+        response = self.client.get('/billing/config/')
+        self.assertFalse(response.data['card_checkout_available'])
+
+    def test_config_lists_both_plans_with_prices(self):
+        response = self.client.get('/billing/config/')
+        plans = {plan['key']: plan for plan in response.data['plans']}
+        self.assertEqual(set(plans), {Account.MONTHLY, Account.ONE_TIME})
+        for plan in plans.values():
+            self.assertTrue(plan['price_usd'])
+            self.assertTrue(plan['name'])
+
+    def test_checkout_is_reachable_while_pending(self):
+        # Reachable, and refused for the right reason — a 403 here would mean the paywall
+        # blocks its own checkout.
+        response = self.client.post('/billing/checkout/', {'plan': 'monthly'}, format='json')
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.data['code'], 'card_checkout_unavailable')
+
+    def test_checkout_rejects_an_unknown_plan(self):
+        response = self.client.post(
+            '/billing/checkout/', {'plan': 'enterprise'}, format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_checkout_ignores_any_amount_the_client_sends(self):
+        # The client sends a plan key and nothing else is read. If an amount were ever
+        # honoured, this is where it would show up.
+        response = self.client.post(
+            '/billing/checkout/',
+            {'plan': 'monthly', 'amount': '0.01', 'currency': 'USD'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 503)
+
+    def test_anonymous_callers_are_rejected_everywhere(self):
+        anonymous = APIClient()
+        self.assertEqual(anonymous.get('/billing/config/').status_code, 401)
+        self.assertEqual(
+            anonymous.post('/billing/checkout/', {'plan': 'monthly'}, format='json').status_code,
+            401,
+        )
