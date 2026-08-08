@@ -234,6 +234,17 @@ REST_FRAMEWORK = {
         'rest_framework.permissions.IsAuthenticated',
         'accounts.permissions.HasActiveSubscription',
     ),
+    # Opt-in per view rather than a global default. The inventory API is already gated by
+    # authentication plus subscription, and a blanket rate limit there would throttle the
+    # dashboard's own burst of parallel requests on page load.
+    #
+    # verify_email must stay well above verification.MAX_ATTEMPTS, or a legitimately
+    # locked-out user gets a 429 instead of the "request a new code" message that tells them
+    # what to do.
+    'DEFAULT_THROTTLE_RATES': {
+        'verify_email': '30/hour',
+        'resend_code': '10/hour',
+    },
 }
 
 

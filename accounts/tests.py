@@ -427,3 +427,142 @@ class VerificationEmailTests(TestCase):
         self.user.save(update_fields=['email'])
         self.assertFalse(emails.send_verification_code(self.user, '123456'))
         self.assertEqual(len(mail.outbox), 0)
+
+
+@override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')
+class OnboardingEndpointTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='owner@example.com', email='owner@example.com', password='pw12345!',
+        )
+        self.account = Account.objects.create(
+            name='Corner Shop', subscription_status=Account.PENDING_VERIFICATION,
+        )
+        Membership.objects.create(user=self.user, account=self.account, is_owner=True)
+        self.client = APIClient()
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f'JWT {RefreshToken.for_user(self.user).access_token}',
+        )
+        mail.outbox = []
+
+    # --- the escape hatches must not sit behind the wall they exist to open ---
+
+    def test_status_endpoint_is_reachable_while_pending(self):
+        response = self.client.get('/accounts/subscription/')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['status'], Account.PENDING_VERIFICATION)
+        self.assertFalse(response.data['has_active_subscription'])
+        self.assertEqual(response.data['business_name'], 'Corner Shop')
+        self.assertEqual(response.data['email'], 'owner@example.com')
+
+    def test_verify_endpoint_is_reachable_while_pending(self):
+        _, code = verification.issue_code(self.user)
+        response = self.client.post('/accounts/verify-email/', {'code': code}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_resend_endpoint_is_reachable_while_pending(self):
+        response = self.client.post('/accounts/resend-code/')
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_the_inventory_api_is_not_reachable_while_pending(self):
+        response = self.client.get('/inventory/products/')
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()['code'], 'subscription_expired')
+
+    # --- behaviour ---
+
+    def test_verifying_moves_the_account_to_pending_payment(self):
+        _, code = verification.issue_code(self.user)
+        response = self.client.post('/accounts/verify-email/', {'code': code}, format='json')
+        self.assertEqual(response.data['status'], Account.PENDING_PAYMENT)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.subscription_status, Account.PENDING_PAYMENT)
+        # Still no access. Verifying an email is not paying for anything.
+        self.assertFalse(self.account.has_active_subscription)
+
+    def test_a_wrong_code_returns_a_machine_readable_error(self):
+        verification.issue_code(self.user)
+        response = self.client.post('/accounts/verify-email/', {'code': '000000'}, format='json')
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['code'], 'invalid_code')
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.subscription_status, Account.PENDING_VERIFICATION)
+
+    def test_a_locked_code_says_so(self):
+        verification.issue_code(self.user)
+        for _ in range(verification.MAX_ATTEMPTS):
+            self.client.post('/accounts/verify-email/', {'code': '000000'}, format='json')
+        response = self.client.post('/accounts/verify-email/', {'code': '000000'}, format='json')
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['code'], 'code_locked')
+
+    def test_an_expired_code_says_so(self):
+        row, code = verification.issue_code(self.user)
+        row.expires_at = timezone.now() - timedelta(seconds=1)
+        row.save(update_fields=['expires_at'])
+        response = self.client.post('/accounts/verify-email/', {'code': code}, format='json')
+        self.assertEqual(response.data['code'], 'code_expired')
+
+    def test_verifying_with_nothing_outstanding_says_so(self):
+        response = self.client.post('/accounts/verify-email/', {'code': '123456'}, format='json')
+        self.assertEqual(response.data['code'], 'no_code')
+
+    def test_a_missing_code_is_a_field_error(self):
+        response = self.client.post('/accounts/verify-email/', {}, format='json')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('code', response.data)
+
+    def test_resend_sends_a_new_code(self):
+        response = self.client.post('/accounts/resend-code/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(EmailVerification.objects.filter(user=self.user).count(), 1)
+
+    def test_resend_too_soon_returns_429_with_a_retry_after(self):
+        self.client.post('/accounts/resend-code/')
+        response = self.client.post('/accounts/resend-code/')
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.data['code'], 'resend_throttled')
+        self.assertGreater(response.data['retry_after'], 0)
+
+    def test_verifying_an_already_active_account_does_not_downgrade_it(self):
+        self.account.subscription_status = Account.ACTIVE
+        self.account.save(update_fields=['subscription_status'])
+        _, code = verification.issue_code(self.user)
+        self.client.post('/accounts/verify-email/', {'code': code}, format='json')
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.subscription_status, Account.ACTIVE)
+
+    def test_one_users_code_cannot_verify_another_users_account(self):
+        other = User.objects.create_user(
+            username='other@example.com', email='other@example.com', password='pw12345!',
+        )
+        Membership.objects.create(
+            user=other,
+            account=Account.objects.create(name='Other Co'),
+            is_owner=True,
+        )
+        _, their_code = verification.issue_code(other)
+        response = self.client.post(
+            '/accounts/verify-email/', {'code': their_code}, format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.subscription_status, Account.PENDING_VERIFICATION)
+
+    def test_a_superadmin_has_no_account_but_is_not_sent_to_a_paywall(self):
+        admin = User.objects.create_superuser(username='platform', password='pw12345!')
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f'JWT {RefreshToken.for_user(admin).access_token}')
+        response = client.get('/accounts/subscription/')
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.data['status'])
+        self.assertTrue(response.data['has_active_subscription'])
+
+    def test_all_three_endpoints_require_authentication(self):
+        anonymous = APIClient()
+        self.assertEqual(anonymous.get('/accounts/subscription/').status_code, 401)
+        self.assertEqual(
+            anonymous.post('/accounts/verify-email/', {'code': '1'}).status_code, 401,
+        )
+        self.assertEqual(anonymous.post('/accounts/resend-code/').status_code, 401)

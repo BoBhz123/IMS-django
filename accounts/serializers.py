@@ -80,3 +80,33 @@ class UserCreateWithAccountSerializer(UserCreateSerializer):
         # and the email must not go out if the transaction is about to fail. The user resends.
         transaction.on_commit(lambda: send_verification_code(user, code))
         return user
+
+
+class VerifyEmailSerializer(serializers.Serializer):
+    code = serializers.CharField(max_length=12, trim_whitespace=True)
+
+
+class SubscriptionStatusSerializer(serializers.ModelSerializer):
+    """
+    Read-only projection of onboarding/billing state for the SPA's router.
+
+    `has_active_subscription` is the computed property, not the stored column — the frontend
+    must make the same call the permission class does, or the two disagree the moment a
+    subscription lapses.
+    """
+
+    business_name = serializers.CharField(source='name', read_only=True)
+    status = serializers.CharField(source='subscription_status', read_only=True)
+    has_active_subscription = serializers.BooleanField(read_only=True)
+    email = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Account
+        fields = [
+            'status', 'plan_type', 'expires_at', 'has_active_subscription',
+            'business_name', 'phone', 'email',
+        ]
+
+    def get_email(self, account):
+        membership = account.memberships.first()
+        return membership.user.email if membership else ''
