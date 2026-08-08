@@ -5,7 +5,7 @@ import { ToastContainer } from '@/components/ui/ToastContainer'
 import { Login } from '@/pages/Login'
 import { Signup } from '@/pages/Signup'
 import { VerifyEmail } from '@/pages/VerifyEmail'
-import { SubscriptionExpired } from '@/pages/SubscriptionExpired'
+import { Subscription } from '@/pages/Subscription'
 import { Dashboard } from '@/pages/Dashboard'
 import { Products } from '@/pages/Products'
 import { Orders } from '@/pages/Orders'
@@ -21,7 +21,7 @@ function App() {
         <Route path="/login" element={<Login />} />
         <Route path="/signup" element={<Signup />} />
         <Route path="/signup/verify" element={<VerifyEmail />} />
-        <Route path="/subscription" element={<SubscriptionExpired />} />
+        <Route path="/subscription" element={<Subscription />} />
 
         <Route element={<ProtectedRoute />}>
           <Route element={<AppShell />}>
