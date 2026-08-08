@@ -164,7 +164,7 @@ code with the API export views, so a formula/format fix usually needs to happen 
 **Full design:** `docs/superpowers/specs/2026-08-07-saas-single-db-migration-design.md`
 **Completed work log:** `HISTORY.md` — read it at session start.
 
-**Status:** Phases 1–2 complete. Phase 3 next.
+**Status:** Phases 1–2 complete. Phase 2.5 in progress.
 
 Phases are a dependency chain. 3–5 all touch models that Phase 2 restructures, so running them out of
 order means writing migrations twice. Finish each phase (including its tests) before starting the next.
@@ -190,6 +190,45 @@ model `is_staff` means platform superadmin, so leaving them would either break e
 dashboard or hand every subscriber the platform. Drop the global `unique=True` on `Product`/`Supplier`/
 `Category`/`Customer` `.name` for per-account uniqueness, or the first account to name a product blocks
 every other account.
+
+### Phase 2.5 — Secure onboarding & payment gateway — **in progress**
+**Design:** `docs/superpowers/specs/2026-08-08-secure-onboarding-payment-gateway-design.md`
+
+Signup takes email + password + phone, emails a 6-digit code, and grants no access until either a
+Paddle card payment (monthly subscription or one-time lifetime licence) or a 100%-off discount key is
+redeemed. **This deletes Phase 2's 14-day trial** — a trial is a free bypass of the wall.
+
+**Paddle, not Stripe.** Stripe does not onboard Lebanon-registered businesses and there is no foreign
+entity. Paddle is a merchant of record, so no local acquiring relationship is needed. A provider
+interface (`accounts/billing/`) fronts it, with a dummy implementation for tests and credential-free
+local dev — the gateway is the one piece a third party can refuse (see the spec's Risks).
+
+Split for sequencing: **2.5a** identity + email verification (no third party but Resend), **2.5b**
+payments + discount keys (needs live Paddle credentials, which take days to weeks to approve).
+
+What the obvious implementation gets wrong:
+- **"No account until paid" is not implementable.** You cannot charge a card or verify an email before
+  a row exists to attach them to. The account is created immediately in `pending_verification` and is
+  simply inert: `LIVE_STATUSES` narrows to `(ACTIVE,)`, so Phase 2's default `HasActiveSubscription`
+  already locks every endpoint with no new checks.
+- **The paywall will block the escape from the paywall.** Every endpoint needed to get *out* of
+  pending state — subscription status, resend code, verify code, create checkout, redeem key — must
+  declare `permission_classes = [IsAuthenticated]` explicitly to shed the default. Miss one and the
+  account is unrecoverable without admin intervention.
+- **A 6-digit code is 1,000,000 guesses.** Expiry alone does not protect it: cap wrong attempts at 5
+  and kill the code, throttle resend (1/min, 5/hr), generate with `secrets`, compare with
+  `compare_digest`. `django-axes` guards login only and does not cover these endpoints.
+- **Only the webhook may grant access.** A post-checkout redirect parameter is forgeable; the browser
+  polls status and never reports success. Verify Paddle's signature before parsing, and record
+  `event_id` for idempotency — providers retry, and a double-activation double-extends `expires_at`.
+- **Never accept an amount from the client.** It sends a plan *key*; the server maps it to a configured
+  price id.
+- **Discount keys are local, not Paddle coupons.** A gateway coupon still needs the checkout round
+  trip, and the requirement is to bypass card checkout entirely. Local keys also record the cash sale
+  where Phase 3's reporting can see it, and keep working if Paddle is down or unapproved. Redeem under
+  `select_for_update()` or two concurrent posts share a single-use key.
+- **v1 honours 100%-off keys only** — a partial discount needs a second gateway integration. The
+  `percent_off` column exists so it is additive later.
 
 ### Phase 3 — Expenses
 `Expense` model + account-scoped CRUD. `net_profit = order profit − expenses`, with the *same* date
