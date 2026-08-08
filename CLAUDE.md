@@ -215,6 +215,34 @@ Split for sequencing, and 2.5b split again once the Paddle dependency was isolat
 
 Routes to `active` today: redeeming a discount key, or the `activate_accounts` Django admin action.
 
+#### ⏸ PAUSE STATUS — where Phase 2.5b stopped and what resumes it
+
+Read this before touching `accounts/billing/`. Work moved on to Phase 3 with 2.5b deliberately
+half-finished; that is a pause, not an oversight, and not a bug to be fixed by improvising a gateway.
+
+- **Completed:** Phase 2.5a (email OTP onboarding) and Phase 2.5b-1 (billing foundation and 100%-off
+  discount keys). Both are recorded in `HISTORY.md`.
+- **Paused at:** Phase 2.5b-2 — Paddle checkout, the signed webhook, `ProcessedWebhookEvent`
+  idempotency, and Paddle.js in the SPA. None of it is written.
+- **Reason for the pause:** awaiting Paddle merchant-account approval and sandbox/production
+  credentials. The design also requires the "will Paddle accept a Lebanon-registered seller?" risk
+  validated *before* 2.5b-2 is built rather than after, so this is a sequencing decision and not
+  merely a missing password.
+- **Current state:** the provider seam is live with `BILLING_PROVIDER='dummy'`. The dummy refuses card
+  checkout (`503 card_checkout_unavailable`) instead of faking a payment, and `BILLING_PROVIDER='paddle'`
+  raises `ImproperlyConfigured` on purpose until 2.5b-2 lands. Discount keys and the admin
+  `activate_accounts` action are the only routes to `active`, and they are sufficient — a cash-only
+  business is fully operational as things stand.
+- **Environment setup before any production deploy:** set `BILLING_PRICE_MONTHLY_USD` and
+  `BILLING_PRICE_ONE_TIME_USD`. The committed values (`15` and `299`) are display-only placeholders,
+  not agreed pricing. They are what the plan cards render; the server never accepts an amount from
+  the client, so these do not control what anyone is charged — but shipping them unset would quote
+  invented prices to real customers.
+
+**To resume:** get sandbox credentials, then build `accounts/billing/paddle.py` behind the existing
+`BillingProvider` interface and add the webhook. `activate_account` already accepts `grace_days`, so
+the renewal path is a new caller rather than a rewrite.
+
 What the obvious implementation gets wrong:
 - **"No account until paid" is not implementable.** You cannot charge a card or verify an email before
   a row exists to attach them to. The account is created immediately in `pending_verification` and is
