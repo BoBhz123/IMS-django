@@ -13,6 +13,11 @@ from inventory.models import Category, Product
 
 
 def make_account(**kwargs):
+    # Defaults to an account that can actually reach the API. The model default is
+    # pending_verification, which 403s every request — correct for production, useless as a
+    # fixture default. Liveness tests pass subscription_status explicitly, so nothing here
+    # masks the state machine.
+    kwargs.setdefault('subscription_status', Account.ACTIVE)
     return Account.objects.create(name=kwargs.pop('name', 'Test Co'), **kwargs)
 
 
@@ -22,39 +27,52 @@ class SubscriptionLivenessTests(TestCase):
     without a scheduled job, so trusting the column alone silently grants free service.
     """
 
-    def test_trial_with_future_expiry_is_active(self):
+    def test_active_with_future_expiry_is_live(self):
         account = make_account(
-            subscription_status=Account.TRIAL,
+            subscription_status=Account.ACTIVE,
             expires_at=timezone.now() + timedelta(days=1),
         )
         self.assertTrue(account.has_active_subscription)
 
-    def test_active_with_past_expiry_is_not_active(self):
+    def test_active_with_past_expiry_is_not_live(self):
         account = make_account(
             subscription_status=Account.ACTIVE,
             expires_at=timezone.now() - timedelta(days=1),
         )
         self.assertFalse(account.has_active_subscription)
 
-    def test_active_with_no_expiry_is_active(self):
+    def test_active_with_no_expiry_is_live(self):
+        # A one-time lifetime licence. NULL means "never expires", not "already expired".
         account = make_account(subscription_status=Account.ACTIVE, expires_at=None)
         self.assertTrue(account.has_active_subscription)
 
-    def test_canceled_is_never_active_even_with_future_expiry(self):
+    def test_canceled_is_never_live_even_with_future_expiry(self):
         account = make_account(
             subscription_status=Account.CANCELED,
             expires_at=timezone.now() + timedelta(days=30),
         )
         self.assertFalse(account.has_active_subscription)
 
-    def test_past_due_is_not_active(self):
+    def test_past_due_is_not_live(self):
         account = make_account(subscription_status=Account.PAST_DUE)
         self.assertFalse(account.has_active_subscription)
 
-    def test_new_accounts_default_to_trial(self):
+    def test_pending_verification_is_not_live(self):
+        # The whole wall rests on this: an un-onboarded account exists and is inert.
+        account = make_account(subscription_status=Account.PENDING_VERIFICATION)
+        self.assertFalse(account.has_active_subscription)
+
+    def test_pending_payment_is_not_live_even_with_no_expiry(self):
+        # expires_at=None must not read as "unlimited" for an account that never paid.
+        account = make_account(
+            subscription_status=Account.PENDING_PAYMENT, expires_at=None,
+        )
+        self.assertFalse(account.has_active_subscription)
+
+    def test_new_accounts_default_to_pending_verification(self):
         account = Account.objects.create(name='Fresh')
-        self.assertEqual(account.subscription_status, Account.TRIAL)
-        self.assertEqual(account.plan_type, Account.FREE_TRIAL)
+        self.assertEqual(account.subscription_status, Account.PENDING_VERIFICATION)
+        self.assertEqual(account.plan_type, '')
 
 
 class GetAccountTests(TestCase):
@@ -75,6 +93,7 @@ class GetAccountTests(TestCase):
 
 class SubscriptionEnforcementTests(TestCase):
     def build(self, **account_kwargs):
+        account_kwargs.setdefault('subscription_status', Account.ACTIVE)
         account = Account.objects.create(name='Gated Co', **account_kwargs)
         user = User.objects.create_user(username=f'u{account.id}', password='pw12345!')
         Membership.objects.create(user=user, account=account, is_owner=True)
@@ -87,10 +106,21 @@ class SubscriptionEnforcementTests(TestCase):
         header = f'JWT {RefreshToken.for_user(user).access_token}'
         return account, client, header
 
-    def test_trial_account_may_use_the_api(self):
-        _, client, header = self.build(subscription_status=Account.TRIAL)
+    def test_active_account_may_use_the_api(self):
+        _, client, header = self.build(subscription_status=Account.ACTIVE)
         response = client.get('/inventory/products/', HTTP_AUTHORIZATION=header)
         self.assertEqual(response.status_code, 200)
+
+    def test_pending_verification_account_is_blocked(self):
+        _, client, header = self.build(subscription_status=Account.PENDING_VERIFICATION)
+        response = client.get('/inventory/products/', HTTP_AUTHORIZATION=header)
+        self.assertEqual(response.status_code, 403)
+
+    def test_pending_payment_account_is_blocked(self):
+        # Verifying an email is not paying for anything.
+        _, client, header = self.build(subscription_status=Account.PENDING_PAYMENT)
+        response = client.get('/inventory/products/', HTTP_AUTHORIZATION=header)
+        self.assertEqual(response.status_code, 403)
 
     def test_expired_account_is_blocked(self):
         _, client, header = self.build(
@@ -149,15 +179,15 @@ class SignupProvisioningTests(TestCase):
         self.signup()
         self.assertEqual(User.objects.get(username='newbiz').membership.account.name, 'newbiz')
 
-    def test_new_accounts_start_on_a_fourteen_day_trial(self):
+    def test_a_fresh_signup_grants_no_access(self):
+        # The payment wall's whole premise. Signup provisions an account that exists and is
+        # inert; nothing about registering earns a single request.
         self.signup()
         account = User.objects.get(username='newbiz').membership.account
-        self.assertEqual(account.subscription_status, Account.TRIAL)
-        self.assertEqual(account.plan_type, Account.FREE_TRIAL)
-        self.assertIsNotNone(account.expires_at)
-        self.assertAlmostEqual(
-            (account.expires_at - timezone.now()).days, 13, delta=1,
-        )
+        self.assertEqual(account.subscription_status, Account.PENDING_VERIFICATION)
+        self.assertEqual(account.plan_type, '')
+        self.assertIsNone(account.expires_at)
+        self.assertFalse(account.has_active_subscription)
 
     def test_new_users_are_never_staff(self):
         self.signup()
@@ -165,16 +195,20 @@ class SignupProvisioningTests(TestCase):
         self.assertFalse(user.is_staff)
         self.assertFalse(user.is_superuser)
 
-    def test_a_new_signup_can_immediately_use_the_api(self):
+    def test_a_new_signup_can_log_in_but_not_use_the_api(self):
+        # Both halves matter. Login must work — otherwise the user cannot reach the verify
+        # endpoint at all — while every business endpoint stays shut.
         self.signup()
         client = APIClient()
-        token = client.post(
+        login = client.post(
             '/auth/jwt/create/',
             {'username': 'newbiz', 'password': 'sTr0ng-pw-2026'}, format='json',
-        ).json()['access']
+        )
+        self.assertEqual(login.status_code, 200)
+        token = login.json()['access']
         response = client.get('/inventory/products/', HTTP_AUTHORIZATION=f'JWT {token}')
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()['count'], 0)
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()['code'], 'subscription_expired')
 
     def test_createsuperuser_provisions_no_account(self):
         # Platform admins are not subscribers and must not own a workspace.

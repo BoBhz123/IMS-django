@@ -20,7 +20,12 @@ class AccountFixtureMixin:
     def make_account_user(self, username, account_name=None):
         from accounts.models import Account, Membership
 
-        account = Account.objects.create(name=account_name or f'{username} Co')
+        account = Account.objects.create(
+            name=account_name or f'{username} Co',
+            # Scoping tests are about which rows you can see, not about onboarding. The
+            # model default is pending_verification, which 403s every request.
+            subscription_status=Account.ACTIVE,
+        )
         user = User.objects.create_user(username=username, password='pw12345!')
         Membership.objects.create(user=user, account=account, is_owner=True)
         client = APIClient()

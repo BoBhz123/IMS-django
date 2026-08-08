@@ -1,4 +1,5 @@
 from django.contrib.auth.models import User
+from django.core.validators import RegexValidator
 from django.db import models
 from django.utils import timezone
 
@@ -9,12 +10,14 @@ class Account(models.Model):
     django-tenants: every row of business data belongs to exactly one Account.
     """
 
-    TRIAL = 'trial'
+    PENDING_VERIFICATION = 'pending_verification'
+    PENDING_PAYMENT = 'pending_payment'
     ACTIVE = 'active'
     PAST_DUE = 'past_due'
     CANCELED = 'canceled'
     SUBSCRIPTION_STATUS_CHOICES = [
-        (TRIAL, 'Trial'),
+        (PENDING_VERIFICATION, 'Pending email verification'),
+        (PENDING_PAYMENT, 'Pending payment'),
         (ACTIVE, 'Active'),
         (PAST_DUE, 'Past due'),
         (CANCELED, 'Canceled'),
@@ -22,23 +25,35 @@ class Account(models.Model):
 
     MONTHLY = 'monthly'
     ONE_TIME = 'one_time'
-    FREE_TRIAL = 'free_trial'
     PLAN_TYPE_CHOICES = [
-        (MONTHLY, 'Monthly'),
-        (ONE_TIME, 'One time'),
-        (FREE_TRIAL, 'Free trial'),
+        (MONTHLY, 'Monthly subscription'),
+        (ONE_TIME, 'One-time licence (lifetime)'),
     ]
 
-    # Statuses that represent a paying-or-trialling customer. past_due and canceled are
-    # absent on purpose: both mean "stop serving".
-    LIVE_STATUSES = (TRIAL, ACTIVE)
+    # The only status that grants access. There is deliberately no trial status: a trial is
+    # by definition a free bypass of the payment wall. The pending_* states mean "signed up
+    # but not onboarded"; past_due and canceled mean "stop serving".
+    LIVE_STATUSES = (ACTIVE,)
 
     name = models.CharField(max_length=255)
-    subscription_status = models.CharField(
-        max_length=20, choices=SUBSCRIPTION_STATUS_CHOICES, default=TRIAL, db_index=True,
+    phone = models.CharField(
+        max_length=32,
+        blank=True,
+        validators=[RegexValidator(
+            r'^\+?[\d\s\-()]{6,32}$',
+            'Enter a phone number — digits, spaces, dashes and an optional leading +.',
+        )],
     )
+    subscription_status = models.CharField(
+        max_length=32,
+        choices=SUBSCRIPTION_STATUS_CHOICES,
+        default=PENDING_VERIFICATION,
+        db_index=True,
+    )
+    # Blank until a plan is chosen at checkout. Kept out of the wall's logic entirely —
+    # subscription_status decides access, plan_type only records what was bought.
     plan_type = models.CharField(
-        max_length=20, choices=PLAN_TYPE_CHOICES, default=FREE_TRIAL,
+        max_length=20, choices=PLAN_TYPE_CHOICES, blank=True, default='',
     )
     expires_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

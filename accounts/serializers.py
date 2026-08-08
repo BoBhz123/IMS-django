@@ -1,13 +1,8 @@
-from datetime import timedelta
-
 from django.db import transaction
-from django.utils import timezone
 from djoser.serializers import UserCreateSerializer
 from rest_framework import serializers
 
 from .models import Account, Membership
-
-TRIAL_DAYS = 14
 
 
 class UserCreateWithAccountSerializer(UserCreateSerializer):
@@ -45,9 +40,7 @@ class UserCreateWithAccountSerializer(UserCreateSerializer):
 
         account = Account.objects.create(
             name=business_name or user.username,
-            subscription_status=Account.TRIAL,
-            plan_type=Account.FREE_TRIAL,
-            expires_at=timezone.now() + timedelta(days=TRIAL_DAYS),
+            subscription_status=Account.PENDING_VERIFICATION,
         )
         Membership.objects.create(user=user, account=account, is_owner=True)
         return user
