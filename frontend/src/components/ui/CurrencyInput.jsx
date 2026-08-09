@@ -19,12 +19,21 @@ export function CurrencyInput({ valueUsd, onChangeUsd, rate, placeholder, classN
 
   const [text, setText] = useState(() => (valueUsd || valueUsd === 0 ? String(toDisplay(valueUsd)) : ''))
 
-  // Re-sync the displayed text when the currency toggles — but not on every valueUsd change,
-  // which would fight the user mid-keystroke (see fromDisplay rounding below).
+  // Re-sync the displayed text when the currency toggles, or when the parent moves valueUsd to
+  // something the text does not already represent — picking or scanning a product fills the
+  // line's price from the product, and without this the field kept reading 0 while the order
+  // total read the real figure.
+  //
+  // The two guards below are what keep it from fighting the user mid-keystroke: text that
+  // already parses back to valueUsd is left exactly as typed (so "6." and "6.50" survive), and
+  // a field the user has emptied is not refilled with the 0 that emptying it reported.
   useEffect(() => {
+    if (text === '' && !valueUsd) return
+    const shown = parseFloat(text)
+    if (!Number.isNaN(shown) && Math.abs(fromDisplay(shown) - Number(valueUsd)) < 0.005) return
     setText(valueUsd || valueUsd === 0 ? String(toDisplay(valueUsd)) : '')
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currency])
+  }, [currency, valueUsd])
 
   function handleChange(event) {
     const raw = event.target.value

@@ -1,13 +1,15 @@
-import { useState } from 'react'
-import { Loader2, Plus, Trash2 } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Loader2, Plus, ScanLine, Trash2 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { DEFAULT_EXCHANGE_RATE, useCurrency } from '@/context/CurrencyContext'
 import { SlideOver } from '@/components/ui/SlideOver'
+import { BarcodeScannerModal } from '@/components/ui/BarcodeScannerModal'
 import { CurrencyInput } from '@/components/ui/CurrencyInput'
 import { ProductPicker } from '@/components/forms/ProductPicker'
+import { lookupByBarcode } from '@/hooks/useBarcodeLookup'
 
 function emptyItem() {
-  return { product: '', quantity: 1, unit_multiplier: 1, unit_price: 0 }
+  return { product: '', quantity: 1, unit_multiplier: 1, unit_price: 0, product_name: '' }
 }
 
 export function PurchaseForm({ open, onClose, onSaved, suppliers }) {
@@ -19,6 +21,78 @@ export function PurchaseForm({ open, onClose, onSaved, suppliers }) {
   const [errors, setErrors] = useState({})
   const [saving, setSaving] = useState(false)
 
+  const [scannerOpen, setScannerOpen] = useState(false)
+  const [scanMessage, setScanMessage] = useState(null)
+  const [scanChoices, setScanChoices] = useState([])
+
+  // Stable scan handlers: BarcodeScannerModal restarts the camera whenever they change, so they
+  // read the current lines through a ref instead of closing over `items`.
+  const itemsRef = useRef(items)
+  useEffect(() => {
+    itemsRef.current = items
+  }, [items])
+
+  /**
+   * Put a scanned product on the purchase: bump the line that already holds it, otherwise take
+   * the first blank line, otherwise append one.
+   *
+   * Deliberately uncapped, unlike the order flow — a purchase adds stock, so buying four of
+   * something you currently hold two of is exactly the normal case.
+   */
+  const applyScannedProduct = useCallback((product) => {
+    const current = itemsRef.current
+    setScanChoices([])
+    setScanMessage(null)
+
+    const existing = current.findIndex((item) => String(item.product) === String(product.id))
+    if (existing !== -1) {
+      setItems(
+        current.map((item, i) =>
+          i === existing ? { ...item, quantity: (Number(item.quantity) || 0) + 1 } : item,
+        ),
+      )
+      return
+    }
+
+    const line = {
+      ...emptyItem(),
+      product: String(product.id),
+      // Same fill as handleProductChange below — a scan must not leave the line at $0.
+      unit_price: product.cost_price,
+      product_name: product.name,
+    }
+    const blank = current.findIndex((item) => !item.product)
+    setItems(blank === -1 ? [...current, line] : current.map((item, i) => (i === blank ? line : item)))
+  }, [])
+
+  const handleScan = useCallback(
+    async (code) => {
+      setScannerOpen(false)
+      setScanChoices([])
+      setScanMessage(null)
+
+      const { status, products } = await lookupByBarcode(code)
+
+      if (status === 'found') {
+        applyScannedProduct(products[0])
+        return
+      }
+      if (status === 'ambiguous') {
+        setScanChoices(products)
+        setScanMessage(`${products.length} products share ${code}. Which one?`)
+        return
+      }
+      setScanMessage(
+        status === 'not_found'
+          ? `No product has the barcode ${code}. Add it from Products first.`
+          : "Couldn't look that barcode up. Check your connection and try again.",
+      )
+    },
+    [applyScannedProduct],
+  )
+
+  const closeScanner = useCallback(() => setScannerOpen(false), [])
+
   function updateItem(index, patch) {
     setItems((current) => current.map((item, i) => (i === index ? { ...item, ...patch } : item)))
   }
@@ -27,6 +101,7 @@ export function PurchaseForm({ open, onClose, onSaved, suppliers }) {
     updateItem(index, {
       product: productId,
       unit_price: product ? product.cost_price : 0,
+      product_name: product ? product.name : '',
     })
   }
 
@@ -110,21 +185,49 @@ export function PurchaseForm({ open, onClose, onSaved, suppliers }) {
         <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between">
             <span className="text-[12px] font-medium text-text-secondary">Items</span>
-            <button
-              type="button"
-              onClick={addItem}
-              className="flex items-center gap-1 text-[12px] font-medium text-accent-blue hover:opacity-80"
-            >
-              <Plus size={13} />
-              Add item
-            </button>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => setScannerOpen(true)}
+                className="flex items-center gap-1 text-[12px] font-medium text-accent-blue hover:opacity-80"
+              >
+                <ScanLine size={13} />
+                Scan barcode
+              </button>
+              <button
+                type="button"
+                onClick={addItem}
+                className="flex items-center gap-1 text-[12px] font-medium text-accent-blue hover:opacity-80"
+              >
+                <Plus size={13} />
+                Add item
+              </button>
+            </div>
           </div>
+
+          {scanMessage && <p className="text-[12px] text-accent-orange">{scanMessage}</p>}
+
+          {scanChoices.length > 0 && (
+            <div className="flex flex-col gap-1 rounded-xl border border-hairline p-2">
+              {scanChoices.map((product) => (
+                <button
+                  key={product.id}
+                  type="button"
+                  onClick={() => applyScannedProduct(product)}
+                  className="flex items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left text-[13px] text-text-primary hover:bg-canvas-2"
+                >
+                  <span className="min-w-0 flex-1 truncate">{product.name}</span>
+                </button>
+              ))}
+            </div>
+          )}
 
           {items.map((item, index) => (
             <div key={index} className="rounded-xl border border-hairline p-3">
               <div className="mb-2 flex items-center gap-2">
                 <ProductPicker
                   value={item.product}
+                  selectedName={item.product_name}
                   onChange={(productId, product) => handleProductChange(index, productId, product)}
                 />
                 {items.length > 1 && (
@@ -181,6 +284,9 @@ export function PurchaseForm({ open, onClose, onSaved, suppliers }) {
           Create purchase
         </button>
       </form>
+
+      {/* Outside the <form>: the scanner's own buttons default to type="submit". */}
+      <BarcodeScannerModal open={scannerOpen} onClose={closeScanner} onScan={handleScan} />
     </SlideOver>
   )
 }
