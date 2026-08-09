@@ -1662,3 +1662,131 @@ class AdminCSVExportTotalsTests(AccountFixtureMixin, TestCase):
         rows = self.rows(export_purchases_to_csv(None, None, Purchase.objects.all()))
         header, body = rows[0], rows[1:-1]
         datetime.fromisoformat(body[0][header.index('Date Placed')])
+
+
+class AnalyticsSeriesProfitTests(AccountFixtureMixin, TestCase):
+    """
+    Per-period profit. The summary payload has carried gross/net profit since Phase 3, but the
+    series did not — which is why the profit tiles shipped without sparklines rather than
+    drawing revenue-minus-purchases and calling it profit.
+    """
+
+    def setUp(self):
+        self.account, self.user, self.client, self.header = self.make_account_user('ser')
+        self.category = Category.objects.create(name='Widgets', account=self.account)
+        self.product = Product.objects.create(
+            name='Widget', description='', cost_price='4.00', default_sell_price='10.00',
+            category=self.category, stock_quantity=1000, account=self.account,
+        )
+
+    def series(self, **params):
+        response = self.client.get(
+            '/inventory/analytics/', {'group_by': 'month', **params},
+            HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.data['series']
+
+    def sell(self, quantity=10, when=None):
+        order = Order.objects.create(account=self.account, exchange_rate=89000)
+        OrderItem.objects.create(
+            order=order, product=self.product, quantity=quantity, unit_multiplier=1,
+            unit_price=Decimal('10.00'), unit_cost_price=Decimal('4.00'),
+        )
+        if when:
+            Order.objects.filter(pk=order.pk).update(placed_at=when)
+        return order
+
+    def spend(self, amount='25.00', when=None):
+        return Expense.objects.create(
+            account=self.account, description='Rent', amount=Decimal(amount),
+            category=ExpenseCategory.RENT, spent_at=when or timezone.now(),
+        )
+
+    def test_a_period_carries_cogs_gross_and_net(self):
+        self.sell(quantity=10)      # revenue 100.00, cogs 40.00
+        self.spend('25.00')
+        row = self.series()[-1]
+        self.assertEqual(Decimal(str(row['total_revenue'])), Decimal('100.00'))
+        self.assertEqual(Decimal(str(row['total_cogs'])), Decimal('40.00'))
+        self.assertEqual(Decimal(str(row['gross_profit'])), Decimal('60.00'))
+        self.assertEqual(Decimal(str(row['total_expenses'])), Decimal('25.00'))
+        self.assertEqual(Decimal(str(row['net_profit'])), Decimal('35.00'))
+
+    def test_the_existing_keys_are_unchanged(self):
+        # total_costs is the purchases line the chart already draws. Renaming it here would
+        # blank the cost series in the carousel with no error anywhere.
+        self.sell()
+        row = self.series()[-1]
+        for key in ('period', 'total_revenue', 'total_costs', 'total_expenses'):
+            self.assertIn(key, row)
+
+    def test_inventory_purchases_stay_out_of_per_period_profit(self):
+        self.sell(quantity=10)
+        purchase = Purchase.objects.create(
+            account=self.account,
+            supplier=Supplier.objects.create(name='S', account=self.account),
+            exchange_rate=89000,
+        )
+        PurchaseItem.objects.create(
+            purchase_order=purchase, product=self.product, quantity=50,
+            unit_price=Decimal('4.00'),
+        )
+        row = self.series()[-1]
+        self.assertEqual(Decimal(str(row['total_costs'])), Decimal('200.00'))
+        self.assertEqual(Decimal(str(row['gross_profit'])), Decimal('60.00'))
+        self.assertEqual(Decimal(str(row['net_profit'])), Decimal('60.00'))
+
+    def test_a_period_with_expenses_but_no_sales_reports_a_loss(self):
+        # Net profit must be allowed to go negative; clamping it at zero would hide the month
+        # a shop paid rent and sold nothing, which is the month worth seeing.
+        self.spend('80.00')
+        row = self.series()[-1]
+        self.assertEqual(Decimal(str(row['total_revenue'])), Decimal('0'))
+        self.assertEqual(Decimal(str(row['net_profit'])), Decimal('-80.00'))
+
+    def test_every_period_row_has_every_key(self):
+        # A row missing a key renders as undefined in the sparkline and produces NaN SVG
+        # coordinates — an invisible chart rather than an error.
+        self.sell(quantity=5, when=timezone.now() - timedelta(days=200))
+        self.spend('10.00')
+        expected = {
+            'period', 'total_revenue', 'total_costs', 'total_cogs',
+            'gross_profit', 'total_expenses', 'net_profit',
+        }
+        rows = self.series()
+        self.assertGreaterEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(set(row), expected)
+
+    def test_revenue_and_cogs_do_not_fan_out_across_the_items_join(self):
+        # Both expressions traverse `items`. Summed in separate annotate() calls on one
+        # queryset they would multiply each other's row counts.
+        order = Order.objects.create(account=self.account, exchange_rate=89000)
+        for _ in range(3):
+            OrderItem.objects.create(
+                order=order, product=self.product, quantity=1, unit_multiplier=1,
+                unit_price=Decimal('10.00'), unit_cost_price=Decimal('4.00'),
+            )
+        row = self.series()[-1]
+        self.assertEqual(Decimal(str(row['total_revenue'])), Decimal('30.00'))
+        self.assertEqual(Decimal(str(row['total_cogs'])), Decimal('12.00'))
+
+    def test_each_dashboard_period_filter_returns_a_well_formed_series(self):
+        # The three options in the dashboard's SegmentedControl. 'all_time' is deliberately
+        # absent from PERIOD_WINDOW_DAYS and means "no filter".
+        self.sell(quantity=10, when=timezone.now() - timedelta(days=400))
+        self.sell(quantity=10, when=timezone.now() - timedelta(days=100))
+        self.sell(quantity=10)
+        self.spend('25.00')
+
+        for period, group_by in (('all_time', 'year'), ('last_month', 'day'),
+                                 ('last_year', 'month')):
+            rows = self.series(period=period, group_by=group_by)
+            self.assertTrue(rows, f'{period}/{group_by} returned no rows')
+            for row in rows:
+                self.assertIsInstance(row['period'], str)
+                self.assertNotIsInstance(row['gross_profit'], str)
+
+    def test_an_account_with_no_data_gets_an_empty_series_not_an_error(self):
+        self.assertEqual(self.series(), [])

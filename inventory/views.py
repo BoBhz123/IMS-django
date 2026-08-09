@@ -208,35 +208,52 @@ class AnalyticsView(APIView):
         return Response(data)
 
     def _build_series(self, orders, purchases, expenses, trunc):
-        def totals_by_period(queryset, field, expression):
+        def totals_by_period(queryset, field, **expressions):
+            """
+            One grouped query per queryset. Multiple Sums in a single annotate() is
+            deliberate: revenue and COGS both traverse the `items` join, and splitting them
+            into two annotate() calls on the same queryset makes each multiply the other's
+            row count.
+            """
             rows = (
                 queryset
                 .annotate(period=trunc(field, output_field=DateField()))
                 .values('period')
-                .annotate(total=Sum(expression))
+                .annotate(**{name: Sum(expr) for name, expr in expressions.items()})
             )
-            return {row['period']: row['total'] or 0 for row in rows if row['period']}
-
-        revenue_by_period = totals_by_period(orders, 'placed_at', LINE_TOTAL)
-        cost_by_period = totals_by_period(purchases, 'placed_at', LINE_TOTAL)
-        expense_by_period = totals_by_period(expenses, 'spent_at', 'amount')
-
-        periods = sorted(
-            set(revenue_by_period) | set(cost_by_period) | set(expense_by_period)
-        )
-
-        # The purchases line keeps the name total_costs: it is the chart's existing cost
-        # series, the frontend already reads that key, and unlike the summary tile it sits
-        # nowhere near a COGS figure.
-        return [
-            {
-                "period": period.isoformat(),
-                "total_revenue": revenue_by_period.get(period, 0),
-                "total_costs": cost_by_period.get(period, 0),
-                "total_expenses": expense_by_period.get(period, 0),
+            return {
+                row['period']: {name: row[name] or 0 for name in expressions}
+                for row in rows if row['period']
             }
-            for period in periods
-        ]
+
+        order_rows = totals_by_period(
+            orders, 'placed_at', total_revenue=LINE_TOTAL, total_cogs=LINE_COGS,
+        )
+        purchase_rows = totals_by_period(purchases, 'placed_at', total_costs=LINE_TOTAL)
+        expense_rows = totals_by_period(expenses, 'spent_at', total_expenses='amount')
+
+        periods = sorted(set(order_rows) | set(purchase_rows) | set(expense_rows))
+
+        series = []
+        for period in periods:
+            revenue = order_rows.get(period, {}).get('total_revenue', 0)
+            cogs = order_rows.get(period, {}).get('total_cogs', 0)
+            spent = expense_rows.get(period, {}).get('total_expenses', 0)
+            gross_profit = revenue - cogs
+            series.append({
+                "period": period.isoformat(),
+                "total_revenue": revenue,
+                # The purchases line. Keeps its Phase 3 name: the chart already reads it, and
+                # unlike the summary tile it sits nowhere near a COGS figure.
+                "total_costs": purchase_rows.get(period, {}).get('total_costs', 0),
+                "total_cogs": cogs,
+                "gross_profit": gross_profit,
+                "total_expenses": spent,
+                # Allowed to be negative. A month with rent and no sales is a loss, and that
+                # is the month most worth seeing on a chart.
+                "net_profit": gross_profit - spent,
+            })
+        return series
 
 
      
