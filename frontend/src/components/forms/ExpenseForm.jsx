@@ -102,7 +102,7 @@ export function ExpenseForm({ open, onClose, onSaved, expense }) {
             type="date"
             value={form.spent_on}
             onChange={(event) => update('spent_on', event.target.value)}
-            className={INPUT_CLASS}
+            className={`${INPUT_CLASS} scheme-light dark:scheme-dark`}
           />
         </Field>
 

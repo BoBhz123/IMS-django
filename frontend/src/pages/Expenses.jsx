@@ -134,19 +134,18 @@ export function Expenses() {
           </select>
         </label>
 
-        <input
-          type="date"
-          aria-label="Spent after"
+        {/* Labelled visibly, not just for screen readers: an empty date input renders the
+            UA's own mm/dd/yyyy hint, which is identical in both boxes and says nothing about
+            which end of the range it is. */}
+        <DateFilter
+          label="Start date"
           value={spentAfter}
-          onChange={(event) => updateFilter(setSpentAfter)(event.target.value)}
-          className={FILTER_CLASS}
+          onChange={updateFilter(setSpentAfter)}
         />
-        <input
-          type="date"
-          aria-label="Spent before"
+        <DateFilter
+          label="End date"
           value={spentBefore}
-          onChange={(event) => updateFilter(setSpentBefore)(event.target.value)}
-          className={FILTER_CLASS}
+          onChange={updateFilter(setSpentBefore)}
         />
 
         <button
@@ -224,6 +223,27 @@ export function Expenses() {
 
 const FILTER_CLASS =
   'rounded-xl border border-hairline bg-canvas-2 px-2.5 py-2 text-[13px] text-text-primary focus:outline-none'
+
+// color-scheme is inherited from :root / .dark in index.css, so the native picker and its
+// calendar glyph already follow the theme. Restating it here — tied to the theme, never
+// hardcoded to dark — keeps that true if this input is ever moved inside a container that
+// resets it, and is what stops a light-on-light glyph in dark mode.
+const DATE_FILTER_CLASS = `${FILTER_CLASS} scheme-light dark:scheme-dark [&::-webkit-calendar-picker-indicator]:cursor-pointer [&::-webkit-calendar-picker-indicator]:opacity-60 [&::-webkit-calendar-picker-indicator]:hover:opacity-100`
+
+function DateFilter({ label, value, onChange }) {
+  return (
+    <label className="flex items-center gap-1.5 text-[12px] text-text-secondary">
+      <span className="whitespace-nowrap">{label}</span>
+      <input
+        type="date"
+        aria-label={label}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className={DATE_FILTER_CLASS}
+      />
+    </label>
+  )
+}
 
 function ExpenseTable({ expenses, loading, formatAmount, onEdit, onDelete }) {
   return (
