@@ -5,6 +5,7 @@ import { useCurrency } from '@/context/CurrencyContext'
 import { SlideOver } from '@/components/ui/SlideOver'
 import { BarcodeScannerModal } from '@/components/ui/BarcodeScannerModal'
 import { CurrencyInput } from '@/components/ui/CurrencyInput'
+import { useOpenSession } from '@/hooks/useOpenSession'
 
 const emptyForm = {
   name: '',
@@ -17,7 +18,18 @@ const emptyForm = {
   stock_quantity: 1,
 }
 
-export function ProductForm({ open, onClose, onSaved, product, categories, suppliers }) {
+export function ProductForm({ open, onClose, ...rest }) {
+  // The body is keyed so every opening remounts it with empty fields; SlideOver stays mounted
+  // above it so its exit animation still plays. See useOpenSession.
+  const session = useOpenSession(open)
+  return (
+    <SlideOver open={open} onClose={onClose} title={rest.product ? 'Edit product' : 'Add product'}>
+      <ProductFormBody key={session} onClose={onClose} {...rest} />
+    </SlideOver>
+  )
+}
+
+function ProductFormBody({ onClose, onSaved, product, categories, suppliers }) {
   const { formatAmount } = useCurrency()
   const isEdit = Boolean(product)
   const [form, setForm] = useState(() =>
@@ -143,7 +155,7 @@ export function ProductForm({ open, onClose, onSaved, product, categories, suppl
   }
 
   return (
-    <SlideOver open={open} onClose={onClose} title={isEdit ? 'Edit product' : 'Add product'}>
+    <>
       <form onSubmit={handleSubmit} className="flex flex-col gap-4">
         <Field label="Name" error={errors.name}>
           <TextInput value={form.name} onChange={(v) => update('name', v)} required />
@@ -291,7 +303,7 @@ export function ProductForm({ open, onClose, onSaved, product, categories, suppl
       {/* Outside the <form> on purpose: the scanner's own buttons default to type="submit",
           and one stray click would post a half-filled product. */}
       <BarcodeScannerModal open={scannerOpen} onClose={closeScanner} onScan={handleScan} />
-    </SlideOver>
+    </>
   )
 }
 

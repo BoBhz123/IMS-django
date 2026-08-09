@@ -7,12 +7,24 @@ import { BarcodeScannerModal } from '@/components/ui/BarcodeScannerModal'
 import { CurrencyInput } from '@/components/ui/CurrencyInput'
 import { ProductPicker } from '@/components/forms/ProductPicker'
 import { lookupByBarcode } from '@/hooks/useBarcodeLookup'
+import { useOpenSession } from '@/hooks/useOpenSession'
 
 function emptyItem() {
   return { product: '', quantity: 1, unit_multiplier: 1, unit_price: 0, product_name: '' }
 }
 
-export function PurchaseForm({ open, onClose, onSaved, suppliers }) {
+export function PurchaseForm({ open, onClose, ...rest }) {
+  // Keyed body: every opening remounts it, so a created purchase does not leave its supplier,
+  // exchange rate and line items behind for the next one. See useOpenSession.
+  const session = useOpenSession(open)
+  return (
+    <SlideOver open={open} onClose={onClose} title="Add purchase">
+      <PurchaseFormBody key={session} onClose={onClose} {...rest} />
+    </SlideOver>
+  )
+}
+
+function PurchaseFormBody({ onClose, onSaved, suppliers }) {
   const { formatAmount } = useCurrency()
 
   const [supplier, setSupplier] = useState('')
@@ -155,7 +167,7 @@ export function PurchaseForm({ open, onClose, onSaved, suppliers }) {
   }
 
   return (
-    <SlideOver open={open} onClose={onClose} title="Add purchase">
+    <>
       <form onSubmit={handleSubmit} className="flex flex-col gap-4">
         <Field label="Supplier">
           <select
@@ -287,7 +299,7 @@ export function PurchaseForm({ open, onClose, onSaved, suppliers }) {
 
       {/* Outside the <form>: the scanner's own buttons default to type="submit". */}
       <BarcodeScannerModal open={scannerOpen} onClose={closeScanner} onScan={handleScan} />
-    </SlideOver>
+    </>
   )
 }
 

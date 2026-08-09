@@ -8,6 +8,7 @@ import { CurrencyInput } from '@/components/ui/CurrencyInput'
 import { ProductPicker } from '@/components/forms/ProductPicker'
 import { StockBadge } from '@/components/ui/StockBadge'
 import { lookupByBarcode } from '@/hooks/useBarcodeLookup'
+import { useOpenSession } from '@/hooks/useOpenSession'
 import { hasBlockingStockError, stockStateFor } from '@/lib/stock'
 
 function emptyItem() {
@@ -34,7 +35,18 @@ function maxQuantityFor(items, index) {
   return Math.max(0, Math.floor((available - claimedElsewhere) / multiplier))
 }
 
-export function OrderForm({ open, onClose, onSaved, customers }) {
+export function OrderForm({ open, onClose, ...rest }) {
+  // Keyed body: every opening remounts it, so a created order does not leave its customer,
+  // exchange rate and line items behind for the next one. See useOpenSession.
+  const session = useOpenSession(open)
+  return (
+    <SlideOver open={open} onClose={onClose} title="Add order">
+      <OrderFormBody key={session} onClose={onClose} {...rest} />
+    </SlideOver>
+  )
+}
+
+function OrderFormBody({ onClose, onSaved, customers }) {
   const { formatAmount } = useCurrency()
 
   const [customer, setCustomer] = useState('')
@@ -185,7 +197,7 @@ export function OrderForm({ open, onClose, onSaved, customers }) {
   }
 
   return (
-    <SlideOver open={open} onClose={onClose} title="Add order">
+    <>
       <form onSubmit={handleSubmit} className="flex flex-col gap-4">
         <Field label="Customer">
           <select
@@ -356,7 +368,7 @@ export function OrderForm({ open, onClose, onSaved, customers }) {
 
       {/* Outside the <form>: the scanner's own buttons default to type="submit". */}
       <BarcodeScannerModal open={scannerOpen} onClose={closeScanner} onScan={handleScan} />
-    </SlideOver>
+    </>
   )
 }
 

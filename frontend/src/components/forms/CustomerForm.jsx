@@ -2,10 +2,22 @@ import { useState } from 'react'
 import { Loader2 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { SlideOver } from '@/components/ui/SlideOver'
+import { useOpenSession } from '@/hooks/useOpenSession'
 
 const emptyForm = { name: '', phone_number: '', location: '' }
 
-export function CustomerForm({ open, onClose, onSaved, customer }) {
+export function CustomerForm({ open, onClose, ...rest }) {
+  // Keyed body: every opening remounts it so the fields go back to their defaults instead of
+  // holding whatever was last submitted. See useOpenSession.
+  const session = useOpenSession(open)
+  return (
+    <SlideOver open={open} onClose={onClose} title={rest.customer ? 'Edit customer' : 'Add customer'}>
+      <CustomerFormBody key={session} onClose={onClose} {...rest} />
+    </SlideOver>
+  )
+}
+
+function CustomerFormBody({ onClose, onSaved, customer }) {
   const isEdit = Boolean(customer)
   const [form, setForm] = useState(() =>
     customer
@@ -44,30 +56,28 @@ export function CustomerForm({ open, onClose, onSaved, customer }) {
   }
 
   return (
-    <SlideOver open={open} onClose={onClose} title={isEdit ? 'Edit customer' : 'Add customer'}>
-      <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-        <Field label="Name" error={errors.name}>
-          <TextInput value={form.name} onChange={(v) => update('name', v)} required />
-        </Field>
-        <Field label="Phone number" error={errors.phone_number}>
-          <TextInput value={form.phone_number} onChange={(v) => update('phone_number', v)} />
-        </Field>
-        <Field label="Location" error={errors.location}>
-          <TextInput value={form.location} onChange={(v) => update('location', v)} />
-        </Field>
+    <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+      <Field label="Name" error={errors.name}>
+        <TextInput value={form.name} onChange={(v) => update('name', v)} required />
+      </Field>
+      <Field label="Phone number" error={errors.phone_number}>
+        <TextInput value={form.phone_number} onChange={(v) => update('phone_number', v)} />
+      </Field>
+      <Field label="Location" error={errors.location}>
+        <TextInput value={form.location} onChange={(v) => update('location', v)} />
+      </Field>
 
-        {errors.detail && <p className="text-[13px] text-accent-red">{errors.detail[0]}</p>}
+      {errors.detail && <p className="text-[13px] text-accent-red">{errors.detail[0]}</p>}
 
-        <button
-          type="submit"
-          disabled={saving}
-          className="mt-2 flex items-center justify-center gap-2 rounded-xl bg-accent-blue py-2.5 text-[14px] font-semibold text-white hover:opacity-90 disabled:opacity-60"
-        >
-          {saving && <Loader2 size={14} className="animate-spin" />}
-          {isEdit ? 'Save changes' : 'Add customer'}
-        </button>
-      </form>
-    </SlideOver>
+      <button
+        type="submit"
+        disabled={saving}
+        className="mt-2 flex items-center justify-center gap-2 rounded-xl bg-accent-blue py-2.5 text-[14px] font-semibold text-white hover:opacity-90 disabled:opacity-60"
+      >
+        {saving && <Loader2 size={14} className="animate-spin" />}
+        {isEdit ? 'Save changes' : 'Add customer'}
+      </button>
+    </form>
   )
 }
 
