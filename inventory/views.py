@@ -12,7 +12,7 @@ from rest_framework.viewsets import ModelViewSet
 from rest_framework.views import APIView
 from .filters import ProductFilter,PurchaseFilter,OrderFilter,ExpenseFilter
 from .pagination import DefaultPagination
-from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order,Expense,LINE_TOTAL
+from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order,Expense,LINE_TOTAL,LINE_COGS
 from .reporting import DateWindow
 from .serializers import *
 import csv
@@ -150,6 +150,7 @@ class AnalyticsView(APIView):
             OrderItem.objects.filter(order__account=account)
             if account else OrderItem.objects.none()
         )
+        expenses = Expense.objects.for_account(account)
 
         group_by = request.query_params.get('group_by')
 
@@ -157,27 +158,37 @@ class AnalyticsView(APIView):
         orders = window.apply(orders, 'placed_at')
         purchases = window.apply(purchases, 'placed_at')
         products = window.apply(products, 'order__placed_at')
+        expenses = window.apply(expenses, 'spent_at')
 
-        revenue_query = orders.aggregate(
-            total_revenue=Sum(LINE_TOTAL)
+        # One aggregate call over `orders`: both expressions traverse the same `items` join,
+        # so there is no fan-out between them.
+        order_totals = orders.aggregate(
+            total_revenue=Sum(LINE_TOTAL),
+            total_cogs=Sum(LINE_COGS),
         )
-        cost_query = purchases.aggregate(
-            total_cost=Sum(LINE_TOTAL)
-        )
+        outlays = purchases.aggregate(total=Sum(LINE_TOTAL))['total'] or 0
+        expense_total = expenses.aggregate(total=Sum('amount'))['total'] or 0
+
+        revenue = order_totals['total_revenue'] or 0
+        cogs = order_totals['total_cogs'] or 0
+        gross_profit = revenue - cogs
 
         best_seller_query = products.values('product__name').annotate(
             total_sold=Sum(F('quantity') * F('unit_multiplier'))
         ).order_by('-total_sold')[:5]
 
-        raw_revenue = revenue_query['total_revenue'] or 0
-        raw_cost = cost_query['total_cost'] or 0
-
-        raw_profit = raw_revenue - raw_cost
-
         data = {
-            "total_revenue": f"${raw_revenue:,.2f}",
-            "total_costs": f"${raw_cost:,.2f}",
-            "net_profit": f"${raw_profit:,.2f}",
+            # Profit and loss.
+            "total_revenue": revenue,
+            "total_cogs": cogs,
+            "gross_profit": gross_profit,
+            "total_expenses": expense_total,
+            "net_profit": gross_profit - expense_total,
+            # Cash flow, deliberately outside the P&L above. Stock bought this month is not
+            # a cost of what was sold this month; mixing them makes margin swing with
+            # restocking timing. Named inventory_outlays rather than total_costs so it
+            # cannot be misread as total_cogs.
+            "inventory_outlays": outlays,
             "top_products": best_seller_query,
             # Catalog size, deliberately NOT date-filtered — it's "how many products exist",
             # not "how many were sold in this window". Served here so the dashboard's
@@ -187,34 +198,39 @@ class AnalyticsView(APIView):
         }
 
         if group_by in GROUP_BY_TRUNC:
-            data["series"] = self._build_series(orders, purchases, GROUP_BY_TRUNC[group_by])
+            data["series"] = self._build_series(
+                orders, purchases, expenses, GROUP_BY_TRUNC[group_by],
+            )
 
         return Response(data)
 
-    def _build_series(self, orders, purchases, trunc):
-        revenue_rows = (
-            orders
-            .annotate(period=trunc('placed_at', output_field=DateField()))
-            .values('period')
-            .annotate(total=Sum(LINE_TOTAL))
+    def _build_series(self, orders, purchases, expenses, trunc):
+        def totals_by_period(queryset, field, expression):
+            rows = (
+                queryset
+                .annotate(period=trunc(field, output_field=DateField()))
+                .values('period')
+                .annotate(total=Sum(expression))
+            )
+            return {row['period']: row['total'] or 0 for row in rows if row['period']}
+
+        revenue_by_period = totals_by_period(orders, 'placed_at', LINE_TOTAL)
+        cost_by_period = totals_by_period(purchases, 'placed_at', LINE_TOTAL)
+        expense_by_period = totals_by_period(expenses, 'spent_at', 'amount')
+
+        periods = sorted(
+            set(revenue_by_period) | set(cost_by_period) | set(expense_by_period)
         )
-        cost_rows = (
-            purchases
-            .annotate(period=trunc('placed_at', output_field=DateField()))
-            .values('period')
-            .annotate(total=Sum(LINE_TOTAL))
-        )
 
-        revenue_by_period = {row['period']: row['total'] or 0 for row in revenue_rows if row['period']}
-        cost_by_period = {row['period']: row['total'] or 0 for row in cost_rows if row['period']}
-
-        periods = sorted(set(revenue_by_period) | set(cost_by_period))
-
+        # The purchases line keeps the name total_costs: it is the chart's existing cost
+        # series, the frontend already reads that key, and unlike the summary tile it sits
+        # nowhere near a COGS figure.
         return [
             {
                 "period": period.isoformat(),
                 "total_revenue": revenue_by_period.get(period, 0),
                 "total_costs": cost_by_period.get(period, 0),
+                "total_expenses": expense_by_period.get(period, 0),
             }
             for period in periods
         ]

@@ -456,11 +456,17 @@ class LineTotalConsistencyTests(AccountFixtureMixin, APITestCase):
         self.assertEqual(body["total_price"], sum(i["total_price"] for i in body["items"]))
 
     def test_total_price_agrees_with_analytics_revenue_and_cost(self):
+        # Phase 3 changed this contract twice over: money comes back as a raw number rather
+        # than a "$1,234.00" string (the SPA parsed those straight back out again), and the
+        # purchases figure is inventory_outlays — cash flow, deliberately named so it cannot
+        # be misread as the new total_cogs sitting beside it.
         analytics = self.client.get(
             "/inventory/analytics/", HTTP_AUTHORIZATION=self.auth_header
         ).json()
-        self.assertEqual(analytics["total_revenue"], f"${self.order.total_price:,.2f}")
-        self.assertEqual(analytics["total_costs"], f"${self.purchase.total_price:,.2f}")
+        self.assertEqual(Decimal(str(analytics["total_revenue"])), self.order.total_price)
+        self.assertEqual(
+            Decimal(str(analytics["inventory_outlays"])), self.purchase.total_price,
+        )
 
     def test_sorting_annotation_agrees_with_the_total_price_field(self):
         body = self.client.get(
@@ -701,7 +707,7 @@ class CrossAccountIsolationTests(AccountFixtureMixin, APITestCase):
             unit_price='10.00', unit_multiplier=1,
         )
         body = self.client_b.get('/inventory/analytics/', HTTP_AUTHORIZATION=self.header_b).json()
-        self.assertEqual(body['total_revenue'], '$0.00')
+        self.assertEqual(Decimal(str(body['total_revenue'])), Decimal('0'))
 
     def test_orders_csv_export_covers_only_the_callers_account(self):
         order = Order.objects.create(account=self.account_a, customer=self.customer_a)
@@ -1082,3 +1088,120 @@ class ExpenseAPITests(AccountFixtureMixin, TestCase):
 
     def test_anonymous_callers_are_rejected(self):
         self.assertEqual(APIClient().get(self.url).status_code, 401)
+
+
+class AnalyticsFinancialsTests(AccountFixtureMixin, TestCase):
+    """
+    Two ledgers that must not be mixed: gross/net profit is margin, inventory_outlays is
+    cash. Folding stock spend into profit makes margin swing with restocking timing.
+    """
+
+    def setUp(self):
+        self.account, self.user, self.client, self.header = self.make_account_user('fin')
+        self.category = Category.objects.create(name='Widgets', account=self.account)
+        self.product = Product.objects.create(
+            name='Widget', description='', cost_price='4.00', default_sell_price='10.00',
+            category=self.category, stock_quantity=100, account=self.account,
+        )
+
+    def analytics(self, **params):
+        response = self.client.get(
+            '/inventory/analytics/', params, HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.data
+
+    def sell(self, quantity=10, unit_price='10.00', when=None):
+        order = Order.objects.create(account=self.account, exchange_rate=89000)
+        OrderItem.objects.create(
+            order=order, product=self.product, quantity=quantity,
+            unit_price=Decimal(unit_price), unit_cost_price=Decimal('4.00'),
+        )
+        if when:
+            Order.objects.filter(pk=order.pk).update(placed_at=when)
+        return order
+
+    def spend(self, amount='100.00', when=None):
+        return Expense.objects.create(
+            account=self.account, description='Rent', amount=Decimal(amount),
+            category=ExpenseCategory.RENT, spent_at=when or timezone.now(),
+        )
+
+    def test_gross_profit_is_revenue_minus_cogs(self):
+        self.sell(quantity=10)
+        data = self.analytics()
+        self.assertEqual(Decimal(str(data['total_revenue'])), Decimal('100.00'))
+        self.assertEqual(Decimal(str(data['total_cogs'])), Decimal('40.00'))
+        self.assertEqual(Decimal(str(data['gross_profit'])), Decimal('60.00'))
+
+    def test_net_profit_is_gross_profit_minus_expenses(self):
+        self.sell(quantity=10)
+        self.spend('25.00')
+        data = self.analytics()
+        self.assertEqual(Decimal(str(data['total_expenses'])), Decimal('25.00'))
+        self.assertEqual(Decimal(str(data['net_profit'])), Decimal('35.00'))
+
+    def test_inventory_purchases_do_not_touch_profit(self):
+        self.sell(quantity=10)
+        purchase = Purchase.objects.create(
+            account=self.account, supplier=Supplier.objects.create(
+                name='S', account=self.account,
+            ), exchange_rate=89000,
+        )
+        PurchaseItem.objects.create(
+            purchase_order=purchase, product=self.product, quantity=50,
+            unit_price=Decimal('4.00'),
+        )
+        data = self.analytics()
+        self.assertEqual(Decimal(str(data['inventory_outlays'])), Decimal('200.00'))
+        self.assertEqual(Decimal(str(data['gross_profit'])), Decimal('60.00'))
+        self.assertEqual(Decimal(str(data['net_profit'])), Decimal('60.00'))
+
+    def test_everything_is_zero_with_no_data(self):
+        data = self.analytics()
+        for key in ('total_revenue', 'total_cogs', 'gross_profit', 'total_expenses',
+                    'net_profit', 'inventory_outlays'):
+            self.assertEqual(Decimal(str(data[key])), Decimal('0'))
+
+    def test_the_same_window_reaches_orders_and_expenses(self):
+        # The failure this guards against: a window that filters orders but not expenses,
+        # which silently reports last month's sales against a year of overhead.
+        old = timezone.now() - timedelta(days=200)
+        self.sell(quantity=10, when=old)
+        self.spend('25.00', when=old)
+        self.sell(quantity=5)
+        self.spend('10.00')
+
+        data = self.analytics(period='last_month')
+        self.assertEqual(Decimal(str(data['total_revenue'])), Decimal('50.00'))
+        self.assertEqual(Decimal(str(data['total_expenses'])), Decimal('10.00'))
+        self.assertEqual(Decimal(str(data['net_profit'])), Decimal('20.00'))
+
+    def test_a_backdated_expense_lands_in_the_month_it_was_spent(self):
+        march = datetime(2026, 3, 15, 12, 0, tzinfo=dt_timezone.utc)
+        self.spend('75.00', when=march)
+        self.spend('10.00')
+
+        data = self.analytics(year='2026', month='3')
+        self.assertEqual(Decimal(str(data['total_expenses'])), Decimal('75.00'))
+
+    def test_expenses_are_account_scoped(self):
+        other_account, _, _, _ = self.make_account_user('fin2')
+        Expense.objects.create(
+            account=other_account, description='Theirs', amount=Decimal('999.00'),
+        )
+        self.assertEqual(Decimal(str(self.analytics()['total_expenses'])), Decimal('0'))
+
+    def test_money_comes_back_as_numbers_not_formatted_strings(self):
+        # The dashboard re-formats these for the LBP toggle. A "$1,234.00" string forces it
+        # to parse the value back out first.
+        self.sell(quantity=1)
+        data = self.analytics()
+        self.assertNotIsInstance(data['total_revenue'], str)
+
+    def test_the_series_carries_expenses_per_period(self):
+        self.sell(quantity=10)
+        self.spend('25.00')
+        data = self.analytics(group_by='month')
+        self.assertTrue(data['series'])
+        self.assertIn('total_expenses', data['series'][0])
