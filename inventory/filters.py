@@ -3,6 +3,11 @@ from .models import Product,Category,Purchase,Order,Expense
 from django.db import models
 from django_filters import filters
 class ProductFilter(FilterSet):
+    # Exact, unlike the icontains ?search=. A scanner submits a complete code, and a partial
+    # or cross-field match would resolve to the wrong product with no way for the user to
+    # tell — the scan flows add order lines without confirming each one.
+    barcode = filters.CharFilter(field_name='barcode', lookup_expr='exact')
+
     class Meta:
         model = Product
         fields = {

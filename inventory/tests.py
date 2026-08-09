@@ -1790,3 +1790,71 @@ class AnalyticsSeriesProfitTests(AccountFixtureMixin, TestCase):
 
     def test_an_account_with_no_data_gets_an_empty_series_not_an_error(self):
         self.assertEqual(self.series(), [])
+
+
+class BarcodeLookupFilterTests(AccountFixtureMixin, TestCase):
+    """
+    A scan needs an exact match. ?search= is icontains across name, description and barcode,
+    so scanning '4006' would also return a product whose description happens to contain it —
+    and the scanner adds items to orders without a human confirming each one.
+    """
+
+    def setUp(self):
+        self.account, self.user, self.client, self.header = self.make_account_user('blk')
+        self.category = Category.objects.create(name='Widgets', account=self.account)
+        self.url = '/inventory/products/'
+
+    def make_product(self, name, barcode=None, account=None, description=''):
+        return Product.objects.create(
+            name=name, description=description, cost_price='1.00',
+            default_sell_price='2.00', category=self.category,
+            account=account or self.account, barcode=barcode, stock_quantity=10,
+        )
+
+    def test_an_exact_barcode_returns_only_that_product(self):
+        self.make_product('Widget', barcode='5901234123457')
+        self.make_product('Gadget', barcode='4006381333931')
+
+        response = self.client.get(
+            self.url, {'barcode': '5901234123457'}, HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(response.data['results'][0]['name'], 'Widget')
+
+    def test_a_partial_code_matches_nothing(self):
+        self.make_product('Widget', barcode='5901234123457')
+        response = self.client.get(
+            self.url, {'barcode': '59012'}, HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.data['count'], 0)
+
+    def test_a_code_appearing_in_a_description_is_not_matched(self):
+        self.make_product('Widget', barcode='5901234123457')
+        self.make_product('Decoy', description='replaces part 5901234123457')
+        response = self.client.get(
+            self.url, {'barcode': '5901234123457'}, HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(response.data['results'][0]['name'], 'Widget')
+
+    def test_a_shared_barcode_returns_every_match(self):
+        # Barcodes are deliberately non-unique (Phase 4). The caller disambiguates; the API
+        # must not silently pick one.
+        self.make_product('Loose apples', barcode='2000000000001')
+        self.make_product('Loose pears', barcode='2000000000001')
+        response = self.client.get(
+            self.url, {'barcode': '2000000000001'}, HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.data['count'], 2)
+
+    def test_the_lookup_is_account_scoped(self):
+        other_account, _, _, _ = self.make_account_user('blk2')
+        other_category = Category.objects.create(name='Theirs', account=other_account)
+        Product.objects.create(
+            name='Theirs', description='', cost_price='1.00', default_sell_price='2.00',
+            category=other_category, account=other_account, barcode='5901234123457',
+        )
+        response = self.client.get(
+            self.url, {'barcode': '5901234123457'}, HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.data['count'], 0)
