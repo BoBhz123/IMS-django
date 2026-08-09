@@ -11,6 +11,7 @@ import { Products } from '@/pages/Products'
 import { Orders } from '@/pages/Orders'
 import { Purchases } from '@/pages/Purchases'
 import { Customers } from '@/pages/Customers'
+import { Expenses } from '@/pages/Expenses'
 import { Suppliers } from '@/pages/Suppliers'
 
 function App() {
@@ -30,6 +31,7 @@ function App() {
             <Route path="/orders" element={<Orders />} />
             <Route path="/purchases" element={<Purchases />} />
             <Route path="/customers" element={<Customers />} />
+            <Route path="/expenses" element={<Expenses />} />
             <Route path="/suppliers" element={<Suppliers />} />
           </Route>
         </Route>

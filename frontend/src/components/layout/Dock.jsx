@@ -7,6 +7,7 @@ import {
   LogOut,
   Moon,
   Package,
+  Receipt,
   ShoppingCart,
   Sun,
   Truck,
@@ -21,6 +22,7 @@ export const NAV_ITEMS = [
   { to: '/products', label: 'Products', icon: Package },
   { to: '/orders', label: 'Orders', icon: ShoppingCart },
   { to: '/purchases', label: 'Purchases', icon: Truck },
+  { to: '/expenses', label: 'Expenses', icon: Receipt },
   { to: '/customers', label: 'Customers', icon: Users },
   { to: '/suppliers', label: 'Suppliers', icon: Building2 },
 ]
