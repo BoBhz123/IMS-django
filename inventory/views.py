@@ -10,9 +10,9 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
 from rest_framework.views import APIView
-from .filters import ProductFilter,PurchaseFilter,OrderFilter
+from .filters import ProductFilter,PurchaseFilter,OrderFilter,ExpenseFilter
 from .pagination import DefaultPagination
-from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order,LINE_TOTAL
+from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order,Expense,LINE_TOTAL
 from .reporting import DateWindow
 from .serializers import *
 import csv
@@ -412,3 +412,13 @@ class ExportPurchasesCSVView(APIView):
             ])
             
         return response
+
+class ExpenseViewSet(AccountScopedMixin, ModelViewSet):
+    queryset = Expense.objects.all()
+    serializer_class = ExpenseSerializer
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_class = ExpenseFilter
+    search_fields = ['description']
+    ordering_fields = ['spent_at', 'amount', 'category']
+    ordering = ['-spent_at']
+    pagination_class = DefaultPagination

@@ -945,3 +945,140 @@ class ExpenseModelTests(AccountFixtureMixin, TestCase):
             spent_at=timezone.now(),
         )
         self.assertEqual(list(Expense.objects.all()), [newer, older])
+
+
+class ExpenseAPITests(AccountFixtureMixin, TestCase):
+    def setUp(self):
+        self.account, self.user, self.client, self.header = self.make_account_user('e1')
+        self.other_account, _, self.other_client, self.other_header = self.make_account_user('e2')
+        self.url = '/inventory/expenses/'
+
+    def make_expense(self, account=None, **overrides):
+        fields = {
+            'account': account or self.account,
+            'description': 'Office rent',
+            'amount': Decimal('500.00'),
+            'category': ExpenseCategory.RENT,
+        }
+        fields.update(overrides)
+        return Expense.objects.create(**fields)
+
+    def test_create_stamps_the_callers_account(self):
+        response = self.client.post(
+            self.url,
+            {'description': 'Rent', 'amount': '500.00', 'category': 'rent'},
+            format='json',
+            HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(Expense.objects.get().account, self.account)
+
+    def test_the_client_cannot_choose_another_account(self):
+        self.client.post(
+            self.url,
+            {
+                'description': 'Rent', 'amount': '500.00', 'category': 'rent',
+                'account': self.other_account.id,
+            },
+            format='json',
+            HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(Expense.objects.get().account, self.account)
+
+    def test_list_shows_only_the_callers_expenses(self):
+        self.make_expense()
+        self.make_expense(account=self.other_account, description='Theirs')
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=self.header)
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(response.data['results'][0]['description'], 'Office rent')
+
+    def test_another_account_cannot_read_one_by_id(self):
+        expense = self.make_expense()
+        response = self.other_client.get(
+            f'{self.url}{expense.id}/', HTTP_AUTHORIZATION=self.other_header,
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_another_account_cannot_delete_one(self):
+        expense = self.make_expense()
+        response = self.other_client.delete(
+            f'{self.url}{expense.id}/', HTTP_AUTHORIZATION=self.other_header,
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertTrue(Expense.objects.filter(pk=expense.pk).exists())
+
+    def test_update_and_delete_work_for_the_owner(self):
+        expense = self.make_expense()
+        patched = self.client.patch(
+            f'{self.url}{expense.id}/', {'amount': '600.00'},
+            format='json', HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(patched.status_code, 200)
+        expense.refresh_from_db()
+        self.assertEqual(expense.amount, Decimal('600.00'))
+
+        deleted = self.client.delete(
+            f'{self.url}{expense.id}/', HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(deleted.status_code, 204)
+
+    def test_a_backdated_spend_date_is_accepted(self):
+        backdated = (timezone.now() - timedelta(days=45)).isoformat()
+        response = self.client.post(
+            self.url,
+            {
+                'description': 'Late receipt', 'amount': '80.00',
+                'category': 'transport', 'spent_at': backdated,
+            },
+            format='json',
+            HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertLess(Expense.objects.get().spent_at, timezone.now() - timedelta(days=40))
+
+    def test_the_response_carries_a_human_readable_category(self):
+        self.make_expense(category=ExpenseCategory.TAXES_FEES)
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=self.header)
+        self.assertEqual(response.data['results'][0]['category_display'], 'Taxes & Fees')
+
+    def test_filtering_by_category(self):
+        self.make_expense(category=ExpenseCategory.RENT)
+        self.make_expense(category=ExpenseCategory.SOFTWARE, description='Hosting')
+
+        response = self.client.get(
+            self.url, {'category': 'software'}, HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.data['count'], 1)
+
+    def test_filtering_by_spend_date_range(self):
+        self.make_expense(spent_at=timezone.now() - timedelta(days=40))
+        self.make_expense(spent_at=timezone.now() - timedelta(days=2), description='Recent')
+
+        cutoff = (timezone.now() - timedelta(days=10)).date().isoformat()
+        response = self.client.get(
+            self.url, {'spent_after': cutoff}, HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(response.data['results'][0]['description'], 'Recent')
+
+    def test_search_matches_the_description(self):
+        self.make_expense(description='Generator diesel')
+        self.make_expense(description='Office rent')
+
+        response = self.client.get(
+            self.url, {'search': 'diesel'}, HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.data['count'], 1)
+
+    def test_ordering_by_amount(self):
+        self.make_expense(amount=Decimal('10.00'))
+        self.make_expense(amount=Decimal('900.00'), description='Big')
+
+        response = self.client.get(
+            self.url, {'ordering': '-amount'}, HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.data['results'][0]['description'], 'Big')
+
+    def test_anonymous_callers_are_rejected(self):
+        self.assertEqual(APIClient().get(self.url).status_code, 401)

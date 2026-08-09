@@ -10,6 +10,7 @@ router.register('purchases', views.PurchaseViewSet)
 router.register('orders', views.OrderViewSet)
 router.register('suppliers', views.SupplierViewSet)
 router.register('customers', views.CustomerViewSet)
+router.register('expenses', views.ExpenseViewSet, basename='expenses')
 
 # Image nested routing
 products_router = routers.NestedDefaultRouter(router, 'products', lookup='product')

@@ -14,6 +14,8 @@ from accounts.models import Account, Membership
 from inventory.models import (
     Category,
     Customer,
+    Expense,
+    ExpenseCategory,
     Order,
     OrderItem,
     Product,
@@ -103,6 +105,9 @@ class Command(BaseCommand):
         parser.add_argument(
             "--orders", type=int, default=120, help="Number of orders to create."
         )
+        parser.add_argument(
+            "--expenses", type=int, default=30, help="Number of expenses to create."
+        )
 
     def handle(self, *args, **options):
         Faker.seed()
@@ -163,13 +168,14 @@ class Command(BaseCommand):
             products = self._seed_products(account, categories, suppliers, options["products"])
             self._seed_purchases(account, products, suppliers, options["purchases"])
             self._seed_orders(account, products, customers, options["orders"])
+            self._seed_expenses(account, options["expenses"])
 
         scoped = lambda model: model.objects.for_account(account).count()
         self.stdout.write(self.style.SUCCESS(
             f"Seed complete for '{account.name}' — categories={scoped(Category)} "
             f"suppliers={scoped(Supplier)} customers={scoped(Customer)} "
             f"products={scoped(Product)} purchases={scoped(Purchase)} "
-            f"orders={scoped(Order)}"
+            f"orders={scoped(Order)} expenses={scoped(Expense)}"
         ))
 
     def _seed_categories(self, account):
@@ -274,6 +280,30 @@ class Command(BaseCommand):
         now = timezone.now()
         delta_seconds = random.randint(0, days_back * 24 * 3600)
         return now - timedelta(seconds=delta_seconds)
+
+    def _seed_expenses(self, account, count):
+        # spent_at is default=timezone.now, not auto_now_add, so unlike purchases and orders
+        # these can be back-dated on the way in rather than by a follow-up UPDATE.
+        categories = [choice[0] for choice in ExpenseCategory.choices]
+        descriptions = {
+            'rent': 'Shop rent', 'utilities': 'Electricity and water',
+            'salaries': 'Staff wages', 'marketing': 'Instagram ads',
+            'software': 'Accounting software', 'transport': 'Delivery fuel',
+            'maintenance': 'Fridge repair', 'taxes_fees': 'Municipality fee',
+            'other': 'Miscellaneous',
+        }
+        created = 0
+        for _ in range(count):
+            category = random.choice(categories)
+            Expense.objects.create(
+                account=account,
+                description=descriptions[category],
+                amount=Decimal(str(round(random.uniform(20, 900), 2))),
+                category=category,
+                spent_at=self._random_datetime_within(330),
+            )
+            created += 1
+        self.stdout.write(f"Expenses created: {created}")
 
     def _seed_purchases(self, account, products, suppliers, count):
         created_ids = []

@@ -3,7 +3,7 @@ from collections import defaultdict
 from rest_framework import serializers
 from django.db import transaction
 from django.db.models import F
-from .models import Product , Category,Purchase,PurchaseItem,Order,OrderItem,Supplier,ProductImage,Customer
+from .models import Product , Category,Purchase,PurchaseItem,Order,OrderItem,Supplier,ProductImage,Customer,Expense
 import uuid
 
 
@@ -248,3 +248,20 @@ class OrderSerializer(serializers.ModelSerializer):
     class Meta():
         model = Order
         fields = ['id','customer','placed_at','exchange_rate','items','total_price','total_profit']  
+
+class ExpenseSerializer(serializers.ModelSerializer):
+    """
+    No AccountScopedSerializerMixin here, and that is not an omission: Expense has no
+    relational field other than `account`, so there is nothing to narrow. The account is
+    stamped by AccountScopedMixin on the viewset and is not writable.
+    """
+
+    category_display = serializers.CharField(source='get_category_display', read_only=True)
+
+    class Meta:
+        model = Expense
+        fields = [
+            'id', 'description', 'amount', 'category', 'category_display',
+            'spent_at', 'created_at',
+        ]
+        read_only_fields = ['id', 'created_at']
