@@ -57,6 +57,23 @@ drive-by change.
 Deployment steps are not in scope for routine work — never run migrations, resets, or config changes
 against production without explicit authorization.
 
+### ⚠️ Pre-deploy checklist — dev-only relaxations to revert
+
+Things loosened deliberately for local development. Check each before a production deploy.
+
+1. **`frontend/vite.config.js` → `server.allowedHosts`** is set to `['.trycloudflare.com',
+   '.loca.lt']` so tunnel URLs can reach the dev server — the only way to test the camera barcode
+   scanner, since `getUserMedia` needs a secure context and a phone on the LAN has none. Revert it
+   to the default (remove the key) once phone testing is done.
+
+   *This one cannot reach production by itself:* `server.*` configures the Vite dev server only,
+   and `vite build` ignores it, so nothing in `dist/` is affected. The exposure is the local
+   machine while a tunnel is actually running — treat the tunnel as public, because it is.
+2. **`CORS_ALLOW_ALL_ORIGINS = True`** in `ims/settings.py` — this one *does* ship. Flagged for
+   Phase 8 (`PLAN.md`), not to be fixed as a drive-by change.
+3. **`BILLING_PRICE_MONTHLY_USD` / `BILLING_PRICE_ONE_TIME_USD`** — the committed `15` / `299` are
+   display-only placeholders, not agreed pricing. See the Phase 2.5 section.
+
 ## Architecture
 
 Django apps under a single `ims` project, plus a React frontend:
