@@ -41,6 +41,8 @@ function toChartSeries(series, granularity) {
     // renamed to inventory_outlays — here it sits nowhere near a COGS figure.
     cost: row.total_costs,
     expenses: row.total_expenses ?? 0,
+    grossProfit: row.gross_profit ?? 0,
+    netProfit: row.net_profit ?? 0,
   }))
 }
 
@@ -254,16 +256,16 @@ export function Dashboard() {
           deltaLabel={deltaLabel}
           sparkline={sparkline.map((t) => t.revenue)}
         />
-        {/* No sparkline on the two profit tiles: the chart series carries revenue, purchases
-            and expenses per period, but not COGS, so there is no honest per-period gross or
-            net profit to draw. A revenue−purchases line here would be the old conflation
-            back again, in a shape that looks authoritative. */}
+        {/* The profit tiles draw real per-period figures: the series carries COGS since
+            Phase 6, so gross and net profit are computed the same way here as in the
+            summary rather than approximated from revenue minus purchases. */}
         <StatTile
           index={1}
           label="Gross profit"
           value={formatAmount(money('value', 'gross_profit'))}
           delta={delta('gross_profit', true)}
           deltaLabel={deltaLabel}
+          sparkline={sparkline.map((t) => t.grossProfit)}
         />
         <StatTile
           index={2}
@@ -279,6 +281,7 @@ export function Dashboard() {
           value={formatAmount(money('value', 'net_profit'))}
           delta={delta('net_profit', true)}
           deltaLabel={deltaLabel}
+          sparkline={sparkline.map((t) => t.netProfit)}
         />
         <StatTile
           index={4}
