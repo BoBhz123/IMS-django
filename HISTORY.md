@@ -8,6 +8,40 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-09 — Phase 6: per-period profit and the dashboard profit sparklines
+
+The analytics `series` gains `total_cogs`, `gross_profit` and `net_profit` per period, and the Gross
+profit and Net profit tiles finally draw sparklines.
+
+**Why those two tiles shipped bare in Phase 3.** The summary payload has carried gross and net profit
+since then, but the *series* had only revenue, purchases and expenses — no per-period COGS. Drawing
+`revenue − purchases` under a tile labelled "profit" would have put the exact conflation this project
+spent Phase 3 removing back on screen, in a shape that looks authoritative. Leaving them bare was the
+honest option until the data existed. Now it does.
+
+**Revenue and COGS are summed in one `annotate()`.** Both expressions traverse the `items` join;
+split across two `annotate()` calls on the same queryset, each multiplies the other's row count. The
+same reasoning already governs the summary aggregate, and a test pins the per-period version too.
+
+**`net_profit` is allowed to be negative.** A month with rent and no sales is a loss, and that is the
+month most worth seeing on a chart. Verified on the seeded account: 11 of 297 daily periods report a
+loss, and they survive the API, the gap-fill and the sparkline unclamped.
+
+**`fillSeriesGaps` names every key explicitly, so it silently drops any it does not name.** A field
+added to the series without being added there reads as `undefined` in the chart, `Math.max` returns
+`NaN`, every SVG coordinate becomes `NaN`, and the tile renders an invisible line with no error. The
+existing exact-match test on the filled row shape is what catches that, and it was extended rather
+than loosened when the three new keys landed.
+
+`total_costs` stays the series key for purchases while the summary tile is `inventory_outlays`. Both
+are correct in place — the tile sits beside `total_cogs` and the series does not.
+
+Sparklines continue to use the fixed last-7-days daily window, matching the existing revenue and
+outlays tiles. Making them follow the All time / Last month / Last year selector was considered and
+deliberately deferred: it means restructuring Dashboard's two independent data-loading effects.
+
+---
+
 ## 2026-08-09 — CSV export redesign: machine-readable output
 
 A follow-up to Phase 5, redesigning what the four exports actually emit so downstream spreadsheets

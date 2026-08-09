@@ -164,9 +164,9 @@ code with the API export views, so a formula/format fix usually needs to happen 
 **Full design:** `docs/superpowers/specs/2026-08-07-saas-single-db-migration-design.md`
 **Completed work log:** `HISTORY.md` — read it at session start.
 
-**Status:** Phases 1–5 complete. The milestone is done except **Phase 2.5b-2**, which is blocked on
-Paddle merchant approval — see the PAUSE STATUS below. There is no next planned phase; the backlog
-beyond this is camera barcode scanning (deferred from Phase 4) and whatever Paddle unblocks.
+**Status:** Phases 1–6 complete. **Phase 7** (camera barcode scanning) is in progress and **Phase 8**
+(security audit) is gated on the user installing the scanning tools — see `PLAN.md`, Task 8.0.
+**Phase 2.5b-2** remains blocked on Paddle merchant approval; see the PAUSE STATUS below.
 
 Phases are a dependency chain. 3–5 all touch models that Phase 2 restructures, so running them out of
 order means writing migrations twice. Finish each phase (including its tests) before starting the next.
@@ -298,6 +298,21 @@ the date window is one shared `inventory/reporting.py::DateWindow` applied to ev
 queryset. `spent_at` uses `default=timezone.now`, not `auto_now_add`, so a receipt entered Friday for
 a Tuesday purchase lands in the right month.
 
+### Phase 6 — Dashboard profit series — **done**
+The analytics `series` carries `total_cogs`, `gross_profit` and `net_profit` per period, and the
+Gross profit / Net profit tiles draw sparklines from them. See `HISTORY.md`. Tile sparklines all use
+the fixed last-7-days daily window by decision — making them follow the period selector would mean
+restructuring Dashboard's two data-loading effects.
+
+### Phase 7 — Camera barcode scanning — **in progress**
+Plan: `PLAN.md`. `@zxing/library` behind a dynamic import, one `BarcodeScannerModal`, and three call
+sites (product form, order flow, purchase flow). Manual verification on a physical phone is the
+owner's; automated coverage mocks the decoder, since browser automation is forbidden here.
+
+### Phase 8 — Security audit — **blocked, by design**
+Do not start. `PLAN.md` Task 8.0 requires the user to install `pip-audit`, `bandit` and `semgrep`
+and confirm before any Phase 8 work begins.
+
 ### Phase 4 — Barcodes — **done**
 Optional indexed `Product.barcode` in `ProductViewSet.search_fields`, so `?search=` covers it. Form
 input, list tag, admin search, seeded data. See `HISTORY.md`. Camera scanning is still a later phase.
@@ -391,6 +406,15 @@ Append here when something bites. Do not repeat these.
 - **Every reporting queryset must be filtered through `inventory/reporting.py::DateWindow`.** A window
   applied to one side of a profit calculation and not the other misstates it silently — no exception,
   no error, just a wrong number.
+- **`fillSeriesGaps` (`frontend/src/lib/format.js`) drops any key it does not name.** Adding a field
+  to the analytics `series` requires adding it there too, or the chart reads `undefined`, `Math.max`
+  returns `NaN`, and the sparkline renders invisible with no error. The exact-match test on the
+  filled row shape is the guard — extend it, never loosen it.
+- **Series money keys and summary money keys differ on purpose.** `series` rows use `total_costs` for
+  purchases; the summary uses `inventory_outlays`. Both are correct in place, and the series has no
+  equivalent of the summary's `total_cogs` naming hazard.
+- **Per-period revenue and COGS must be summed in one `annotate()`.** Both traverse the `items` join;
+  two calls on the same queryset fan out and multiply each other's row counts.
 - **CSV money is written bare — no `$`, no thousands separators — via `inventory/csv_format.py`.**
   A `$` makes a spreadsheet treat the column as text and refuse to sum it; a thousands comma inside
   an unquoted cell splits it in two and shifts every column after it. Both exporters and both admin
