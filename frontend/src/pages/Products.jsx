@@ -3,6 +3,7 @@ import {
   ArrowDown,
   ArrowUp,
   ArrowUpDown,
+  Barcode,
   ChevronLeft,
   ChevronRight,
   Package,
@@ -253,7 +254,7 @@ function FilterBar({
           type="text"
           value={searchInput}
           onChange={(event) => onSearchChange(event.target.value)}
-          placeholder="Search products…"
+          placeholder="Search name or barcode…"
           className="w-full bg-transparent text-[13px] text-text-primary placeholder:text-text-tertiary focus:outline-none"
         />
       </div>
@@ -388,7 +389,17 @@ function ProductTable({ products, categoryMap, supplierMap, sort, onSort, loadin
                     <td className="px-5 py-2.5">
                       <div className="flex items-center gap-3">
                         <Thumbnail product={product} />
-                        <span className="font-medium text-text-primary">{product.name}</span>
+                        <div className="flex flex-col gap-0.5">
+                          <span className="font-medium text-text-primary">{product.name}</span>
+                          {/* Only rendered when present — the field is optional, and an
+                              empty tag on most rows is noise, not information. */}
+                          {product.barcode && (
+                            <span className="inline-flex w-fit items-center gap-1 rounded-md bg-canvas-2 px-1.5 py-0.5 font-mono text-[11px] text-text-tertiary tabular-nums">
+                              <Barcode size={11} />
+                              {product.barcode}
+                            </span>
+                          )}
+                        </div>
                       </div>
                     </td>
                     <td className="px-4 py-2.5 text-text-secondary">

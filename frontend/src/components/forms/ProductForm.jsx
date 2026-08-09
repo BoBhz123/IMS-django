@@ -9,6 +9,7 @@ const emptyForm = {
   name: '',
   category: '',
   supplier: '',
+  barcode: '',
   description: '',
   cost_price: 0,
   default_sell_price: 0,
@@ -24,6 +25,7 @@ export function ProductForm({ open, onClose, onSaved, product, categories, suppl
           name: product.name,
           category: product.category ?? '',
           supplier: product.supplier ?? '',
+          barcode: product.barcode ?? '',
           description: product.description ?? '',
           cost_price: product.cost_price,
           default_sell_price: product.default_sell_price,
@@ -86,6 +88,9 @@ export function ProductForm({ open, onClose, onSaved, product, categories, suppl
       category: form.category || null,
       supplier: form.supplier || null,
       description: form.description,
+      // Sent even when empty: '' is how the server is told to clear an existing barcode,
+      // which it stores as NULL.
+      barcode: form.barcode.trim(),
       cost_price: form.cost_price,
       default_sell_price: form.default_sell_price,
       stock_quantity: Number(form.stock_quantity),
@@ -149,6 +154,14 @@ export function ProductForm({ open, onClose, onSaved, product, categories, suppl
               </option>
             ))}
           </Select>
+        </Field>
+
+        <Field label="Barcode" error={errors.barcode}>
+          <TextInput
+            value={form.barcode}
+            onChange={(v) => update('barcode', v)}
+            placeholder="Optional — scan or type the code"
+          />
         </Field>
 
         <Field label="Description" error={errors.description}>
