@@ -1,8 +1,9 @@
-import { useRef, useState } from 'react'
-import { ImagePlus, Loader2, X } from 'lucide-react'
+import { useCallback, useRef, useState } from 'react'
+import { ImagePlus, Loader2, ScanLine, X } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useCurrency } from '@/context/CurrencyContext'
 import { SlideOver } from '@/components/ui/SlideOver'
+import { BarcodeScannerModal } from '@/components/ui/BarcodeScannerModal'
 import { CurrencyInput } from '@/components/ui/CurrencyInput'
 
 const emptyForm = {
@@ -35,6 +36,18 @@ export function ProductForm({ open, onClose, onSaved, product, categories, suppl
   )
   const [errors, setErrors] = useState({})
   const [saving, setSaving] = useState(false)
+  const [scannerOpen, setScannerOpen] = useState(false)
+
+  // Both callbacks are memoised because BarcodeScannerModal lists them in the deps of the
+  // effect that starts the camera. A fresh identity on every render would tear the camera
+  // down and restart it on every keystroke in this form.
+  const handleScan = useCallback((code) => {
+    setForm((current) => ({ ...current, barcode: code }))
+    // Closed here rather than left to the user: the reader keeps decoding, and a second read
+    // of the same label would overwrite the field they are about to check.
+    setScannerOpen(false)
+  }, [])
+  const closeScanner = useCallback(() => setScannerOpen(false), [])
 
   const existingImage = product?.images?.[0]
   const [imageFile, setImageFile] = useState(null)
@@ -157,11 +170,25 @@ export function ProductForm({ open, onClose, onSaved, product, categories, suppl
         </Field>
 
         <Field label="Barcode" error={errors.barcode}>
-          <TextInput
-            value={form.barcode}
-            onChange={(v) => update('barcode', v)}
-            placeholder="Optional — scan or type the code"
-          />
+          <div className="flex items-center gap-2">
+            <div className="min-w-0 flex-1">
+              <TextInput
+                value={form.barcode}
+                onChange={(v) => update('barcode', v)}
+                placeholder="Optional — scan or type the code"
+              />
+            </div>
+            {/* The camera is an accelerator, never the only way in — the input beside it stays
+                fully editable, which is what desktops and denied permissions fall back to. */}
+            <button
+              type="button"
+              onClick={() => setScannerOpen(true)}
+              aria-label="Scan barcode"
+              className="flex shrink-0 items-center gap-1.5 rounded-xl border border-hairline bg-canvas-2 px-3 py-2 text-[13px] font-medium text-text-secondary hover:border-accent-blue/40 hover:text-text-primary"
+            >
+              <ScanLine size={15} />
+            </button>
+          </div>
         </Field>
 
         <Field label="Description" error={errors.description}>
@@ -260,6 +287,10 @@ export function ProductForm({ open, onClose, onSaved, product, categories, suppl
           {isEdit ? 'Save changes' : 'Add product'}
         </button>
       </form>
+
+      {/* Outside the <form> on purpose: the scanner's own buttons default to type="submit",
+          and one stray click would post a half-filled product. */}
+      <BarcodeScannerModal open={scannerOpen} onClose={closeScanner} onScan={handleScan} />
     </SlideOver>
   )
 }
