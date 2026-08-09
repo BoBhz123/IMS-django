@@ -4,6 +4,7 @@ from datetime import timezone as dt_timezone
 from decimal import Decimal
 
 from django.contrib.auth.models import User
+from django.core.exceptions import ValidationError
 from django.db.models import Sum
 from django.test import TestCase, override_settings
 from django.utils import timezone
@@ -11,8 +12,8 @@ from rest_framework.test import APIClient, APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from inventory.models import (
-    LINE_COGS, Category, Customer, Order, OrderItem, Product, ProductImage,
-    Purchase, PurchaseItem, Supplier, items_cogs,
+    LINE_COGS, Category, Customer, Expense, ExpenseCategory, Order, OrderItem,
+    Product, ProductImage, Purchase, PurchaseItem, Supplier, items_cogs,
 )
 from inventory.reporting import DateWindow
 
@@ -889,3 +890,58 @@ class DateWindowTests(AccountFixtureMixin, TestCase):
         self.assertEqual(
             window.apply(OrderItem.objects.all(), 'order__placed_at').count(), 0,
         )
+
+
+class ExpenseModelTests(AccountFixtureMixin, TestCase):
+    def setUp(self):
+        self.account, self.user, self.client, self.header = self.make_account_user('exp')
+
+    def test_spent_at_defaults_to_now_but_is_writable(self):
+        # default=timezone.now, never auto_now_add. A receipt entered Friday for a Tuesday
+        # spend has to land in Tuesday's month or that month's net profit is wrong.
+        backdated = timezone.now() - timedelta(days=45)
+        expense = Expense.objects.create(
+            account=self.account, description='Rent', amount=Decimal('500.00'),
+            category=ExpenseCategory.RENT, spent_at=backdated,
+        )
+        self.assertEqual(expense.spent_at, backdated)
+
+    def test_created_at_records_when_it_was_entered_not_when_it_was_spent(self):
+        backdated = timezone.now() - timedelta(days=45)
+        expense = Expense.objects.create(
+            account=self.account, description='Rent', amount=Decimal('500.00'),
+            spent_at=backdated,
+        )
+        self.assertGreater(expense.created_at, backdated)
+
+    def test_category_defaults_to_other(self):
+        expense = Expense.objects.create(
+            account=self.account, description='Something', amount=Decimal('1.00'),
+        )
+        self.assertEqual(expense.category, ExpenseCategory.OTHER)
+
+    def test_a_negative_amount_is_rejected(self):
+        expense = Expense(
+            account=self.account, description='Refund', amount=Decimal('-5.00'),
+        )
+        with self.assertRaises(ValidationError):
+            expense.full_clean()
+
+    def test_an_unknown_category_is_rejected(self):
+        expense = Expense(
+            account=self.account, description='X', amount=Decimal('1.00'),
+            category='helicopters',
+        )
+        with self.assertRaises(ValidationError):
+            expense.full_clean()
+
+    def test_newest_first_by_spend_date(self):
+        older = Expense.objects.create(
+            account=self.account, description='Older', amount=Decimal('1.00'),
+            spent_at=timezone.now() - timedelta(days=10),
+        )
+        newer = Expense.objects.create(
+            account=self.account, description='Newer', amount=Decimal('1.00'),
+            spent_at=timezone.now(),
+        )
+        self.assertEqual(list(Expense.objects.all()), [newer, older])

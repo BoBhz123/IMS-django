@@ -235,3 +235,11 @@ class CustomerAdmin(admin.ModelAdmin):
     
     
     
+
+
+@admin.register(models.Expense)
+class ExpenseAdmin(admin.ModelAdmin):
+    list_display = ['description', 'category', 'amount', 'spent_at', 'account']
+    list_filter = ['category', 'account']
+    search_fields = ['description']
+    date_hierarchy = 'spent_at'

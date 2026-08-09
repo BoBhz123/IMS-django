@@ -1,6 +1,7 @@
 from django.db import models
 import uuid
 from django.core.validators import MinValueValidator
+from django.utils import timezone
 
 from accounts.managers import AccountScopedManager
 from accounts.models import Account
@@ -257,3 +258,58 @@ class OrderItem(models.Model):
          return (self.unit_price - self.unit_cost_price) * self.quantity * self.unit_multiplier
 
 
+
+
+class ExpenseCategory(models.TextChoices):
+    """
+    A fixed list rather than free text. Free text fragments 'Rent', 'rent' and 'Rent ' into
+    separate rows in any per-category breakdown, which is the main reason to record a
+    category at all. Adding one later is an edit here, not a migration.
+    """
+
+    RENT = 'rent', 'Rent'
+    UTILITIES = 'utilities', 'Utilities'
+    SALARIES = 'salaries', 'Salaries'
+    MARKETING = 'marketing', 'Marketing'
+    SOFTWARE = 'software', 'Software'
+    TRANSPORT = 'transport', 'Transport'
+    MAINTENANCE = 'maintenance', 'Maintenance'
+    TAXES_FEES = 'taxes_fees', 'Taxes & Fees'
+    OTHER = 'other', 'Other'
+
+
+class Expense(models.Model):
+    """
+    Operational overhead — rent, salaries, software. Deliberately not inventory: stock
+    spend is a cash movement recorded by Purchase, and folding it in here would corrupt the
+    margin that gross profit is supposed to measure.
+
+    Amounts are USD, like every other price in this app. LBP is a display toggle.
+    """
+
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name='expenses')
+    description = models.CharField(max_length=255)
+    amount = models.DecimalField(
+        max_digits=10, decimal_places=2, validators=[MinValueValidator(0)],
+    )
+    category = models.CharField(
+        max_length=32, choices=ExpenseCategory.choices, default=ExpenseCategory.OTHER,
+        db_index=True,
+    )
+    # When the money was spent, which is not when the row was made. default=timezone.now and
+    # never auto_now_add: auto_now_add ignores assignment, so a receipt entered on Friday for
+    # a Tuesday spend would land in the wrong month and misstate that month's net profit.
+    spent_at = models.DateTimeField(default=timezone.now, db_index=True)
+    # When it was entered. An audit trail worth keeping on a money record.
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = AccountScopedManager()
+
+    class Meta:
+        ordering = ['-spent_at']
+        indexes = [
+            models.Index(fields=['account', '-spent_at'], name='expense_account_date_idx'),
+        ]
+
+    def __str__(self):
+        return f'{self.description} (${self.amount})'
