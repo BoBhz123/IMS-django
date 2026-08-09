@@ -1,9 +1,12 @@
 import tempfile
+from datetime import datetime, timedelta
+from datetime import timezone as dt_timezone
 from decimal import Decimal
 
 from django.contrib.auth.models import User
 from django.db.models import Sum
 from django.test import TestCase, override_settings
+from django.utils import timezone
 from rest_framework.test import APIClient, APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
@@ -11,6 +14,7 @@ from inventory.models import (
     LINE_COGS, Category, Customer, Order, OrderItem, Product, ProductImage,
     Purchase, PurchaseItem, Supplier, items_cogs,
 )
+from inventory.reporting import DateWindow
 
 
 class AccountFixtureMixin:
@@ -807,3 +811,81 @@ class CostSnapshotTests(AccountFixtureMixin, TestCase):
         body = response.content.decode()
         self.assertIn('4.00', body)
         self.assertNotIn('9.00', body)
+
+
+class DateWindowTests(AccountFixtureMixin, TestCase):
+    """
+    One window object, applied to every queryset a report touches. Orders filtered by a
+    window that expenses escaped would misstate net profit with no error anywhere — which
+    is the whole reason this is a shared object and not four copies of five if-statements.
+    """
+
+    def setUp(self):
+        self.account, self.user, self.client, self.header = self.make_account_user('win')
+        self.category = Category.objects.create(name='Widgets', account=self.account)
+
+    def make_order(self, when):
+        order = Order.objects.create(account=self.account, exchange_rate=89000)
+        Order.objects.filter(pk=order.pk).update(placed_at=when)
+        return order
+
+    def test_no_parameters_filters_nothing(self):
+        self.make_order(timezone.now() - timedelta(days=900))
+        window = DateWindow.from_query_params({})
+        self.assertEqual(window.apply(Order.objects.all(), 'placed_at').count(), 1)
+
+    def test_year_and_month(self):
+        self.make_order(datetime(2026, 3, 4, 12, 0, tzinfo=dt_timezone.utc))
+        self.make_order(datetime(2026, 5, 4, 12, 0, tzinfo=dt_timezone.utc))
+
+        window = DateWindow.from_query_params({'year': '2026', 'month': '3'})
+        self.assertEqual(window.apply(Order.objects.all(), 'placed_at').count(), 1)
+
+    def test_start_and_end_dates_are_inclusive(self):
+        self.make_order(datetime(2026, 3, 1, 12, 0, tzinfo=dt_timezone.utc))
+        self.make_order(datetime(2026, 3, 31, 12, 0, tzinfo=dt_timezone.utc))
+        self.make_order(datetime(2026, 4, 1, 12, 0, tzinfo=dt_timezone.utc))
+
+        window = DateWindow.from_query_params(
+            {'start_date': '2026-03-01', 'end_date': '2026-03-31'}
+        )
+        self.assertEqual(window.apply(Order.objects.all(), 'placed_at').count(), 2)
+
+    def test_period_last_month(self):
+        self.make_order(timezone.now() - timedelta(days=5))
+        self.make_order(timezone.now() - timedelta(days=200))
+
+        window = DateWindow.from_query_params({'period': 'last_month'})
+        self.assertEqual(window.apply(Order.objects.all(), 'placed_at').count(), 1)
+
+    def test_an_unrecognised_period_filters_nothing(self):
+        # 'all_time' is deliberately absent from PERIOD_WINDOW_DAYS and means "no filter".
+        self.make_order(timezone.now() - timedelta(days=900))
+        window = DateWindow.from_query_params({'period': 'all_time'})
+        self.assertEqual(window.apply(Order.objects.all(), 'placed_at').count(), 1)
+
+    def test_blank_parameters_are_ignored(self):
+        # The SPA sends ?year=&month= when its selects are cleared. Treating '' as a value
+        # would filter on the empty string and raise.
+        self.make_order(timezone.now())
+        window = DateWindow.from_query_params({'year': '', 'month': '', 'period': ''})
+        self.assertEqual(window.apply(Order.objects.all(), 'placed_at').count(), 1)
+
+    def test_the_same_window_applies_across_a_relation(self):
+        order = self.make_order(datetime(2026, 3, 4, 12, 0, tzinfo=dt_timezone.utc))
+        product = Product.objects.create(
+            name='W', description='', cost_price='1.00', default_sell_price='2.00',
+            category=self.category, stock_quantity=5, account=self.account,
+        )
+        OrderItem.objects.create(
+            order=order, product=product, quantity=1, unit_price=Decimal('2.00'),
+        )
+
+        window = DateWindow.from_query_params({'year': '2026', 'month': '3'})
+        self.assertEqual(
+            window.apply(OrderItem.objects.all(), 'order__placed_at').count(), 1,
+        )
+        window = DateWindow.from_query_params({'year': '2026', 'month': '4'})
+        self.assertEqual(
+            window.apply(OrderItem.objects.all(), 'order__placed_at').count(), 0,
+        )

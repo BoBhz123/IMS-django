@@ -13,9 +13,8 @@ from rest_framework.views import APIView
 from .filters import ProductFilter,PurchaseFilter,OrderFilter
 from .pagination import DefaultPagination
 from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order,LINE_TOTAL
+from .reporting import DateWindow
 from .serializers import *
-from datetime import date, timedelta
-from django.utils import timezone
 import csv
 
 from accounts.mixins import AccountScopedMixin
@@ -138,13 +137,6 @@ GROUP_BY_TRUNC = {
     'year': TruncYear,
 }
 
-# 'all_time' is intentionally absent: it means "no date filtering", the existing default behavior.
-PERIOD_WINDOW_DAYS = {
-    'last_month': 30,
-    'last_year': 365,
-}
-
-
 class AnalyticsView(APIView):
     # Deliberately not IsAdminUser. The dashboard calls this on every load, so admin-only
     # would force every subscriber to be is_staff — which now means platform admin over
@@ -159,38 +151,12 @@ class AnalyticsView(APIView):
             if account else OrderItem.objects.none()
         )
 
-        year = request.query_params.get('year')
-        month = request.query_params.get('month')
-        start_date = request.query_params.get('start_date')
-        end_date = request.query_params.get('end_date')
         group_by = request.query_params.get('group_by')
-        period = request.query_params.get('period')
 
-        if period in PERIOD_WINDOW_DAYS:
-            cutoff = timezone.now() - timedelta(days=PERIOD_WINDOW_DAYS[period])
-            orders = orders.filter(placed_at__gte=cutoff)
-            purchases = purchases.filter(placed_at__gte=cutoff)
-            products = products.filter(order__placed_at__gte=cutoff)
-
-        if year:
-            orders = orders.filter(placed_at__year=year)
-            purchases = purchases.filter(placed_at__year=year)
-            products = products.filter(order__placed_at__year=year)
-
-        if month:
-            orders = orders.filter(placed_at__month=month)
-            purchases = purchases.filter(placed_at__month=month)
-            products = products.filter(order__placed_at__month=month)
-
-        if start_date:
-            orders = orders.filter(placed_at__date__gte=start_date)
-            purchases = purchases.filter(placed_at__date__gte=start_date)
-            products = products.filter(order__placed_at__date__gte=start_date)
-
-        if end_date:
-            orders = orders.filter(placed_at__date__lte=end_date)
-            purchases = purchases.filter(placed_at__date__lte=end_date)
-            products = products.filter(order__placed_at__date__lte=end_date)
+        window = DateWindow.from_query_params(request.query_params)
+        orders = window.apply(orders, 'placed_at')
+        purchases = window.apply(purchases, 'placed_at')
+        products = window.apply(products, 'order__placed_at')
 
         revenue_query = orders.aggregate(
             total_revenue=Sum(LINE_TOTAL)
