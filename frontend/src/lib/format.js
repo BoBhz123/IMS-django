@@ -76,11 +76,18 @@ export function fillSeriesGaps(series, { start, end, stepDays }) {
   while (cursor <= endDate) {
     const key = toDateKey(cursor)
     const row = byPeriod.get(key)
+    // Every key is named explicitly, so a field added to the analytics series and not added
+    // here is silently dropped — and renders as a plausible flat-zero sparkline rather than
+    // an error.
     filled.push({
       period: key,
       total_revenue: row?.total_revenue ?? 0,
       total_costs: row?.total_costs ?? 0,
       total_expenses: row?.total_expenses ?? 0,
+      total_cogs: row?.total_cogs ?? 0,
+      gross_profit: row?.gross_profit ?? 0,
+      // ?? rather than ||: a real -80 must survive, and 0 is a legitimate value here.
+      net_profit: row?.net_profit ?? 0,
     })
     cursor.setUTCDate(cursor.getUTCDate() + stepDays)
   }
