@@ -164,7 +164,7 @@ code with the API export views, so a formula/format fix usually needs to happen 
 **Full design:** `docs/superpowers/specs/2026-08-07-saas-single-db-migration-design.md`
 **Completed work log:** `HISTORY.md` — read it at session start.
 
-**Status:** Phases 1–2 complete. Phase 2.5 in progress.
+**Status:** Phases 1–3 complete, except Phase 2.5b-2 (blocked on Paddle approval). Phase 4 is next.
 
 Phases are a dependency chain. 3–5 all touch models that Phase 2 restructures, so running them out of
 order means writing migrations twice. Finish each phase (including its tests) before starting the next.
@@ -284,11 +284,17 @@ What the obvious implementation gets wrong:
 - **v1 honours 100%-off keys only** — a partial discount needs a second gateway integration. The
   `percent_off` column exists so it is additive later.
 
-### Phase 3 — Expenses
-`Expense` model + account-scoped CRUD. `net_profit = order profit − expenses`, with the *same* date
-window applied to both sides — extract the window logic into one helper rather than duplicating it.
-`created_at` uses `default=timezone.now`, not `auto_now_add`, so a receipt entered Friday for a Tuesday
-purchase lands in the right month.
+### Phase 3 — Expenses — **done**
+**Design:** `docs/superpowers/specs/2026-08-08-expense-tracking-design.md` ·
+**Plan:** `docs/superpowers/plans/2026-08-08-phase-3-expense-tracking.md` · see `HISTORY.md`
+
+`Expense` model + account-scoped CRUD at `/inventory/expenses/`, an Expenses page in the SPA, and a
+financial reporting model with one honest definition of profit: `total_revenue`, `total_cogs`,
+`gross_profit`, `total_expenses`, `net_profit`, with `inventory_outlays` (formerly `total_costs`) kept
+outside the P&L as cash flow. COGS is snapshotted onto `OrderItem.unit_cost_price` at sale time, and
+the date window is one shared `inventory/reporting.py::DateWindow` applied to every reporting
+queryset. `spent_at` uses `default=timezone.now`, not `auto_now_add`, so a receipt entered Friday for
+a Tuesday purchase lands in the right month.
 
 ### Phase 4 — Barcodes
 Optional indexed `Product.barcode`; add it to `ProductViewSet.search_fields` so `?search=` covers it.
@@ -362,5 +368,18 @@ Append here when something bites. Do not repeat these.
 - **Discount key codes are stored normalized** — uppercase, no dashes. Querying `DiscountKey` by the
   dash-separated form the user was shown never matches; run it through
   `accounts.billing.keys.normalize_key` first.
+- **`OrderItem.unit_cost_price` is the only correct source of COGS.** `product.cost_price` is a
+  *current* figure that gets corrected; reading it for any historical calculation restates the past.
+  The snapshot is what `OrderItem.profit`, `LINE_COGS`/`items_cogs`, `AnalyticsView` and
+  `ExportOrdersCSVView` all read.
+- **`bulk_create` bypasses `OrderItem.save()`**, so any new bulk creation path must stamp
+  `unit_cost_price` itself. `save()` only covers the row-at-a-time callers (admin inline, `seed_data`);
+  `CreateOrderSerializer` stamps it explicitly from the products it has already locked.
+- **`AnalyticsView` returns money as raw numbers, not `"$..."` strings**, and the summary key for
+  purchases is `inventory_outlays` — but `series` rows still use `total_costs`. That difference is
+  deliberate, not a bug: the tile sits next to `total_cogs` and the series does not.
+- **Every reporting queryset must be filtered through `inventory/reporting.py::DateWindow`.** A window
+  applied to one side of a profit calculation and not the other misstates it silently — no exception,
+  no error, just a wrong number.
 - **`react-router-dom` has 2 open high-severity advisories** (`npm audit`). `npm audit fix --force`
   downgrades to 7.11.0, a breaking change — left alone deliberately; raise it as its own decision.

@@ -80,6 +80,7 @@ export function fillSeriesGaps(series, { start, end, stepDays }) {
       period: key,
       total_revenue: row?.total_revenue ?? 0,
       total_costs: row?.total_costs ?? 0,
+      total_expenses: row?.total_expenses ?? 0,
     })
     cursor.setUTCDate(cursor.getUTCDate() + stepDays)
   }

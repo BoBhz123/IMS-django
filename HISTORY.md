@@ -8,6 +8,70 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-09 — Phase 3: expense tracking and financial reporting
+
+`Expense` CRUD is the small half of this phase. The large half is fixing what "profit" meant, because
+the app shipped two definitions of it that disagreed under completely normal operation.
+
+**Two contradicting definitions, and which one won.** `AnalyticsView` computed `revenue − purchases in
+window` — cash out against cash in. `ExportOrdersCSVView` and `Order.total_profit` computed
+`revenue − cost of the items sold` — margin. Buy $5,000 of stock in January and sell it over six
+months: the dashboard reported a January loss followed by five inflated months while the CSV reported
+steady margin, and both columns were labelled "profit". Margin won for the P&L; the cash figure
+survives as `inventory_outlays`, deliberately outside it. Adding expenses on top of either definition
+would have compounded the problem, so this was settled first.
+
+**`OrderItem.unit_cost_price` is snapshotted, not derived.** `OrderItem.profit` used to read
+`self.product.cost_price` live, so correcting a product's cost silently rewrote every past month —
+last year's numbers were not reproducible. The cost is now stamped at the instant of sale, inside the
+same `@transaction.atomic` block that already locks stock, and profit reads the snapshot.
+
+**The backfill is an approximation, and knowingly so.** Existing lines were stamped with their
+product's cost *as it stood at migration time*. The true cost at each historical sale was never
+recorded anywhere and cannot be recovered; this was the last moment the number was knowable at all.
+Historical gross profit shifted once and is stable forever after. Everything sold after this ships is
+exact. The alternative — leaving profit recomputed from live costs — means no month is ever
+reproducible, which is worse.
+
+**`bulk_create` bypasses `save()`.** That is why `CreateOrderSerializer` stamps the cost itself,
+reading off the rows it has already locked rather than re-querying, while `OrderItem.save()` covers
+the paths that build rows one at a time — the admin inline and `seed_data`. Either half alone leaves a
+route that records a zero cost and therefore a 100% margin. `save()` coerces through the field with
+`to_python`, because an unsaved `Product` may still hold the string a fixture or form assigned it, and
+`.profit` does arithmetic on that value.
+
+**`DateWindow` was extracted before expenses existed, not after.** `AnalyticsView` applied five date
+filters inline across three querysets; expenses would have been a fourth. A window applied to orders
+but not to expenses misstates net profit and raises nothing — there is no error to notice. Extracting
+it as a pure refactor first, with every pre-existing analytics test passing untouched, is what proves
+the diff that added expenses could not have hidden a filtering regression.
+
+**`spent_at`, not `created_at`.** A receipt entered on Friday for a Tuesday spend has to land in
+Tuesday's month or that month's net profit is wrong. `default=timezone.now` is what makes that
+possible; `auto_now_add` ignores assignment entirely and would have made backdating impossible. A
+separate `created_at` keeps the audit trail of when the row was entered, which a money record
+warrants. Categories are a fixed choice list because free text fragments `Rent`, `rent` and `Rent `
+into separate rows in the per-category breakdown that is the main reason to record a category at all.
+
+**`inventory_outlays` is deliberately outside the P&L**, and deliberately renamed. Stock bought this
+month is not a cost of what was sold this month; folding it in makes margin swing with restocking
+timing. Left as `total_costs` it would have sat immediately beside a new `total_cogs` — a permanent
+invitation to read the wrong number. The chart `series` still uses `total_costs` for its purchases
+line, where nothing resembling COGS is nearby.
+
+**Analytics money is raw numbers now.** The view pre-formatted `"$1,234.00"` and the dashboard
+immediately parsed it back into a number so the LBP toggle could reformat it — format, parse,
+reformat. The new tiles needed the same round trip, so it was removed rather than extended. Two
+pre-existing tests asserted the old string contract and were updated; that is the intended change.
+
+**`net_profit` changed meaning** from `revenue − purchases` to `gross_profit − expenses`. The number
+on the dashboard moved, on purpose. The Gross profit and Net profit tiles carry no sparkline: the
+series has revenue, purchases and expenses per period but not COGS, so there is no honest per-period
+profit to draw, and a revenue−purchases line would be the old conflation back again in a shape that
+looks authoritative.
+
+---
+
 ## 2026-08-08 — Phase 2.5b-1: billing foundation and discount keys
 
 Everything in Phase 2.5b that does not need a live Paddle account: one activation function, a
