@@ -1,5 +1,6 @@
 from django.contrib import admin,messages
 from . import models
+from .csv_format import iso as _iso, money as _money
 from django.db.models.aggregates import Count
 from django.db.models import Sum, F
 from django.http import HttpResponse
@@ -116,12 +117,12 @@ def export_orders_to_csv(modeladmin, request, queryset):
         writer.writerow([
             order.id,
             order.customer.name if order.customer else "No Customer",
-            order.placed_at.strftime("%Y-%m-%d %H:%M"),
+            _iso(order.placed_at),
             order.exchange_rate,
-            f"${calculated_total:.2f}" # Added the formatted total
+            _money(calculated_total),
         ])
 
-    writer.writerow(['TOTALS', '', '', '', f"${grand_total:.2f}"])
+    writer.writerow(['TOTALS', '', '', '', _money(grand_total)])
 
     return response
     
@@ -145,11 +146,11 @@ def export_purchases_to_csv(modeladmin, request, queryset):
         writer.writerow([
             purchase.id,
             purchase.supplier.name if purchase.supplier else "No Supplier",
-            purchase.placed_at.strftime("%Y-%m-%d %H:%M"),
-            f"${calculated_total:.2f}"
+            _iso(purchase.placed_at),
+            _money(calculated_total),
         ])
 
-    writer.writerow(['TOTALS', '', '', f"${grand_total:.2f}"])
+    writer.writerow(['TOTALS', '', '', _money(grand_total)])
 
     # Was missing: without this the action returns None, so the admin just redirects back to
     # the changelist and no file is ever downloaded. export_orders_to_csv above returns its

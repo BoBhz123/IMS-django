@@ -310,9 +310,12 @@ is a decision that breaks a test rather than a silent change.
 All four transaction exports end in a TOTALS row — both API views and both admin actions. The
 products catalogue export is deliberately excluded. See `HISTORY.md`.
 
-`ExportOrdersCSVView` gained a `Line Profit (USD)` column, which is what the profit total sums; the
-existing `Total Profit (USD)` still repeats the whole order's profit on every line and was left alone
-so saved formulas keep working. Its cell in the TOTALS row is intentionally blank.
+`ExportOrdersCSVView` gained a `Line Profit (USD)` column, which is what the profit total sums.
+
+**Superseded by the export redesign (same day):** the repeating `Total Profit (USD)` column was
+initially kept for saved formulas, then removed outright at the owner's direction — BI tools summing
+it was judged the larger risk. That redesign also made all money numeric, added `Barcode` and
+`Total Units`, and moved dates to ISO 8601. See `HISTORY.md`.
 
 ---
 
@@ -388,11 +391,19 @@ Append here when something bites. Do not repeat these.
 - **Every reporting queryset must be filtered through `inventory/reporting.py::DateWindow`.** A window
   applied to one side of a profit calculation and not the other misstates it silently — no exception,
   no error, just a wrong number.
-- **Never sum the orders CSV's `Total Profit (USD)` column** — it repeats each order's whole profit on
-  every one of its lines, so the sum is inflated by the line count (3.1x on the demo data).
-  `Line Profit (USD)` is the per-line figure and the one the TOTALS row sums.
+- **CSV money is written bare — no `$`, no thousands separators — via `inventory/csv_format.py`.**
+  A `$` makes a spreadsheet treat the column as text and refuse to sum it; a thousands comma inside
+  an unquoted cell splits it in two and shifts every column after it. Both exporters and both admin
+  actions import `money()`/`iso()` from there, so formatting cannot drift between the four.
+- **The orders CSV has no per-order profit column.** It used to, and it repeated each order's whole
+  profit on every one of its lines, so any tool summing it inflated profit by the line count (3.1x on
+  the demo data). `Line Profit (USD)` is per-line and is what the TOTALS row sums. Don't reintroduce
+  an order-level column into a line-level export.
 - **CSV totals are accumulated in the row loop, never a second aggregate query.** `ExportOrdersCSVView`
   has a test pinning its query count constant as rows grow; a totals aggregate would break it.
+- **`Quantity` is deliberately not totalled in the CSV footer** — summing it across lines with
+  different `unit_multiplier`s is meaningless. `Total Units` (`quantity * unit_multiplier`) is the
+  column that carries a real physical count, and it is the one totalled.
 - **`Product.barcode` is normalized in `Product.save()`** — `''` becomes `NULL` and surrounding
   whitespace is stripped. Query by the stripped value; do not assume `''` is ever stored.
 - **`react-router-dom` has 2 open high-severity advisories** (`npm audit`). `npm audit fix --force`

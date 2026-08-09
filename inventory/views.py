@@ -13,6 +13,7 @@ from rest_framework.views import APIView
 from .filters import ProductFilter,PurchaseFilter,OrderFilter,ExpenseFilter
 from .pagination import DefaultPagination
 from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order,Expense,LINE_TOTAL,LINE_COGS
+from .csv_format import iso as _iso, money as _money
 from .reporting import DateWindow
 from .serializers import *
 import csv
@@ -308,17 +309,19 @@ class ExportOrdersCSVView(APIView):
             'Customer Name', 
             'Date Placed', 
             'Exchange Rate (LBP)', 
-            'Product Name', 
-            'Quantity', 
-            'Unit Multiplier', 
-            'Sell Price (USD)', 
+            'Product Name',
+            'Barcode',
+            'Quantity',
+            'Unit Multiplier',
+            # The physical count, quantity * unit_multiplier. Quantity alone is meaningless
+            # to sum across lines that use different multipliers.
+            'Total Units',
+            'Sell Price (USD)',
             'Cost Price (USD)',
             'Line Total (USD)',
-            # Repeats the whole order's profit on every line of that order. Kept as-is
-            # because saved spreadsheets and formulas point at it, but it is why summing
-            # this column multiplies each order's profit by its line count.
-            'Total Profit (USD)',
-            # This line's own profit — the column that actually adds up to the TOTALS row.
+            # This line's own profit. There is deliberately no per-order profit column: it
+            # repeated the whole order's profit on every one of its lines, so any tool that
+            # summed the column multiplied each order's profit by its line count.
             'Line Profit (USD)',
         ])
 
@@ -342,58 +345,46 @@ class ExportOrdersCSVView(APIView):
         if order_id:
             items = items.filter(order__id=order_id)
 
-        # `item.order.total_profit` is a Python property that walks order.items.all(). Since
-        # select_related builds a distinct Order instance per row, nothing was cached: every
-        # single CSV line fired its own query for that order's items — a textbook N+1 that
-        # made a 2,000-line export 2,000 queries. One grouped aggregate replaces all of them.
-        profit_by_order = {
-            row['order_id']: row['profit'] or 0
-            for row in items.values('order_id').annotate(
-                profit=Sum(
-                    (F('unit_price') - F('unit_cost_price'))
-                    * F('quantity')
-                    * F('unit_multiplier')
-                )
-            )
-        }
-
         # Accumulated in the loop that already walks the items rather than re-queried, so the
         # totals row costs no extra queries — this export's constant-query-count guarantee
         # predates it and has a test.
+        total_units = 0
         total_line_value = 0
         total_line_profit = 0
 
         for item in items:
-            line_total = item.quantity * item.unit_multiplier * item.unit_price
+            units = item.quantity * item.unit_multiplier
+            line_total = units * item.unit_price
             # The snapshot on the line, not product.cost_price: a re-export of last year
             # must reproduce last year's figures even after a cost correction.
             cost_price = item.unit_cost_price
-            line_profit = (item.unit_price - cost_price) * item.quantity * item.unit_multiplier
+            line_profit = (item.unit_price - cost_price) * units
 
+            total_units += units
             total_line_value += line_total
             total_line_profit += line_profit
 
             writer.writerow([
                 item.order.id,
                 item.order.customer.name if item.order.customer else "No Customer",
-                item.order.placed_at.strftime("%Y-%m-%d %H:%M"),
+                _iso(item.order.placed_at),
                 item.order.exchange_rate,
                 item.product.name if item.product else "Unknown Product",
+                item.product.barcode or '' if item.product else '',
                 item.quantity,
                 item.unit_multiplier,
-                f"${item.unit_price:.2f}",
-                f"${cost_price:.2f}",
-                f"${line_total:.2f}",
-                f"${profit_by_order.get(item.order_id, 0):.2f}",
-                f"${line_profit:.2f}",
+                units,
+                _money(item.unit_price),
+                _money(cost_price),
+                _money(line_total),
+                _money(line_profit),
             ])
 
-        # Deliberately blank under 'Total Profit': that column repeats an order's profit per
-        # line, so no single figure belongs at the foot of it. The total lives under
-        # 'Line Profit', which is the column it is the sum of.
+        # Quantity is deliberately not totalled: summing it across lines with different
+        # unit_multipliers produces a number that means nothing. Total Units is that column.
         writer.writerow([
             'TOTALS', '', '', '', '', '', '', '',
-            '', f"${total_line_value:.2f}", '', f"${total_line_profit:.2f}",
+            total_units, '', '', _money(total_line_value), _money(total_line_profit),
         ])
 
         return response
@@ -410,11 +401,13 @@ class ExportPurchasesCSVView(APIView):
             'Supplier Name', 
             'Date Placed', 
             'Exchange Rate (LBP)', 
-            'Product Name', 
-            'Quantity', 
-            'Unit Multiplier', 
-            'Unit Cost Price (USD)', 
-            'Line Total (USD)'
+            'Product Name',
+            'Barcode',
+            'Quantity',
+            'Unit Multiplier',
+            'Total Units',
+            'Unit Cost Price (USD)',
+            'Line Total (USD)',
         ])
 
         # Query PurchaseItems directly for the row-by-row breakdown
@@ -439,26 +432,32 @@ class ExportPurchasesCSVView(APIView):
             items = items.filter(purchase_order__id=purchase_id)
 
         # See ExportOrdersCSVView: accumulated in the existing loop, not a second query.
+        total_units = 0
         total_line_value = 0
 
         for item in items:
-            line_total = item.quantity * item.unit_multiplier * item.unit_price
+            units = item.quantity * item.unit_multiplier
+            line_total = units * item.unit_price
+            total_units += units
             total_line_value += line_total
 
             writer.writerow([
                 item.purchase_order.id,
                 item.purchase_order.supplier.name if item.purchase_order.supplier else "No Supplier",
-                item.purchase_order.placed_at.strftime("%Y-%m-%d %H:%M"),
+                _iso(item.purchase_order.placed_at),
                 item.purchase_order.exchange_rate,
                 item.product.name if item.product else "Unknown Product",
+                item.product.barcode or '' if item.product else '',
                 item.quantity,
                 item.unit_multiplier,
-                f"${item.unit_price:.2f}",
-                f"${line_total:.2f}"
+                units,
+                _money(item.unit_price),
+                _money(line_total),
             ])
 
         writer.writerow([
-            'TOTALS', '', '', '', '', '', '', '', f"${total_line_value:.2f}",
+            'TOTALS', '', '', '', '', '', '', '',
+            total_units, '', _money(total_line_value),
         ])
 
         return response

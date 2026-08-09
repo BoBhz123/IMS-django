@@ -8,6 +8,41 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-09 — CSV export redesign: machine-readable output
+
+A follow-up to Phase 5, redesigning what the four exports actually emit so downstream spreadsheets
+and BI tools can consume them without cleanup.
+
+**Money is written bare — no `$`, no thousands separators.** A leading `$` makes a spreadsheet treat
+the whole column as text and silently refuse to sum it, which defeats the point of an export. The
+separator is the worse half: a comma inside an unquoted numeric cell splits it in two and shifts every
+column after it, so a single order over $1,000 would have corrupted the row shape. `csv_format.py`
+holds `money()` and `iso()`, imported by both API views and both admin actions — the four exporters
+already differ on columns, and formatting was the one thing they must not also differ on.
+
+**The repeating `Total Profit (USD)` column is gone.** Phase 5 kept it and added `Line Profit (USD)`
+alongside, on the reasoning that saved formulas pointed at it. That was reversed at the owner's
+direction: a BI tool summing a column that repeats each order's profit on every line inflates profit
+by the line count — 3.1x on the demo data — and silently producing a wrong number was judged worse
+than breaking a formula that would be noticed. A line-level export now carries only line-level figures.
+
+**`Total Units` = `quantity * unit_multiplier`.** The physical count. `Quantity` alone cannot be
+summed across lines that use different multipliers, so it is deliberately left out of the totals row
+while `Total Units` is totalled.
+
+**`Barcode` sits immediately after `Product Name`**, blank where a product has none — the field is
+optional, so a stock list exported for reconciliation has to survive that.
+
+**Dates are ISO 8601 to the second** (`YYYY-MM-DDTHH:MM:SS`) rather than `%Y-%m-%d %H:%M`. The format
+changed, not the timezone: both render the stored UTC value.
+
+Two pre-existing tests asserted the old shape — one reading a `$`-prefixed total, one addressing the
+now-removed profit column — and were updated. A test now asserts every money cell matches
+`^-?\d+\.\d{2}$`, that no row contains a `$` or `,`, and that every row is exactly as wide as the
+header, which is the cheap guard against a hand-built footer drifting out of step with the columns.
+
+---
+
 ## 2026-08-09 — Phase 5: CSV export totals rows
 
 All four transaction exports now end in a `TOTALS` row: `ExportOrdersCSVView` and
