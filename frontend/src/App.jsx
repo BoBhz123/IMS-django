@@ -8,6 +8,7 @@ import { VerifyEmail } from '@/pages/VerifyEmail'
 import { Subscription } from '@/pages/Subscription'
 import { Dashboard } from '@/pages/Dashboard'
 import { Products } from '@/pages/Products'
+import { Categories } from '@/pages/Categories'
 import { Orders } from '@/pages/Orders'
 import { Purchases } from '@/pages/Purchases'
 import { Customers } from '@/pages/Customers'
@@ -28,6 +29,7 @@ function App() {
           <Route element={<AppShell />}>
             <Route path="/" element={<Dashboard />} />
             <Route path="/products" element={<Products />} />
+            <Route path="/categories" element={<Categories />} />
             <Route path="/orders" element={<Orders />} />
             <Route path="/purchases" element={<Purchases />} />
             <Route path="/customers" element={<Customers />} />

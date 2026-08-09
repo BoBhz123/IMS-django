@@ -10,6 +10,7 @@ import {
   Receipt,
   ShoppingCart,
   Sun,
+  Tags,
   Truck,
   Users,
 } from 'lucide-react'
@@ -20,6 +21,7 @@ import { useCurrency } from '@/context/CurrencyContext'
 export const NAV_ITEMS = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
   { to: '/products', label: 'Products', icon: Package },
+  { to: '/categories', label: 'Categories', icon: Tags },
   { to: '/orders', label: 'Orders', icon: ShoppingCart },
   { to: '/purchases', label: 'Purchases', icon: Truck },
   { to: '/expenses', label: 'Expenses', icon: Receipt },
