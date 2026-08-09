@@ -164,8 +164,9 @@ code with the API export views, so a formula/format fix usually needs to happen 
 **Full design:** `docs/superpowers/specs/2026-08-07-saas-single-db-migration-design.md`
 **Completed work log:** `HISTORY.md` — read it at session start.
 
-**Status:** Phases 1–4 complete, except Phase 2.5b-2 (blocked on Paddle approval). Phase 5 is next
-and is the last planned phase in this milestone.
+**Status:** Phases 1–5 complete. The milestone is done except **Phase 2.5b-2**, which is blocked on
+Paddle merchant approval — see the PAUSE STATUS below. There is no next planned phase; the backlog
+beyond this is camera barcode scanning (deferred from Phase 4) and whatever Paddle unblocks.
 
 Phases are a dependency chain. 3–5 all touch models that Phase 2 restructures, so running them out of
 order means writing migrations twice. Finish each phase (including its tests) before starting the next.
@@ -305,12 +306,13 @@ Deliberately **indexed, not unique** — a shop reuses one code across loose goo
 `ProductBarcodeTests.test_two_products_may_share_a_barcode` pins that, so adding the constraint later
 is a decision that breaks a test rather than a silent change.
 
-### Phase 5 — CSV export totals row
-Append a TOTALS row to `ExportOrdersCSVView` (the API view the frontend calls — *not* the similarly
-named `export_orders_to_csv` admin action, which has no cost/profit columns; that one gets a matching
-row for its single Total Value column). The existing "Total Profit" column repeats the whole order's
-profit on every line of that order, so summing that column multiplies each order's profit by its line
-count. Sum per-line profit instead.
+### Phase 5 — CSV export totals row — **done**
+All four transaction exports end in a TOTALS row — both API views and both admin actions. The
+products catalogue export is deliberately excluded. See `HISTORY.md`.
+
+`ExportOrdersCSVView` gained a `Line Profit (USD)` column, which is what the profit total sums; the
+existing `Total Profit (USD)` still repeats the whole order's profit on every line and was left alone
+so saved formulas keep working. Its cell in the TOTALS row is intentionally blank.
 
 ---
 
@@ -386,6 +388,11 @@ Append here when something bites. Do not repeat these.
 - **Every reporting queryset must be filtered through `inventory/reporting.py::DateWindow`.** A window
   applied to one side of a profit calculation and not the other misstates it silently — no exception,
   no error, just a wrong number.
+- **Never sum the orders CSV's `Total Profit (USD)` column** — it repeats each order's whole profit on
+  every one of its lines, so the sum is inflated by the line count (3.1x on the demo data).
+  `Line Profit (USD)` is the per-line figure and the one the TOTALS row sums.
+- **CSV totals are accumulated in the row loop, never a second aggregate query.** `ExportOrdersCSVView`
+  has a test pinning its query count constant as rows grow; a totals aggregate would break it.
 - **`Product.barcode` is normalized in `Product.save()`** — `''` becomes `NULL` and surrounding
   whitespace is stripped. Query by the stripped value; do not assume `''` is ever stored.
 - **`react-router-dom` has 2 open high-severity advisories** (`npm audit`). `npm audit fix --force`

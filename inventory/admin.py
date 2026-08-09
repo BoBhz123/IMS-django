@@ -105,17 +105,25 @@ def export_orders_to_csv(modeladmin, request, queryset):
         total_value=Sum(models.LINE_TOTAL)
     )
 
+    # This action has no cost or profit column, so its totals row is a plain sum of the one
+    # value column — unlike ExportOrdersCSVView, whose repeated per-order profit column is
+    # the reason that export needed a per-line column to total. Accumulated in the loop.
+    grand_total = 0
+
     for order in annotated_queryset:
         calculated_total = order.total_value if order.total_value is not None else 0
+        grand_total += calculated_total
         writer.writerow([
-            order.id, 
-            order.customer.name if order.customer else "No Customer", 
-            order.placed_at.strftime("%Y-%m-%d %H:%M"), 
+            order.id,
+            order.customer.name if order.customer else "No Customer",
+            order.placed_at.strftime("%Y-%m-%d %H:%M"),
             order.exchange_rate,
             f"${calculated_total:.2f}" # Added the formatted total
         ])
 
-    return response    
+    writer.writerow(['TOTALS', '', '', '', f"${grand_total:.2f}"])
+
+    return response
     
 @admin.action(description='Export selected purchases to CSV')
 def export_purchases_to_csv(modeladmin, request, queryset):
@@ -129,14 +137,19 @@ def export_purchases_to_csv(modeladmin, request, queryset):
         total_cost=Sum(models.LINE_TOTAL)
     )
 
+    grand_total = 0
+
     for purchase in annotated_queryset:
         calculated_total = purchase.total_cost if purchase.total_cost is not None else 0
+        grand_total += calculated_total
         writer.writerow([
             purchase.id,
             purchase.supplier.name if purchase.supplier else "No Supplier",
             purchase.placed_at.strftime("%Y-%m-%d %H:%M"),
             f"${calculated_total:.2f}"
         ])
+
+    writer.writerow(['TOTALS', '', '', f"${grand_total:.2f}"])
 
     # Was missing: without this the action returns None, so the admin just redirects back to
     # the changelist and no file is ever downloaded. export_orders_to_csv above returns its

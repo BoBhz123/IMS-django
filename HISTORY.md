@@ -8,6 +8,39 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-09 — Phase 5: CSV export totals rows
+
+All four transaction exports now end in a `TOTALS` row: `ExportOrdersCSVView` and
+`ExportPurchasesCSVView` (the API views the SPA calls) and the two separate admin actions with
+near-identical names. The products catalogue export is deliberately untouched — it is a stock list,
+not a transaction ledger, and a total of its price columns would mean nothing.
+
+**The orders export could not simply total its existing profit column.** `Total Profit (USD)` repeats
+the *whole order's* profit on every line of that order, so summing it multiplies each order's profit
+by its line count. On the seeded demo account that is $8,032,964 against a true $2,609,170 — inflated
+3.1x, and plausible enough that nobody would question it.
+
+A new `Line Profit (USD)` column carries each line's own profit, and the totals row is the sum of
+that. `Total Profit` was left exactly as it was: it is an existing column and saved spreadsheets and
+formulas point at it. The alternative — redefining it in place — would have silently changed the
+meaning of a column people already use. The cell beneath `Total Profit` in the totals row is
+deliberately blank, because no single figure honestly belongs at the foot of a column of repeated
+values.
+
+**Totals are accumulated in the loop that already walks the rows**, never a second query. The orders
+export has a standing test that its query count is constant regardless of row count — a fix for an
+earlier N+1 — and a totals row computed with its own aggregate would have quietly reintroduced a
+per-export query. A new test asserts the count is unchanged as rows grow.
+
+The totals row also applies the *same* filters as the rows above it. A total computed over an
+unfiltered queryset would disagree with the rows printed beneath it, which is worse than no total.
+
+One pre-existing test read `row.split(',')[-1]` — "whichever column happens to be last" — and broke
+when `Line Profit` was appended. It now addresses columns by header name and excludes the footer,
+which is what it meant all along.
+
+---
+
 ## 2026-08-09 — Phase 4: product barcodes
 
 Optional `Product.barcode`, added to `ProductViewSet.search_fields` so a scanned code finds its product

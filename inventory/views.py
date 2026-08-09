@@ -314,7 +314,12 @@ class ExportOrdersCSVView(APIView):
             'Sell Price (USD)', 
             'Cost Price (USD)',
             'Line Total (USD)',
-            'Total Profit (USD)'
+            # Repeats the whole order's profit on every line of that order. Kept as-is
+            # because saved spreadsheets and formulas point at it, but it is why summing
+            # this column multiplies each order's profit by its line count.
+            'Total Profit (USD)',
+            # This line's own profit — the column that actually adds up to the TOTALS row.
+            'Line Profit (USD)',
         ])
 
         account = get_account(request.user)
@@ -352,11 +357,21 @@ class ExportOrdersCSVView(APIView):
             )
         }
 
+        # Accumulated in the loop that already walks the items rather than re-queried, so the
+        # totals row costs no extra queries — this export's constant-query-count guarantee
+        # predates it and has a test.
+        total_line_value = 0
+        total_line_profit = 0
+
         for item in items:
             line_total = item.quantity * item.unit_multiplier * item.unit_price
             # The snapshot on the line, not product.cost_price: a re-export of last year
             # must reproduce last year's figures even after a cost correction.
             cost_price = item.unit_cost_price
+            line_profit = (item.unit_price - cost_price) * item.quantity * item.unit_multiplier
+
+            total_line_value += line_total
+            total_line_profit += line_profit
 
             writer.writerow([
                 item.order.id,
@@ -369,8 +384,17 @@ class ExportOrdersCSVView(APIView):
                 f"${item.unit_price:.2f}",
                 f"${cost_price:.2f}",
                 f"${line_total:.2f}",
-                f"${profit_by_order.get(item.order_id, 0):.2f}"
+                f"${profit_by_order.get(item.order_id, 0):.2f}",
+                f"${line_profit:.2f}",
             ])
+
+        # Deliberately blank under 'Total Profit': that column repeats an order's profit per
+        # line, so no single figure belongs at the foot of it. The total lives under
+        # 'Line Profit', which is the column it is the sum of.
+        writer.writerow([
+            'TOTALS', '', '', '', '', '', '', '',
+            '', f"${total_line_value:.2f}", '', f"${total_line_profit:.2f}",
+        ])
 
         return response
     
@@ -414,13 +438,17 @@ class ExportPurchasesCSVView(APIView):
         if purchase_id:
             items = items.filter(purchase_order__id=purchase_id)
 
+        # See ExportOrdersCSVView: accumulated in the existing loop, not a second query.
+        total_line_value = 0
+
         for item in items:
             line_total = item.quantity * item.unit_multiplier * item.unit_price
-            
+            total_line_value += line_total
+
             writer.writerow([
-                item.purchase_order.id, 
-                item.purchase_order.supplier.name if item.purchase_order.supplier else "No Supplier", 
-                item.purchase_order.placed_at.strftime("%Y-%m-%d %H:%M"), 
+                item.purchase_order.id,
+                item.purchase_order.supplier.name if item.purchase_order.supplier else "No Supplier",
+                item.purchase_order.placed_at.strftime("%Y-%m-%d %H:%M"),
                 item.purchase_order.exchange_rate,
                 item.product.name if item.product else "Unknown Product",
                 item.quantity,
@@ -428,7 +456,11 @@ class ExportPurchasesCSVView(APIView):
                 f"${item.unit_price:.2f}",
                 f"${line_total:.2f}"
             ])
-            
+
+        writer.writerow([
+            'TOTALS', '', '', '', '', '', '', '', f"${total_line_value:.2f}",
+        ])
+
         return response
 
 class ExpenseViewSet(AccountScopedMixin, ModelViewSet):

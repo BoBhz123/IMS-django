@@ -1,3 +1,5 @@
+import csv
+import io
 import tempfile
 from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
@@ -358,11 +360,19 @@ class OrdersCSVExportQueryCountTests(AccountFixtureMixin, APITestCase):
         self.assertEqual(len(small.captured_queries), len(large.captured_queries))
 
     def test_exported_profit_matches_the_model_property(self):
+        # Columns are addressed by name and the trailing TOTALS row is excluded: this used to
+        # read row.split(',')[-1], which silently meant "whichever column happens to be last"
+        # and broke when Line Profit was appended. These orders have a single line each, so
+        # the per-order and per-line profit columns agree — both are checked.
         self.make_orders(3)
-        rows = self.export().content.decode().strip().splitlines()[1:]
+        rows = list(csv.reader(io.StringIO(self.export().content.decode())))
+        header, body = rows[0], [row for row in rows[1:] if row and row[0] != 'TOTALS']
+
         expected = f"${Order.objects.first().total_profit:.2f}"
-        for row in rows:
-            self.assertEqual(row.split(",")[-1], expected)
+        self.assertEqual(len(body), 3)
+        for row in body:
+            self.assertEqual(row[header.index('Total Profit (USD)')], expected)
+            self.assertEqual(row[header.index('Line Profit (USD)')], expected)
 
 
 class AnalyticsPayloadTests(AccountFixtureMixin, APITestCase):
@@ -1316,3 +1326,194 @@ class ProductBarcodeTests(AccountFixtureMixin, TestCase):
         self.make_product(barcode='5901234123457')
         self.make_product(name='Loose goods', barcode='5901234123457')
         self.assertEqual(Product.objects.filter(barcode='5901234123457').count(), 2)
+
+
+class CSVExportTotalsTests(AccountFixtureMixin, TestCase):
+    """
+    Every export ends in a TOTALS row.
+
+    The trap this phase exists for: 'Total Profit (USD)' repeats the whole order's profit on
+    every line of that order, so summing that column multiplies each order's profit by its
+    line count. The totals are built from a per-line figure instead, and the new
+    'Line Profit (USD)' column is what a reader can actually add up to reach them.
+    """
+
+    def setUp(self):
+        self.account, self.user, self.client, self.header = self.make_account_user('csv')
+        self.category = Category.objects.create(name='Widgets', account=self.account)
+        self.supplier = Supplier.objects.create(name='Acme', account=self.account)
+        self.widget = Product.objects.create(
+            name='Widget', description='', cost_price='4.00', default_sell_price='10.00',
+            category=self.category, stock_quantity=500, account=self.account,
+        )
+        self.gadget = Product.objects.create(
+            name='Gadget', description='', cost_price='2.00', default_sell_price='5.00',
+            category=self.category, stock_quantity=500, account=self.account,
+        )
+
+    def rows(self, url):
+        response = self.client.get(url, HTTP_AUTHORIZATION=self.header)
+        self.assertEqual(response.status_code, 200)
+        return list(csv.reader(io.StringIO(response.content.decode())))
+
+    def make_multi_line_order(self):
+        """One order, two lines — the shape that exposes the repeated-profit bug."""
+        order = Order.objects.create(account=self.account, exchange_rate=89000)
+        OrderItem.objects.create(
+            order=order, product=self.widget, quantity=2, unit_multiplier=3,
+            unit_price=Decimal('10.00'), unit_cost_price=Decimal('4.00'),
+        )  # line total 60.00, line profit 36.00
+        OrderItem.objects.create(
+            order=order, product=self.gadget, quantity=4, unit_multiplier=2,
+            unit_price=Decimal('5.00'), unit_cost_price=Decimal('2.00'),
+        )  # line total 40.00, line profit 24.00
+        return order
+
+    def test_the_orders_export_ends_in_a_totals_row(self):
+        self.make_multi_line_order()
+        rows = self.rows('/inventory/orders/export/csv/')
+        self.assertEqual(rows[-1][0], 'TOTALS')
+
+    def test_the_orders_totals_do_not_multiply_profit_by_line_count(self):
+        # Order profit is 60.00. The 'Total Profit' column shows 60.00 on BOTH lines, so a
+        # naive sum of that column gives 120.00 — this asserts the total is not that.
+        self.make_multi_line_order()
+        rows = self.rows('/inventory/orders/export/csv/')
+        header, totals = rows[0], rows[-1]
+
+        line_total_col = header.index('Line Total (USD)')
+        line_profit_col = header.index('Line Profit (USD)')
+        self.assertEqual(totals[line_total_col], '$100.00')
+        self.assertEqual(totals[line_profit_col], '$60.00')
+
+    def test_the_line_profit_column_sums_to_the_totals_row(self):
+        # The whole point of the added column: a reader can select it and reach the total.
+        self.make_multi_line_order()
+        rows = self.rows('/inventory/orders/export/csv/')
+        header, body, totals = rows[0], rows[1:-1], rows[-1]
+        column = header.index('Line Profit (USD)')
+
+        summed = sum(Decimal(row[column].lstrip('$')) for row in body)
+        self.assertEqual(f'${summed:.2f}', totals[column])
+
+    def test_the_repeated_order_profit_column_is_left_alone(self):
+        # Kept deliberately for anyone with a saved formula against it; it still repeats the
+        # order's whole profit on every line.
+        self.make_multi_line_order()
+        rows = self.rows('/inventory/orders/export/csv/')
+        header, body = rows[0], rows[1:-1]
+        column = header.index('Total Profit (USD)')
+        self.assertEqual([row[column] for row in body], ['$60.00', '$60.00'])
+
+    def test_totals_span_more_than_one_order(self):
+        self.make_multi_line_order()
+        second = Order.objects.create(account=self.account, exchange_rate=89000)
+        OrderItem.objects.create(
+            order=second, product=self.widget, quantity=1, unit_multiplier=1,
+            unit_price=Decimal('10.00'), unit_cost_price=Decimal('4.00'),
+        )  # line total 10.00, line profit 6.00
+
+        rows = self.rows('/inventory/orders/export/csv/')
+        header, totals = rows[0], rows[-1]
+        self.assertEqual(totals[header.index('Line Total (USD)')], '$110.00')
+        self.assertEqual(totals[header.index('Line Profit (USD)')], '$66.00')
+
+    def test_an_empty_orders_export_still_totals_zero(self):
+        rows = self.rows('/inventory/orders/export/csv/')
+        header, totals = rows[0], rows[-1]
+        self.assertEqual(totals[0], 'TOTALS')
+        self.assertEqual(totals[header.index('Line Total (USD)')], '$0.00')
+        self.assertEqual(totals[header.index('Line Profit (USD)')], '$0.00')
+
+    def test_the_totals_row_respects_the_same_filters_as_the_rows(self):
+        # A totals row computed over an unfiltered queryset would disagree with the rows
+        # printed above it, which is worse than having no total at all.
+        self.make_multi_line_order()
+        response = self.client.get(
+            '/inventory/orders/export/csv/', {'year': '1999'}, HTTP_AUTHORIZATION=self.header,
+        )
+        rows = list(csv.reader(io.StringIO(response.content.decode())))
+        header, totals = rows[0], rows[-1]
+        self.assertEqual(len(rows), 2)  # header + totals, no data rows
+        self.assertEqual(totals[header.index('Line Total (USD)')], '$0.00')
+
+    def test_the_purchases_export_ends_in_a_totals_row(self):
+        purchase = Purchase.objects.create(
+            account=self.account, supplier=self.supplier, exchange_rate=89000,
+        )
+        PurchaseItem.objects.create(
+            purchase_order=purchase, product=self.widget, quantity=5, unit_multiplier=2,
+            unit_price=Decimal('4.00'),
+        )  # 40.00
+        PurchaseItem.objects.create(
+            purchase_order=purchase, product=self.gadget, quantity=3, unit_multiplier=1,
+            unit_price=Decimal('2.00'),
+        )  # 6.00
+
+        rows = self.rows('/inventory/purchases/export/csv/')
+        header, totals = rows[0], rows[-1]
+        self.assertEqual(totals[0], 'TOTALS')
+        self.assertEqual(totals[header.index('Line Total (USD)')], '$46.00')
+
+    def test_the_totals_row_adds_no_queries(self):
+        # The export's constant-query-count guarantee predates this row and must survive it:
+        # totals are accumulated in the loop that already walks the items, not re-queried.
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        self.make_multi_line_order()
+        with CaptureQueriesContext(connection) as small:
+            self.rows('/inventory/orders/export/csv/')
+        for _ in range(10):
+            self.make_multi_line_order()
+        with CaptureQueriesContext(connection) as large:
+            self.rows('/inventory/orders/export/csv/')
+
+        self.assertEqual(len(large.captured_queries), len(small.captured_queries))
+
+
+class AdminCSVExportTotalsTests(AccountFixtureMixin, TestCase):
+    """The admin actions are separate implementations with near-identical names."""
+
+    def setUp(self):
+        self.account, self.user, self.client, self.header = self.make_account_user('acsv')
+        self.category = Category.objects.create(name='Widgets', account=self.account)
+        self.supplier = Supplier.objects.create(name='Acme', account=self.account)
+        self.product = Product.objects.create(
+            name='Widget', description='', cost_price='4.00', default_sell_price='10.00',
+            category=self.category, stock_quantity=500, account=self.account,
+        )
+
+    def rows(self, response):
+        return list(csv.reader(io.StringIO(response.content.decode())))
+
+    def test_the_admin_orders_action_totals_its_value_column(self):
+        from inventory.admin import export_orders_to_csv
+
+        for _ in range(2):
+            order = Order.objects.create(account=self.account, exchange_rate=89000)
+            OrderItem.objects.create(
+                order=order, product=self.product, quantity=2, unit_multiplier=3,
+                unit_price=Decimal('10.00'), unit_cost_price=Decimal('4.00'),
+            )  # 60.00 each
+
+        rows = self.rows(export_orders_to_csv(None, None, Order.objects.all()))
+        header, totals = rows[0], rows[-1]
+        self.assertEqual(totals[0], 'TOTALS')
+        self.assertEqual(totals[header.index('Total Value (USD)')], '$120.00')
+
+    def test_the_admin_purchases_action_totals_its_cost_column(self):
+        from inventory.admin import export_purchases_to_csv
+
+        purchase = Purchase.objects.create(
+            account=self.account, supplier=self.supplier, exchange_rate=89000,
+        )
+        PurchaseItem.objects.create(
+            purchase_order=purchase, product=self.product, quantity=5, unit_multiplier=2,
+            unit_price=Decimal('4.00'),
+        )  # 40.00
+
+        rows = self.rows(export_purchases_to_csv(None, None, Purchase.objects.all()))
+        header, totals = rows[0], rows[-1]
+        self.assertEqual(totals[0], 'TOTALS')
+        self.assertEqual(totals[header.index('Total Cost (USD)')], '$40.00')
