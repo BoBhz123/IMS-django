@@ -8,6 +8,30 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-09 — Phase 4: product barcodes
+
+Optional `Product.barcode`, added to `ProductViewSet.search_fields` so a scanned code finds its product
+through the list endpoint the SPA already calls, rather than needing a second endpoint. Form input,
+a tag in the products list, admin search, and seeded onto most demo products.
+
+**Indexed, not unique — a decision, not an omission.** A shop legitimately reuses one code across
+loose goods and own-label lines, and a unique constraint would reject that outright. A test asserts
+two products *may* share a barcode, so introducing the constraint later breaks a visible test instead
+of silently changing what the field means. If it is ever added it should be per-account and partial,
+like the `name` constraints — a global one would let the first account to record an EAN block every
+other account from recording the same real-world product.
+
+**`Product.save()` normalizes `''` to `NULL` and strips whitespace.** Two separate bugs avoided:
+without the first, `''` and `NULL` both mean "no barcode" and every lookup has to test for both — and
+any future unique constraint collides on the second `''` row. Without the second, a scanner's or a
+copy-paste's trailing space makes the code unfindable by the number printed on the label, which is
+the one search anyone will actually type.
+
+Camera scanning remains deliberately out of scope for a later phase; this ships the data and the
+lookup it needs.
+
+---
+
 ## 2026-08-09 — Phase 3: expense tracking and financial reporting
 
 `Expense` CRUD is the small half of this phase. The large half is fixing what "profit" meant, because

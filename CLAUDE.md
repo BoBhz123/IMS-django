@@ -164,7 +164,8 @@ code with the API export views, so a formula/format fix usually needs to happen 
 **Full design:** `docs/superpowers/specs/2026-08-07-saas-single-db-migration-design.md`
 **Completed work log:** `HISTORY.md` — read it at session start.
 
-**Status:** Phases 1–3 complete, except Phase 2.5b-2 (blocked on Paddle approval). Phase 4 is next.
+**Status:** Phases 1–4 complete, except Phase 2.5b-2 (blocked on Paddle approval). Phase 5 is next
+and is the last planned phase in this milestone.
 
 Phases are a dependency chain. 3–5 all touch models that Phase 2 restructures, so running them out of
 order means writing migrations twice. Finish each phase (including its tests) before starting the next.
@@ -296,9 +297,13 @@ the date window is one shared `inventory/reporting.py::DateWindow` applied to ev
 queryset. `spent_at` uses `default=timezone.now`, not `auto_now_add`, so a receipt entered Friday for
 a Tuesday purchase lands in the right month.
 
-### Phase 4 — Barcodes
-Optional indexed `Product.barcode`; add it to `ProductViewSet.search_fields` so `?search=` covers it.
-Frontend input + list tag. Camera scanning is a later phase.
+### Phase 4 — Barcodes — **done**
+Optional indexed `Product.barcode` in `ProductViewSet.search_fields`, so `?search=` covers it. Form
+input, list tag, admin search, seeded data. See `HISTORY.md`. Camera scanning is still a later phase.
+
+Deliberately **indexed, not unique** — a shop reuses one code across loose goods and own-label lines.
+`ProductBarcodeTests.test_two_products_may_share_a_barcode` pins that, so adding the constraint later
+is a decision that breaks a test rather than a silent change.
 
 ### Phase 5 — CSV export totals row
 Append a TOTALS row to `ExportOrdersCSVView` (the API view the frontend calls — *not* the similarly
@@ -381,5 +386,7 @@ Append here when something bites. Do not repeat these.
 - **Every reporting queryset must be filtered through `inventory/reporting.py::DateWindow`.** A window
   applied to one side of a profit calculation and not the other misstates it silently — no exception,
   no error, just a wrong number.
+- **`Product.barcode` is normalized in `Product.save()`** — `''` becomes `NULL` and surrounding
+  whitespace is stripped. Query by the stripped value; do not assume `''` is ever stored.
 - **`react-router-dom` has 2 open high-severity advisories** (`npm audit`). `npm audit fix --force`
   downgrades to 7.11.0, a breaking change — left alone deliberately; raise it as its own decision.
