@@ -1,6 +1,7 @@
 from django.shortcuts import render
-from django.db.models import Prefetch,F,Q,DateField
-from django.db.models.aggregates import Sum
+from django.db.models import Prefetch,F,Q,DateField,ProtectedError
+from django.db.models.aggregates import Sum,Count
+from rest_framework import status
 from django.db.models.functions import TruncDate,TruncWeek,TruncMonth,TruncYear
 from django.http import HttpResponse
 from django_filters.rest_framework import DjangoFilterBackend
@@ -54,12 +55,37 @@ class ProductViewSet(AccountScopedMixin, ModelViewSet):
    
     
 
-class  CategoryViewSet(AccountScopedMixin, ModelViewSet):
-    queryset = Category.objects.all()
+class ProtectedDeleteMixin:
+    """Turn a PROTECT foreign key into a 409 instead of an uncaught 500.
+
+    `Product.category` and `Product.supplier` are both `on_delete=PROTECT`, so deleting one that
+    still has products raises `ProtectedError` straight out of the view. DRF has no handler for
+    it, so the browser gets a 500 and the user gets no idea what to do about it.
+    """
+
+    protected_delete_message = 'This record is still in use and cannot be deleted.'
+
+    def destroy(self, request, *args, **kwargs):
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response(
+                {'detail': self.protected_delete_message},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+
+class  CategoryViewSet(ProtectedDeleteMixin, AccountScopedMixin, ModelViewSet):
+    # product_count drives the Categories screen: it shows how many products a category holds
+    # and disables its delete button, so the 409 below is the backstop rather than the norm.
+    queryset = Category.objects.annotate(product_count=Count('products'))
     serializer_class = CategorySerializer
     filter_backends = [SearchFilter,OrderingFilter]
     ordering_fields= ['name']
     search_fields = ['name']
+    protected_delete_message = (
+        'This category still has products in it. Move those products to another category first.'
+    )
 
 class CustomerViewSet(AccountScopedMixin, ModelViewSet):
     queryset = Customer.objects.all()
@@ -68,12 +94,15 @@ class CustomerViewSet(AccountScopedMixin, ModelViewSet):
     ordering_fields= ['name']
     search_fields = ['name']
     
-class SupplierViewSet(AccountScopedMixin, ModelViewSet):
+class SupplierViewSet(ProtectedDeleteMixin, AccountScopedMixin, ModelViewSet):
     queryset = Supplier.objects.all()
     serializer_class = SupplierSerializer
     filter_backends = [SearchFilter,OrderingFilter]
     ordering_fields= ['name']
     search_fields = ['name']
+    protected_delete_message = (
+        'This supplier still has products assigned to it. Reassign those products first.'
+    )
     
 class _TotalAnnotationMixin:
     """

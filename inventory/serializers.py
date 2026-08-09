@@ -39,6 +39,36 @@ class AccountScopedSerializerMixin:
         return fields
 
 
+class AccountUniqueNameMixin:
+    """
+    Validates a per-account unique name in the serializer instead of at the database.
+
+    The models carry `UniqueConstraint(fields=['account', 'name'])`, but DRF cannot generate a
+    validator for it: `account` is not a serializer field — it is stamped in `perform_create` —
+    so DRF sees only `name` and considers it unconstrained. The constraint then fires in the
+    database as an `IntegrityError`, which reaches the client as an uncaught 500 rather than a
+    400 naming the field. Typing a name that already exists is an everyday user action, not an
+    exceptional one.
+    """
+
+    #: model whose (account, name) pair must stay unique.
+    unique_name_model = None
+    unique_name_message = 'You already have one with this name.'
+
+    def validate_name(self, value):
+        name = value.strip()
+        account = self.context.get('account')
+        if account is None or self.unique_name_model is None:
+            return name
+
+        clashes = self.unique_name_model.objects.filter(account=account, name__iexact=name)
+        if self.instance is not None:
+            clashes = clashes.exclude(pk=self.instance.pk)
+        if clashes.exists():
+            raise serializers.ValidationError(self.unique_name_message)
+        return name
+
+
 def _units_by_product_id(items_data):
     """
     Units each product gives up (or gains), keyed by product id.
@@ -90,10 +120,25 @@ class SimpleProductSerializer(serializers.ModelSerializer):
         model = Product
         fields = ['id', 'name', 'default_sell_price']    
         
-class CategorySerializer(serializers.ModelSerializer):
+class CategorySerializer(AccountUniqueNameMixin, serializers.ModelSerializer):
+    # iexact, so "Drinks" and "drinks" cannot coexist. Deliberately stricter than the database
+    # constraint, which is case-sensitive: two categories differing only in case are
+    # indistinguishable in a dropdown.
+    unique_name_model = Category
+    unique_name_message = 'You already have a category with this name.'
+
+    product_count = serializers.SerializerMethodField()
+
     class Meta():
         model = Category
-        fields = ['id','name']
+        fields = ['id','name','product_count']
+
+    def get_product_count(self, category):
+        # Annotated by CategoryViewSet for list/retrieve. A category that has just been created
+        # or renamed comes back off serializer.save() with no annotation, so fall back rather
+        # than raise — 0 is the right answer for a new one anyway.
+        count = getattr(category, 'product_count', None)
+        return category.products.count() if count is None else count
         
         
 class CreatePurchaseItemSerializer(AccountScopedSerializerMixin, serializers.ModelSerializer):

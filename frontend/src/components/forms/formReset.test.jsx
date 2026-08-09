@@ -9,8 +9,9 @@ import { ExpenseForm } from './ExpenseForm'
 import { OrderForm } from './OrderForm'
 import { PurchaseForm } from './PurchaseForm'
 
-// Prices are strings here because that is what DRF's DecimalField actually serialises to. The
-// earlier scan tests used numbers and would not have caught a coercion bug.
+// Prices are strings here on purpose. This project sets COERCE_DECIMAL_TO_STRING=False, so the
+// API sends numbers — but the form has to survive either, and strings are the shape that breaks
+// naive arithmetic. The scan tests cover the numeric case.
 const WIDGET = {
   id: 1,
   name: 'Widget',

@@ -1858,3 +1858,173 @@ class BarcodeLookupFilterTests(AccountFixtureMixin, TestCase):
             self.url, {'barcode': '5901234123457'}, HTTP_AUTHORIZATION=self.header,
         )
         self.assertEqual(response.data['count'], 0)
+
+
+class CategoryManagementTests(AccountFixtureMixin, APITestCase):
+    """CRUD for the Categories screen, plus the PROTECT foreign key it has to survive."""
+
+    def setUp(self):
+        self.account, self.user, self.client, self.header = self.make_account_user('catmgr')
+        self.url = '/inventory/categories/'
+
+    def make_product(self, category, name='Thing'):
+        return Product.objects.create(
+            account=self.account, name=name, category=category,
+            cost_price='1.00', default_sell_price='2.00', stock_quantity=1,
+        )
+
+    def test_creating_a_category(self):
+        response = self.client.post(
+            self.url, {'name': 'Drinks'}, HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['name'], 'Drinks')
+        self.assertEqual(Category.objects.filter(account=self.account, name='Drinks').count(), 1)
+
+    def test_a_new_category_reports_zero_products(self):
+        # The serializer falls back to a query when the annotation is absent; a fresh category
+        # has no annotation because it never came off the viewset's queryset.
+        response = self.client.post(
+            self.url, {'name': 'Empty'}, HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.data['product_count'], 0)
+
+    def test_listing_reports_how_many_products_each_category_holds(self):
+        drinks = Category.objects.create(account=self.account, name='Drinks')
+        Category.objects.create(account=self.account, name='Empty')
+        self.make_product(drinks, 'Cola')
+        self.make_product(drinks, 'Water')
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=self.header)
+        counts = {row['name']: row['product_count'] for row in response.data}
+        self.assertEqual(counts, {'Drinks': 2, 'Empty': 0})
+
+    def test_renaming_a_category(self):
+        category = Category.objects.create(account=self.account, name='Drnks')
+        response = self.client.patch(
+            f'{self.url}{category.id}/', {'name': 'Drinks'}, HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 200)
+        category.refresh_from_db()
+        self.assertEqual(category.name, 'Drinks')
+
+    def test_deleting_an_unused_category(self):
+        category = Category.objects.create(account=self.account, name='Unused')
+        response = self.client.delete(
+            f'{self.url}{category.id}/', HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Category.objects.filter(id=category.id).exists())
+
+    def test_deleting_a_category_that_still_has_products_is_a_409_not_a_500(self):
+        # Product.category is on_delete=PROTECT, so the delete raises ProtectedError. DRF has no
+        # handler for it: without ProtectedDeleteMixin this is an uncaught 500.
+        category = Category.objects.create(account=self.account, name='In use')
+        self.make_product(category, 'Cola')
+
+        response = self.client.delete(
+            f'{self.url}{category.id}/', HTTP_AUTHORIZATION=self.header,
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn('products', response.data['detail'])
+        self.assertTrue(Category.objects.filter(id=category.id).exists())
+
+    def test_duplicate_names_are_rejected_within_an_account(self):
+        Category.objects.create(account=self.account, name='Drinks')
+        response = self.client.post(
+            self.url, {'name': 'Drinks'}, HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_two_accounts_may_each_have_a_category_of_the_same_name(self):
+        other_account, _, other_client, other_header = self.make_account_user('catmgr2')
+        Category.objects.create(account=self.account, name='Drinks')
+
+        response = other_client.post(
+            self.url, {'name': 'Drinks'}, HTTP_AUTHORIZATION=other_header,
+        )
+
+        self.assertEqual(response.status_code, 201)
+
+    def test_categories_are_account_scoped(self):
+        other_account, _, _, _ = self.make_account_user('catmgr3')
+        Category.objects.create(account=other_account, name='Theirs')
+        Category.objects.create(account=self.account, name='Mine')
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=self.header)
+
+        self.assertEqual([row['name'] for row in response.data], ['Mine'])
+
+    def test_cannot_delete_another_accounts_category(self):
+        other_account, _, _, _ = self.make_account_user('catmgr4')
+        theirs = Category.objects.create(account=other_account, name='Theirs')
+
+        response = self.client.delete(
+            f'{self.url}{theirs.id}/', HTTP_AUTHORIZATION=self.header,
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertTrue(Category.objects.filter(id=theirs.id).exists())
+
+
+    def test_a_duplicate_name_is_a_400_not_a_500(self):
+        # The (account, name) constraint cannot be validated by DRF on its own: `account` is
+        # never a serializer field, so without AccountUniqueNameMixin this is an uncaught
+        # IntegrityError. Typing an existing name is an everyday action.
+        Category.objects.create(account=self.account, name='Drinks')
+
+        response = self.client.post(
+            self.url, {'name': 'Drinks'}, HTTP_AUTHORIZATION=self.header,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('name', response.data)
+
+    def test_a_duplicate_name_is_rejected_regardless_of_case(self):
+        Category.objects.create(account=self.account, name='Drinks')
+
+        response = self.client.post(
+            self.url, {'name': 'drinks'}, HTTP_AUTHORIZATION=self.header,
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_surrounding_whitespace_is_stripped(self):
+        response = self.client.post(
+            self.url, {'name': '  Drinks  '}, HTTP_AUTHORIZATION=self.header,
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['name'], 'Drinks')
+
+    def test_renaming_a_category_to_its_own_name_is_allowed(self):
+        # The uniqueness check must exclude the row being edited, or saving an unchanged form
+        # rejects itself.
+        category = Category.objects.create(account=self.account, name='Drinks')
+
+        response = self.client.patch(
+            f'{self.url}{category.id}/', {'name': 'Drinks'}, HTTP_AUTHORIZATION=self.header,
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+
+class SupplierProtectedDeleteTests(AccountFixtureMixin, APITestCase):
+    """The same PROTECT trap as categories — Product.supplier is on_delete=PROTECT too."""
+
+    def test_deleting_a_supplier_that_still_has_products_is_a_409_not_a_500(self):
+        account, user, client, header = self.make_account_user('supdel')
+        category = Category.objects.create(account=account, name='Cat')
+        supplier = Supplier.objects.create(account=account, name='Acme')
+        Product.objects.create(
+            account=account, name='Thing', category=category, supplier=supplier,
+            cost_price='1.00', default_sell_price='2.00', stock_quantity=1,
+        )
+
+        response = client.delete(
+            f'/inventory/suppliers/{supplier.id}/', HTTP_AUTHORIZATION=header,
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertTrue(Supplier.objects.filter(id=supplier.id).exists())
