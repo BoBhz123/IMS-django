@@ -164,8 +164,8 @@ code with the API export views, so a formula/format fix usually needs to happen 
 **Full design:** `docs/superpowers/specs/2026-08-07-saas-single-db-migration-design.md`
 **Completed work log:** `HISTORY.md` — read it at session start.
 
-**Status:** Phases 1–6 complete. **Phase 7** (camera barcode scanning) is in progress and **Phase 8**
-(security audit) is gated on the user installing the scanning tools — see `PLAN.md`, Task 8.0.
+**Status:** Phases 1–7 complete. **Phase 8** (security audit) is gated on the user installing the
+scanning tools — see `PLAN.md`, Task 8.0; do not start it before they confirm.
 **Phase 2.5b-2** remains blocked on Paddle merchant approval; see the PAUSE STATUS below.
 
 Phases are a dependency chain. 3–5 all touch models that Phase 2 restructures, so running them out of
@@ -304,10 +304,17 @@ Gross profit / Net profit tiles draw sparklines from them. See `HISTORY.md`. Til
 the fixed last-7-days daily window by decision — making them follow the period selector would mean
 restructuring Dashboard's two data-loading effects.
 
-### Phase 7 — Camera barcode scanning — **in progress**
-Plan: `PLAN.md`. `@zxing/library` behind a dynamic import, one `BarcodeScannerModal`, and three call
-sites (product form, order flow, purchase flow). Manual verification on a physical phone is the
-owner's; automated coverage mocks the decoder, since browser automation is forbidden here.
+### Phase 7 — Camera barcode scanning — **done**
+Plan: `PLAN.md` · see `HISTORY.md`. `@zxing/library` behind a dynamic import, one
+`BarcodeScannerModal`, and three call sites (product form, order flow, purchase flow). Manual
+verification on a physical phone is the owner's; automated coverage mocks the decoder, since browser
+automation is forbidden here.
+
+Scanned lookups resolve through `lookupByBarcode` (`frontend/src/hooks/useBarcodeLookup.js`), which
+returns `found | ambiguous | not_found | error`. Ambiguity is a real state, not an edge case — Phase 4
+deliberately left barcodes non-unique — so the UI asks which product rather than taking the first
+match. Order scans increment through `maxQuantityFor` so Phase 1's stock cap still holds; purchase
+scans are uncapped, because a purchase adds stock.
 
 ### Phase 8 — Security audit — **blocked, by design**
 Do not start. `PLAN.md` Task 8.0 requires the user to install `pip-audit`, `bandit` and `semgrep`
@@ -432,3 +439,31 @@ Append here when something bites. Do not repeat these.
   whitespace is stripped. Query by the stripped value; do not assume `''` is ever stored.
 - **`react-router-dom` has 2 open high-severity advisories** (`npm audit`). `npm audit fix --force`
   downgrades to 7.11.0, a breaking change — left alone deliberately; raise it as its own decision.
+- **`@zxing/library` must stay behind `await import()`.** A top-level import puts ~450 kB into every
+  page load of a bundle already past Vite's size warning. Measured: the entry chunk grows ~5 kB and
+  the library gets its own chunk. Check `npm run build` output after touching a scanner call site.
+- **zxing fires the decode callback with `NotFoundException` on every frame without a barcode** —
+  nearly all of them. Treating it as an error puts the modal in a permanent failure state one frame
+  after opening. `BarcodeScannerModal` filters it by `name`.
+- **One physical scan decodes across many frames.** `BarcodeScannerModal`'s `handledRef` is what
+  stops a single barcode from incrementing an order line five times. Do not remove it when
+  refactoring the callback.
+- **Scanned lookups use `?barcode=` (exact), never `?search=`.** `?search=` is `icontains` over name,
+  description *and* barcode, so it resolves to the wrong product with nothing on screen to reveal it
+  — and the scan flows add order lines without confirming each one.
+- **Camera scanning cannot be verified in this project** — browser automation is forbidden. Tests
+  mock the `@zxing/library` module id (which is what the dynamic import resolves) and drive the
+  decode callback by hand. `getUserMedia` also needs a secure context, so the LAN dev URL a phone
+  uses is camera-less by platform rule, not by bug.
+- **`beforeEach(() => mock.mockReset())` — the concise arrow is a trap.** `mockReset()` returns the
+  mock, and Vitest treats a function returned from a hook as a *teardown callback*: it calls the mock
+  after every test. With a rejecting implementation set, that surfaces as an unhandled rejection
+  attributed to a test that is otherwise passing. Use braces.
+- **`CurrencyInput` deliberately does not mirror `valueUsd` on every change.** It re-syncs only when
+  the text does not already parse back to `valueUsd`, so a part-typed `6.` or `6.50` survives and an
+  emptied field is not refilled with the `0` that emptying it reported. Widening that effect makes
+  the field fight the user mid-keystroke; narrowing it back to mount-only reintroduces the bug where
+  picking or scanning a product left the price showing `0` beside a correct total.
+- **`ProductPicker` only learns a product's name by being clicked.** Any code path that sets a line's
+  `product` id some other way must also pass `selectedName`, or the picker reads "Select product"
+  while holding a real id.

@@ -8,6 +8,67 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-09 — Phase 7: camera barcode scanning
+
+`@zxing/library` behind one `BarcodeScannerModal`, wired into three places: the product form (scan a
+code into the field), the order flow (scan to add or increment a line) and the purchase flow (scan to
+select a product and fill its cost). Typing a barcode by hand still works everywhere — the camera is
+an accelerator, never the only way in, because cameras get denied, break, and are absent on desktops.
+
+**Lookups use `?barcode=` (exact), never `?search=`.** The existing search filter is `icontains` over
+name, description *and* barcode. A scanner submits a complete code, so a fuzzy match would resolve to
+the wrong product with nothing on screen to reveal it — and these flows add order lines without
+confirming each one. `ProductFilter.barcode` is the exact-match filter that backs this.
+
+**A scan can legitimately match several products, and the UI asks rather than guesses.** Phase 4
+deliberately left `Product.barcode` indexed but *not* unique, because a shop reuses one code across
+loose goods and own-label lines. `lookupByBarcode` therefore returns `found | ambiguous | not_found |
+error`, and `ambiguous` renders the matches for the user to pick from. Taking the first row would
+silently add the wrong line.
+
+**`not_found` and `error` are kept apart on purpose.** Not-found should send the user to add the
+product; error should send them to retry. Collapsing the two has people creating duplicate products
+every time the network drops.
+
+**Scan-to-increment in the order flow goes through `maxQuantityFor`** — the same cap Phase 1's stock
+validation put on the quantity input. Without it a repeated scan walks past available stock, and the
+server rejects the *whole* order at submit time with nothing to indicate which line was at fault. The
+purchase flow is deliberately uncapped: a purchase adds stock, so buying four of something you hold
+two of is the normal case, not an error.
+
+**zxing is loaded with `await import()` inside the component.** The library is ~450 kB and the app
+bundle is already past Vite's size warning. Measured: wiring the first call site moved the entry
+chunk 927.0 → 932.0 kB and put the library in its own 451 kB chunk, fetched only when somebody opens
+the scanner.
+
+**zxing calls the decode callback with `NotFoundException` on every frame that has no barcode** —
+which is nearly all of them. Surfacing that as an error puts the modal into a permanent failure state
+one frame after opening, so it is filtered out by name. A `handledRef` guard is the matching trap in
+the other direction: one physical barcode decodes across many frames, and without it a single scan
+increments an order line several times.
+
+**`getUserMedia` requires a secure context, with `localhost` the only exception.** Opening the Vite
+dev server from a phone on the LAN (`http://192.168.x.x:5173`) is therefore silently camera-less,
+which reads as a broken feature rather than a platform rule. The modal detects this before touching
+the camera and says so, pointing at the type-it-instead path.
+
+**Verified with a mocked decoder, because browser automation is forbidden in this project.** The
+tests mock the `@zxing/library` module id — which is what the dynamic import resolves — and drive the
+decode callback by hand, covering the duplicate-frame guard, the `NotFoundException` filter, denied
+permission, the camera switch, teardown on close, and the insecure-context path. The physical-phone
+check is the owner's, by agreement.
+
+**Fixed a pre-existing `CurrencyInput` bug this exposed.** It synced its displayed text only on mount
+and on a currency toggle, so filling a line's price from a product left the field reading `0` while
+the order total read the real figure. A probe confirmed *manual* product selection had the same bug,
+so it predates the scanner. The re-sync deliberately leaves part-typed decimals (`6.`, `6.50`) and
+fields the user has emptied alone — fighting the keystroke is why the effect was narrow originally.
+
+`ProductPicker` gained a `selectedName` fallback: it only learns a product's name by being clicked,
+so a line filled by a scan would otherwise read "Select product" while holding a real product id.
+
+---
+
 ## 2026-08-09 — Phase 6: per-period profit and the dashboard profit sparklines
 
 The analytics `series` gains `total_cogs`, `gross_profit` and `net_profit` per period, and the Gross
