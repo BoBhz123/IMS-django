@@ -361,7 +361,7 @@ class ExportOrdersCSVView(APIView):
             row['order_id']: row['profit'] or 0
             for row in items.values('order_id').annotate(
                 profit=Sum(
-                    (F('unit_price') - F('product__cost_price'))
+                    (F('unit_price') - F('unit_cost_price'))
                     * F('quantity')
                     * F('unit_multiplier')
                 )
@@ -370,7 +370,9 @@ class ExportOrdersCSVView(APIView):
 
         for item in items:
             line_total = item.quantity * item.unit_multiplier * item.unit_price
-            cost_price = item.product.cost_price if item.product else 0
+            # The snapshot on the line, not product.cost_price: a re-export of last year
+            # must reproduce last year's figures even after a cost correction.
+            cost_price = item.unit_cost_price
 
             writer.writerow([
                 item.order.id,

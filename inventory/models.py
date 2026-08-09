@@ -43,6 +43,23 @@ def items_total(items):
     return sum(item.quantity * item.unit_multiplier * item.unit_price for item in items)
 
 
+# The cost half of LINE_TOTAL. Reads the snapshot on the line, never product.cost_price —
+# joining out to the product would make every historical figure move the next time somebody
+# corrects a cost.
+LINE_COGS = (
+    models.F('items__quantity')
+    * models.F('items__unit_multiplier')
+    * models.F('items__unit_cost_price')
+)
+
+
+def items_cogs(items):
+    """Python-side equivalent of Sum(LINE_COGS), for already-loaded (prefetched) items."""
+    return sum(
+        item.quantity * item.unit_multiplier * item.unit_cost_price for item in items
+    )
+
+
 class Supplier(models.Model):
     id = models.AutoField(primary_key=True,
                           null=False,editable=False)
@@ -215,10 +232,28 @@ class OrderItem(models.Model):
      quantity = models.PositiveSmallIntegerField(default=1)
      unit_price = models.DecimalField(max_digits=9, decimal_places=2, validators=[MinValueValidator(0)])
      unit_multiplier = models.PositiveSmallIntegerField(default=1)
+     # What this item cost us at the moment it was sold. Snapshotted, not derived: the
+     # product's cost_price is a current figure that gets corrected, and profit computed
+     # from it restates history every time it moves.
+     unit_cost_price = models.DecimalField(
+         max_digits=9, decimal_places=2, validators=[MinValueValidator(0)],
+     )
+
+     def save(self, *args, **kwargs):
+         # Covers the admin inline and seed_data, which build rows directly. It does NOT
+         # cover CreateOrderSerializer — bulk_create bypasses save() — which is why that
+         # serializer stamps the cost itself.
+         if self.unit_cost_price is None and self.product_id:
+             # to_python rather than a bare assignment: an unsaved Product still holds
+             # whatever was assigned to it, which may be a str from a fixture or a form
+             # rather than a Decimal — and .profit does arithmetic on this value.
+             self.unit_cost_price = self._meta.get_field('unit_cost_price').to_python(
+                 self.product.cost_price
+             )
+         super().save(*args, **kwargs)
+
      @property
      def profit(self):
-         if not self.product_id:
-             return None
-         return (self.unit_price - self.product.cost_price) * self.quantity * self.unit_multiplier
+         return (self.unit_price - self.unit_cost_price) * self.quantity * self.unit_multiplier
 
 

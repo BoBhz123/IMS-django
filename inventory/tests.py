@@ -1,13 +1,15 @@
 import tempfile
+from decimal import Decimal
 
 from django.contrib.auth.models import User
+from django.db.models import Sum
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient, APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from inventory.models import (
-    Category, Customer, Order, OrderItem, Product, ProductImage,
-    Purchase, PurchaseItem, Supplier,
+    LINE_COGS, Category, Customer, Order, OrderItem, Product, ProductImage,
+    Purchase, PurchaseItem, Supplier, items_cogs,
 )
 
 
@@ -707,3 +709,101 @@ class CrossAccountIsolationTests(AccountFixtureMixin, APITestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertNotIn('Alice Widget', response.content.decode())
+
+
+class CostSnapshotTests(AccountFixtureMixin, TestCase):
+    """
+    Profit must be reproducible. Before this, OrderItem.profit read product.cost_price
+    live, so raising a product's cost silently restated every past month.
+    """
+
+    def setUp(self):
+        self.account, self.user, self.client, self.header = self.make_account_user('snap')
+        self.category = Category.objects.create(name='Widgets', account=self.account)
+        self.product = Product.objects.create(
+            name='Widget', description='', cost_price='4.00', default_sell_price='10.00',
+            category=self.category, stock_quantity=100, account=self.account,
+        )
+
+    def place_order(self, quantity=2, unit_price='10.00', unit_multiplier=1):
+        response = self.client.post(
+            '/inventory/orders/',
+            {
+                'items': [{
+                    'product': self.product.id,
+                    'quantity': quantity,
+                    'unit_price': unit_price,
+                    'unit_multiplier': unit_multiplier,
+                }],
+            },
+            format='json',
+            HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        return Order.objects.get(pk=response.data['id'])
+
+    def test_the_cost_at_sale_time_is_recorded_on_the_line(self):
+        order = self.place_order()
+        self.assertEqual(order.items.first().unit_cost_price, Decimal('4.00'))
+
+    def test_changing_the_product_cost_does_not_move_historical_profit(self):
+        order = self.place_order(quantity=2)
+        before = order.total_profit
+
+        self.product.cost_price = Decimal('9.00')
+        self.product.save()
+
+        order.refresh_from_db()
+        self.assertEqual(order.total_profit, before)
+        self.assertEqual(before, Decimal('12.00'))  # (10 - 4) * 2 * 1
+
+    def test_a_later_order_records_the_new_cost(self):
+        self.place_order()
+        self.product.cost_price = Decimal('9.00')
+        self.product.save()
+        later = self.place_order()
+        self.assertEqual(later.items.first().unit_cost_price, Decimal('9.00'))
+
+    def test_profit_accounts_for_the_unit_multiplier(self):
+        order = self.place_order(quantity=3, unit_price='10.00', unit_multiplier=6)
+        self.assertEqual(order.total_profit, Decimal('108.00'))  # (10 - 4) * 3 * 6
+
+    def test_rows_created_outside_the_serializer_still_get_a_cost(self):
+        # The admin inline and seed_data build OrderItems directly. save() fills the
+        # snapshot so those paths cannot silently record a zero cost.
+        order = Order.objects.create(account=self.account, exchange_rate=89000)
+        item = OrderItem.objects.create(
+            order=order, product=self.product, quantity=1, unit_price=Decimal('10.00'),
+        )
+        self.assertEqual(item.unit_cost_price, Decimal('4.00'))
+
+    def test_an_explicit_cost_is_not_overwritten_by_save(self):
+        order = Order.objects.create(account=self.account, exchange_rate=89000)
+        item = OrderItem.objects.create(
+            order=order, product=self.product, quantity=1,
+            unit_price=Decimal('10.00'), unit_cost_price=Decimal('1.50'),
+        )
+        self.assertEqual(item.unit_cost_price, Decimal('1.50'))
+
+    def test_the_aggregate_matches_the_python_property(self):
+        # LINE_COGS and items_cogs are duplicated expressions; a test pins them together
+        # because the analytics view uses one and the serializers use the other.
+        order = self.place_order(quantity=3, unit_multiplier=6)
+        aggregated = (
+            Order.objects.filter(pk=order.pk).aggregate(total=Sum(LINE_COGS))['total']
+        )
+        self.assertEqual(aggregated, items_cogs(order.items.all()))
+        self.assertEqual(aggregated, Decimal('72.00'))  # 4 * 3 * 6
+
+    def test_the_csv_export_reports_the_snapshot_cost(self):
+        self.place_order()
+        self.product.cost_price = Decimal('9.00')
+        self.product.save()
+
+        response = self.client.get(
+            '/inventory/orders/export/csv/', HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.content.decode()
+        self.assertIn('4.00', body)
+        self.assertNotIn('9.00', body)

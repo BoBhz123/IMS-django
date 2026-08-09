@@ -216,10 +216,20 @@ class CreateOrderSerializer(AccountScopedSerializerMixin, serializers.ModelSeria
         if errors:
             raise serializers.ValidationError({'items': errors})
 
+        # bulk_create bypasses OrderItem.save(), so the snapshot is taken here. Read off the
+        # rows already locked above rather than re-querying: that is the cost as it stood at
+        # the instant this sale was committed.
+        cost_by_product_id = {product.id: product.cost_price for product in locked}
+
         order = Order.objects.create(**validated_data)
-        OrderItem.objects.bulk_create(
-            [OrderItem(order=order, **item_data) for item_data in items_data]
-        )
+        OrderItem.objects.bulk_create([
+            OrderItem(
+                order=order,
+                unit_cost_price=cost_by_product_id[item_data['product'].id],
+                **item_data,
+            )
+            for item_data in items_data
+        ])
 
         # One UPDATE per product, computed in the database, rather than a save() per line.
         for product_id, units in units_by_id.items():
