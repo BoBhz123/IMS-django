@@ -118,8 +118,20 @@ class Product(models.Model):
     stock_quantity = models.IntegerField(default=1,blank=False)
     supplier = models.ForeignKey(Supplier,on_delete=models.PROTECT,blank=True,null=True)
     category= models.ForeignKey(Category,on_delete=models.PROTECT,related_name='products')
+    # Optional, and indexed rather than unique: a shop legitimately reuses one code across
+    # loose goods and own-label lines, and a unique constraint would reject that outright.
+    # Stored as NULL when absent, never '' — see save() below.
+    barcode = models.CharField(max_length=64, blank=True, null=True, db_index=True)
 
     objects = AccountScopedManager()
+
+    def save(self, *args, **kwargs):
+        # '' and NULL would both mean "no barcode", so every lookup would have to test for
+        # two things and any future unique constraint would collide on the second '' row.
+        # Stripping matters because scanners and copy-paste both append whitespace, and
+        # ' 5901234' never matches a search for '5901234'.
+        self.barcode = (self.barcode or '').strip() or None
+        super().save(*args, **kwargs)
 
     def __str__(self):
             return self.name

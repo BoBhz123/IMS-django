@@ -1205,3 +1205,114 @@ class AnalyticsFinancialsTests(AccountFixtureMixin, TestCase):
         data = self.analytics(group_by='month')
         self.assertTrue(data['series'])
         self.assertIn('total_expenses', data['series'][0])
+
+
+class ProductBarcodeTests(AccountFixtureMixin, TestCase):
+    """
+    An optional barcode, searchable through the same ?search= the products list already uses.
+    Deliberately indexed rather than unique: the phase brief asks for a lookup aid, and a
+    unique constraint would reject the loose-goods and own-label cases where a shop
+    legitimately reuses one code.
+    """
+
+    def setUp(self):
+        self.account, self.user, self.client, self.header = self.make_account_user('bc')
+        self.category = Category.objects.create(name='Widgets', account=self.account)
+        self.url = '/inventory/products/'
+
+    def make_product(self, name='Blue Widget', account=None, **overrides):
+        fields = {
+            'name': name,
+            'description': 'A widget',
+            'cost_price': '5.00',
+            'default_sell_price': '9.99',
+            'category': self.category,
+            'account': account or self.account,
+        }
+        fields.update(overrides)
+        return Product.objects.create(**fields)
+
+    def test_a_product_needs_no_barcode(self):
+        product = self.make_product()
+        self.assertIsNone(product.barcode)
+
+    def test_a_blank_barcode_is_stored_as_null_not_an_empty_string(self):
+        # Otherwise '' and NULL both mean "no barcode" and every lookup has to test for two
+        # things — and a future unique constraint would collide on the second '' row.
+        product = self.make_product(barcode='')
+        product.refresh_from_db()
+        self.assertIsNone(product.barcode)
+
+    def test_surrounding_whitespace_is_stripped(self):
+        # Scanners and copy-paste both append stray whitespace; ' 5901234' would then never
+        # match a search for '5901234'.
+        product = self.make_product(barcode='  5901234123457  ')
+        product.refresh_from_db()
+        self.assertEqual(product.barcode, '5901234123457')
+
+    def test_search_finds_a_product_by_its_full_barcode(self):
+        self.make_product(barcode='5901234123457')
+        self.make_product(name='Red Gadget', barcode='4006381333931')
+
+        response = self.client.get(
+            self.url, {'search': '5901234123457'}, HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(response.data['results'][0]['name'], 'Blue Widget')
+
+    def test_search_still_matches_name_and_description(self):
+        self.make_product(barcode='5901234123457')
+        for term in ('Blue', 'widget'):
+            response = self.client.get(
+                self.url, {'search': term}, HTTP_AUTHORIZATION=self.header,
+            )
+            self.assertEqual(response.data['count'], 1, term)
+
+    def test_a_barcode_search_does_not_reach_another_account(self):
+        other_account, _, _, _ = self.make_account_user('bc2')
+        other_category = Category.objects.create(name='Theirs', account=other_account)
+        self.make_product(
+            name='Theirs', account=other_account, category=other_category,
+            barcode='5901234123457',
+        )
+
+        response = self.client.get(
+            self.url, {'search': '5901234123457'}, HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.data['count'], 0)
+
+    def test_the_barcode_is_returned_by_the_api(self):
+        self.make_product(barcode='5901234123457')
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=self.header)
+        self.assertEqual(response.data['results'][0]['barcode'], '5901234123457')
+
+    def test_a_barcode_can_be_set_through_the_api(self):
+        response = self.client.post(
+            self.url,
+            {
+                'name': 'Scanned', 'description': '', 'cost_price': '1.00',
+                'default_sell_price': '2.00', 'category': self.category.id,
+                'barcode': '4006381333931',
+            },
+            format='json',
+            HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(Product.objects.get(name='Scanned').barcode, '4006381333931')
+
+    def test_a_barcode_can_be_cleared_through_the_api(self):
+        product = self.make_product(barcode='5901234123457')
+        response = self.client.patch(
+            f'{self.url}{product.id}/', {'barcode': ''},
+            format='json', HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        product.refresh_from_db()
+        self.assertIsNone(product.barcode)
+
+    def test_two_products_may_share_a_barcode(self):
+        # Indexed, not unique — see the class docstring. This test exists so that adding a
+        # unique constraint later is a deliberate decision that breaks a test, not a silent one.
+        self.make_product(barcode='5901234123457')
+        self.make_product(name='Loose goods', barcode='5901234123457')
+        self.assertEqual(Product.objects.filter(barcode='5901234123457').count(), 2)

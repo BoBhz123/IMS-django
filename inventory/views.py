@@ -46,7 +46,9 @@ class ProductViewSet(AccountScopedMixin, ModelViewSet):
    filter_backends = [DjangoFilterBackend,SearchFilter,OrderingFilter]
    filterset_class = ProductFilter
    pagination_class = DefaultPagination
-   search_fields = ['name','description']
+   # barcode is here so a scanned code finds its product through the same ?search= the list
+   # already uses, rather than needing a second endpoint.
+   search_fields = ['name','description','barcode']
    ordering_fields = ['name','default_sell_price']
    
     

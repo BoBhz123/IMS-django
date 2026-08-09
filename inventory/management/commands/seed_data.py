@@ -266,6 +266,12 @@ class Command(BaseCommand):
                 supplier=random.choice(suppliers) if random.random() > 0.1 else None,
                 category=categories[category_name],
                 account=account,
+                # A 13-digit EAN-shaped code on most products, but not all — the field is
+                # optional and the UI has to look right for the ones without one.
+                barcode=(
+                    str(random.randint(1000000000000, 9999999999999))
+                    if random.random() > 0.2 else None
+                ),
             )
             for _ in range(random.randint(1, 3)):
                 ProductImage.objects.create(

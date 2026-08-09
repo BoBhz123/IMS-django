@@ -29,10 +29,10 @@ class ProductImageInline(admin.TabularInline):
 @admin.register(models.Product)
 class ProductAdmin(admin.ModelAdmin):
     actions = ['clear_stock']
-    list_display = ['name','category','description','stock_quantity','default_sell_price']
+    list_display = ['name','category','description','stock_quantity','default_sell_price','barcode']
     list_per_page= 10
     list_editable= ['default_sell_price']
-    search_fields = ['name']
+    search_fields = ['name','barcode']
     list_filter=['category']
     autocomplete_fields = ['category','supplier']
     inlines = [ProductImageInline]

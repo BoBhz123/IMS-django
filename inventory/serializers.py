@@ -80,7 +80,10 @@ class ProductSerializer(AccountScopedSerializerMixin, serializers.ModelSerialize
     images = ProductImageSerializer(many=True, read_only=True)
     class Meta():
         model = Product
-        fields = ['id','name','category','supplier','description','cost_price','default_sell_price','profit','stock_quantity','images']
+        # allow_blank so the SPA can clear the field by sending '' — Product.save()
+        # normalizes that to NULL rather than storing an empty string.
+        extra_kwargs = {'barcode': {'allow_blank': True}}
+        fields = ['id','name','category','supplier','description','cost_price','default_sell_price','profit','stock_quantity','barcode','images']
         
 class SimpleProductSerializer(serializers.ModelSerializer):
     class Meta:
