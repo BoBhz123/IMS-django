@@ -134,7 +134,7 @@ security-relevant code use `random`". It does not:
 
 ---
 
-## F-06 — `SECRET_KEY` and `DEBUG` fail *open* when unset · **MEDIUM** · needs a decision
+## F-06 — `SECRET_KEY` and `DEBUG` fail *open* when unset · **MEDIUM** · **FIXED 2026-08-10**
 
 **Where:** `ims/settings.py:52` and `:60`
 
@@ -155,7 +155,16 @@ Everything else in `check --deploy` passes: HSTS, SSL redirect, secure and HTTP-
 and `CLAUDE.md` records that Heroku sets `DJANGO_DEBUG=False` explicitly. What is unknown from here
 is whether `DJANGO_SECRET_KEY` is set on Heroku.
 
-**Proposed action, and why it is not being taken unilaterally:** the obvious hardening is to refuse
+**Resolved 2026-08-10.** The owner confirmed `DJANGO_SECRET_KEY` is set in the Heroku config vars,
+so the boot guard could be shipped without risking the next release. `ims/settings.py` now raises
+`ImproperlyConfigured` when `DEBUG` is off and `SECRET_KEY` still starts with `django-insecure-`.
+Tested in both directions plus the local-dev case by
+`inventory.tests.SecretKeyBootGuardTests`. `manage.py check --deploy` now reports 0 issues.
+
+The original reasoning is kept below, because the decision not to act unilaterally is the part worth
+remembering.
+
+**Proposed action, and why it was not taken unilaterally:** the obvious hardening is to refuse
 to boot when `DEBUG` is False and `SECRET_KEY` is still the committed default. That converts a silent
 insecurity into a loud failure — but if the live deployment is *currently* running on the default
 key, shipping that check takes production down on the next release. Rotating `SECRET_KEY` also
@@ -227,7 +236,7 @@ Verified in a subprocess rather than with `override_settings`: Django's test run
 | F-03 stale `react-router-dom` note | INFO | docs fix |
 | F-04 bandit hardcoded-password | LOW | accepted |
 | F-05 bandit `random` in seeder | LOW | accepted |
-| F-06 `SECRET_KEY`/`DEBUG` fail open | MEDIUM | **owner decision** |
+| F-06 `SECRET_KEY`/`DEBUG` fail open | MEDIUM | fixed 2026-08-10 |
 | F-07 CORS wide open | MEDIUM | fixed |
 | F-08 nested image route unscoped | **HIGH** | fixed |
 

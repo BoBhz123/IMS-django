@@ -10,6 +10,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
 
 from . import verification
+from .audit import log_auth_event
 from .emails import send_password_reset_code, send_verification_code
 from .models import Account, get_account
 from .serializers import (
@@ -82,6 +83,7 @@ class VerifyEmailView(APIView):
             account.subscription_status = Account.PENDING_PAYMENT
             account.save(update_fields=['subscription_status'])
 
+        log_auth_event('email_verified', request.user, account=getattr(account, 'pk', None))
         return Response({
             'detail': 'Email verified.',
             'status': account.subscription_status if account else None,
@@ -208,6 +210,7 @@ class PasswordResetConfirmView(APIView):
             request.user.save(update_fields=['password'])
 
         revoked = _revoke_refresh_tokens(request.user)
+        log_auth_event('password_changed', request.user, sessions_revoked=revoked)
         return Response({
             'detail': 'Your password has been changed. Please sign in again.',
             'sessions_revoked': revoked,

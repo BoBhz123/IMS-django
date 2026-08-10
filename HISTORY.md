@@ -8,6 +8,70 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-10 — OWASP Top 10 audit, CSP, and the security audit trail
+
+Full report: `docs/superpowers/specs/2026-08-10-owasp-top-10-audit.md`. Ten categories, each
+asserted by behaviour rather than by the presence of a setting, plus semgrep's `p/owasp-top-ten`
+and seven supporting rulesets (281 rules, 187 files).
+
+**The automated scans found nothing new, and that is the result worth recording.** Both real gaps
+this pass — no CSP, no audit trail — are *missing controls*, and the worst bug of the previous pass
+was broken authorization. Scanners find sinks. They do not find absent defences or authorization
+mistakes, which look exactly like ordinary code.
+
+**F-06 closed, as authorised.** The app now refuses to boot when `DEBUG` is off and `SECRET_KEY` is
+still the committed default. This mattered more than a stale-config warning: `SIMPLE_JWT` has no
+separate `SIGNING_KEY`, so that key signs every token — a deploy missing the variable let anyone who
+can read this repository mint a token for any user. `manage.py check --deploy` is now clean.
+
+**CSP added, hand-rolled rather than `django-csp`** — a dependency means `pipenv install`, which
+relocks, and a relock has silently bumped Django and DRF here before. Two things were verified
+before shipping a policy that could break the app: the Django 6 admin emits **zero** inline
+`<script>` blocks and zero inline handlers, so `script-src 'self'` does not lock the owner out of
+the admin; and the built `index.html` pulls Google Fonts from two hosts that both had to be listed
+or the app renders in a fallback face. `'unsafe-inline'` stays in `style-src` because framer-motion
+writes inline styles every frame and nonces cannot cover style *attributes* — stated rather than
+quietly tolerated. `CSP_REPORT_ONLY=1` rolls a future policy change out without blocking.
+
+CSP earns its place here specifically because **JWTs live in `localStorage`**, so an XSS is a full
+account takeover. That is now recorded as an accepted risk with `HttpOnly` cookies named as the
+structural fix — CSP is mitigation, not a solution, and the report says so.
+
+**There was no security audit trail at all.** No `LOGGING` config, and no record of who deleted
+what — and deletions here are irreversible, so "rows are missing from my customer list" had no
+answer. `accounts/audit.py` now logs deletions, password changes, email verifications and
+key-granted subscriptions, alongside `django.security` and `axes`, to stdout.
+
+The deletion hook lives in `AccountScopedMixin.perform_destroy`, so one override covers every
+scoped collection and a new viewset is audited by inheriting the mixin it already needs in order to
+be scoped. The pk is captured *before* the delete and logged *after* it: Django's collector nulls
+`instance.pk` on the way out, and logging beforehand would record deletions that never happened,
+since a PROTECT foreign key raises and becomes a 409. Both directions are tested.
+
+**Uploads were tested adversarially and held.** PHP source with an `image/jpeg` content type, an
+SVG carrying `<script>`, a 2 MB+ file, and a `../../../../etc/` filename: rejected, rejected,
+rejected, and stored safely inside the account's own directory. The declared content type is never
+believed — Pillow has to be able to open the file.
+
+**Swept clean:** no raw SQL, no `subprocess`/`eval`, no unsafe deserialization, no
+`dangerouslySetInnerHTML`, and **no outbound HTTP client anywhere** — SSRF needs a fetcher and there
+is none. A test now scans for one, so adding it becomes a deliberate act.
+
+**One latent risk recorded rather than fixed:** `playground.views.say_hello` reads `Order.objects`
+with no account filter and no authentication. It is unreachable — `playground.urls` is never
+`include()`d — and a test is now the tripwire, because that view is one innocuous line of `urls.py`
+away from being a cross-tenant leak. Deleting the scratch app is the better fix and is the owner's
+call.
+
+Also documented as accepted: access tokens outlive a password change by up to their remaining day
+(revoking them needs a per-request revocation check), and there is no per-user role model inside an
+account.
+
+Verified: `manage.py test` 387 passed; `npm test` 178 passed; lint and build clean;
+`check --deploy` reports 0 issues; `pip-audit` and `npm audit` both 0.
+
+---
+
 ## 2026-08-10 — Phase 8: security audit and hardening
 
 Scanned with `pip-audit`, `bandit`, `npm audit`, `semgrep` (5 rulesets, 256 rules) and

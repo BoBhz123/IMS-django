@@ -54,11 +54,15 @@ local-dev defaults when unset. The local DB is Postgres (`inventory` on localhos
 read from the environment (comma-separated) with the Vite dev origins as the fallback — so adding a
 production domain is a config change, not a deploy.
 
-`DJANGO_SECRET_KEY` and `DJANGO_DEBUG` both fall back to their **unsafe** values, which Phase 8
-recorded as F-06 and deliberately did not "fix": a deploy missing `DJANGO_SECRET_KEY` runs on the key
-committed here, and `SIMPLE_JWT` has no separate `SIGNING_KEY`, so that key signs every token. Adding
-a refuse-to-boot guard needs confirmation that the variable is set on Heroku first — otherwise the
-guard takes production down on the next release.
+`DJANGO_SECRET_KEY` and `DJANGO_DEBUG` still *default* to their unsafe values for local dev, but
+**the app now refuses to boot when `DEBUG` is off and `SECRET_KEY` is still the committed default**
+(F-06, closed 2026-08-10 once the owner confirmed the variable is set on Heroku). `SIMPLE_JWT` has no
+separate `SIGNING_KEY`, so that key signs every token — a silent insecure boot meant anyone who could
+read this repo could mint a token for any user.
+
+Security headers live in `ims/security_headers.py` (CSP + Referrer-Policy), hand-rolled rather than
+`django-csp` to avoid a lockfile relock. `CSP_REPORT_ONLY=1` rolls a policy change out without
+blocking; `CSP_EXTRA_IMG_SRC` / `CSP_EXTRA_CONNECT_SRC` add origins without a code change.
 
 **This app is deployed** (Heroku, with WhiteNoise serving the built React app and R2 for media).
 Deployment steps are not in scope for routine work — never run migrations, resets, or config changes
@@ -495,6 +499,21 @@ Append here when something bites. Do not repeat these.
   validator — the constraint then surfaces as an uncaught `IntegrityError` 500 instead of a 400. See
   `AccountUniqueNameMixin` and `ProductSerializer.validate_barcode`. Both strip before comparing,
   because the model strips before storing.
+- **The security audit trail is `accounts/audit.py`, logged to `ims.security`.** Deletions are
+  hooked in `AccountScopedMixin.perform_destroy`, so any new account-scoped viewset is audited for
+  free — but capture the pk *before* `super().perform_destroy()` and log *after* it: Django's
+  collector nulls `instance.pk`, and logging first records deletions that a PROTECT foreign key then
+  prevented. Never put a code, token or password in the trail.
+- **CSP is enforced (`ims/security_headers.py`), so no inline `<script>` may ever be added** to the
+  SPA's `index.html` or to a Django template — `script-src` is `'self'` with no nonce. Check
+  `npm run build` output if a build tool starts inlining. `'unsafe-inline'` in `style-src` is
+  load-bearing for framer-motion and cannot be removed without replacing the animation library.
+- **JWTs live in `localStorage`, so any XSS is a full account takeover.** This is a recorded,
+  accepted risk — `HttpOnly` cookies are the structural fix and a much larger change. Treat any new
+  HTML-rendering or `dangerouslySetInnerHTML` path as security-critical.
+- **`playground.views.say_hello` reads every account's orders with no auth and no scoping.** It is
+  not routed, and `test_a05_the_playground_scratch_view_is_not_routed` is the tripwire. Do not
+  `include('playground.urls')`.
 - **Scanners do not find authorization bugs.** Phase 8's worst finding — an unscoped nested route
   allowing cross-account read *and* write — was invisible to semgrep, bandit and pip-audit, because
   it looks like ordinary ORM code. It took a test that crossed the tenant boundary. Run the matrix
