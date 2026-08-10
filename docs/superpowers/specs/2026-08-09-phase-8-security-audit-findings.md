@@ -31,7 +31,7 @@ Working Log did not fire.
 
 ---
 
-## F-01 — CSV formula injection in 4 of the 5 export paths · **MEDIUM** · fix
+## F-01 — CSV formula injection in 4 of the 5 export paths · **MEDIUM** · fixed
 
 **Where:** `inventory/views.py:413`, `:431`, `:490`, `:504`; `inventory/admin.py:117`, `:146`
 **Found by:** semgrep `python.django.security.audit.csv-writer-injection` (5 hits; the admin actions
@@ -55,10 +55,12 @@ the same person. Two paths cross a real boundary:
    Any subscriber can name a customer `=HYPERLINK("http://attacker","Click")`, wait for the platform
    owner to export, and attack them. That is subscriber → platform escalation.
 
-**Proposed action:** move the escaping into `csv_format.py` beside `money()`/`iso()` and apply it to
-every user-controlled text cell in all four exporters.
+**Fixed** in `7681c0f`: `_csv_safe` moved into `csv_format.py` as `text()` and applied to every
+user-controlled cell in all four exporters. Tests: `CSVFormulaInjectionTests`, which asserts no cell
+in any export opens with a formula character, that the hostile name is still *present* (defused, not
+dropped — the owner still has to see which record it is), and that the admin actions are covered.
 
-**Trap to avoid while fixing:** the escape list contains `-`, and `money()` returns `-5.00` for a
+**Trap avoided while fixing** (pinned by `test_negative_money_is_not_escaped_into_text`): the escape list contains `-`, and `money()` returns `-5.00` for a
 negative line profit. Applying the text escape to money cells would emit `'-5.00`, turning the
 numeric columns back into text and undoing the export redesign that made them summable. The escape
 must apply to text cells only — never to `money()` or `iso()` output, which this code generates
@@ -201,13 +203,18 @@ foreign one. Tests:
 
 ---
 
-## F-07 — `CORS_ALLOW_ALL_ORIGINS = True` · **MEDIUM** · fixed in Task 8.3
+## F-07 — `CORS_ALLOW_ALL_ORIGINS = True` · **MEDIUM** · fixed
 
 **Where:** `ims/settings.py`
 
-Known and previously documented as a deliberate dev-only setting. Task 8.3 makes it
-`CORS_ALLOW_ALL_ORIGINS = DEBUG` with an environment-driven allowlist. Recorded here so the baseline
-is complete, not because it was a discovery.
+Known and previously documented as a deliberate dev-only setting. **Fixed** in `7681c0f`:
+`CORS_ALLOW_ALL_ORIGINS = DEBUG`, with `CORS_ALLOWED_ORIGINS` read from the environment so adding a
+domain is a config change rather than a code deploy. Recorded here so the baseline is complete, not
+because it was a discovery.
+
+Verified in a subprocess rather than with `override_settings`: Django's test runner forces
+`settings.DEBUG = False` *after* `ims.settings` has been imported, so in-process the derived value and
+`DEBUG` can never agree and an assertion on them would prove nothing about production.
 
 ---
 
@@ -215,13 +222,13 @@ is complete, not because it was a discovery.
 
 | ID | Severity | Status |
 |---|---|---|
-| F-01 CSV formula injection | MEDIUM | fix in this phase |
+| F-01 CSV formula injection | MEDIUM | fixed |
 | F-02 `mcp` CVEs (tooling) | INFO | no action |
 | F-03 stale `react-router-dom` note | INFO | docs fix |
 | F-04 bandit hardcoded-password | LOW | accepted |
 | F-05 bandit `random` in seeder | LOW | accepted |
 | F-06 `SECRET_KEY`/`DEBUG` fail open | MEDIUM | **owner decision** |
-| F-07 CORS wide open | MEDIUM | fix in Task 8.3 |
+| F-07 CORS wide open | MEDIUM | fixed |
 | F-08 nested image route unscoped | **HIGH** | fixed |
 
 **Two real code defects** (F-08, F-01), one **deployment question for the owner** (F-06), one planned
@@ -231,3 +238,35 @@ hardening (F-07), one documentation correction (F-03). Everything else is noise 
 and semgrep, bandit and pip-audit were all silent on it — an authorization bug looks like ordinary
 ORM code. The scanners earned their place on F-01, which reading had missed for four phases; the
 matrix earned its place on F-08. Neither would have found the other.
+
+---
+
+## Rate limiting — confirmed, not assumed (Task 8.3 Step 3)
+
+Each pre-existing limit was checked against a passing test rather than taken on trust:
+
+| Control | Limit | Test |
+|---|---|---|
+| Login brute force (`django-axes`) | `AXES_FAILURE_LIMIT` = 5, 1h cooloff | `inventory.tests.BruteForceLockoutTests` — and it asserts the *correct* password is still refused while locked, which is the half that actually proves a lockout |
+| OTP wrong guesses | 5, then the code is dead | `accounts.tests.VerificationCodeTests.test_the_code_dies_after_five_wrong_attempts` |
+| OTP resend | 1/min | `…test_resend_is_rate_limited_to_one_a_minute` |
+| OTP resend | 5/hour | `…test_resend_is_capped_per_hour` |
+| CSV exports | 30/hour per user | `inventory.tests.ExportThrottleTests` (new) |
+
+**`django-axes` guards login and nothing else.** It never sees the OTP endpoints, the billing
+endpoints or the exports — those are protected by the DRF scoped throttles and the per-code attempt
+cap, which is why those exist separately. Worth restating because "we have django-axes" reads like
+blanket rate limiting and is not.
+
+## What the phase changed
+
+| Task | Outcome |
+|---|---|
+| 8.1 | Baseline report (this file), `2ee7343` |
+| 8.2 | Isolation + subscription matrix; **found and fixed F-08**, `e98f19d` |
+| 8.3 | CORS, export throttling, F-01, `7681c0f` |
+| 8.4 | Documentation |
+
+**Left open by design:** F-06 (`SECRET_KEY`/`DEBUG` fail open) needs the owner to confirm whether
+`DJANGO_SECRET_KEY` is set on Heroku before a boot guard is added, because adding one blind would
+take production down on the next release if it is not.

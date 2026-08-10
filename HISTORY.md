@@ -8,6 +8,71 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-10 — Phase 8: security audit and hardening
+
+Scanned with `pip-audit`, `bandit`, `npm audit`, `semgrep` (5 rulesets, 256 rules) and
+`manage.py check --deploy`. Findings report:
+`docs/superpowers/specs/2026-08-09-phase-8-security-audit-findings.md`, committed as a baseline
+*before* any fix, so it records what the scanners said rather than describing an already-clean tree.
+
+**The worst finding came from a test, not a scanner.** The nested product-image route was
+unscoped: `ProductImageViewSet.get_queryset()` replaced `AccountScopedMixin`'s instead of chaining
+through it, so the only filter was the product id taken from the URL. Product ids are sequential, so
+any subscriber could walk `/inventory/products/<n>/images/` and list, attach to, retrieve or delete
+**any other account's** product images. The declared `account_lookup = 'product__account'` made the
+viewset look scoped while doing nothing. semgrep, bandit and pip-audit were all silent — an
+authorization bug reads as ordinary ORM code. The Task 8.2 matrix caught it on its first run.
+
+That is the argument for the matrix over per-feature isolation tests: coverage previously tracked
+whoever remembered to write it. The matrix drives every case from a resource list, so an endpoint
+added without scoping fails rather than ships. It asserts 404 and never 403 throughout — a 403 on
+someone else's row confirms the row exists, which is an existence oracle across the tenant boundary.
+
+**CSV formula injection reached 4 of the 5 exports.** `_csv_safe` had existed since the export
+redesign but was applied only to the products export, because it lived in `views.py` where
+`admin.py` could not reach it while the shared `csv_format.py` held only `money()` and `iso()` — the
+exact "a formula fix usually needs both" trap the Working Log warns about. It is now `text()` in
+`csv_format.py`, applied everywhere. The admin half matters most: those rows span every account and
+the file is opened by the platform superadmin, so a subscriber naming a customer `=HYPERLINK(…)` was
+attacking them, not themselves.
+
+The escape is deliberately **not** applied to `money()` output. `-` leads a formula and also leads a
+negative line profit, so escaping money cells would emit `'-6.00`, turn the numeric columns back into
+text and silently undo the redesign that made them summable. A test pins that.
+
+`CORS_ALLOW_ALL_ORIGINS` now follows `DEBUG`, with the allowlist read from the environment so adding
+a domain is config rather than a deploy. Verified in a subprocess: the test runner forces
+`DEBUG = False` *after* `ims.settings` is imported, so an in-process assertion proves nothing about
+production. The three CSV exports share one `exports` throttle scope at 30/hour per user — they walk
+every line item an account has recorded, and a per-view budget would just be three times the ceiling
+for the same work. Patching `ScopedRateThrottle.THROTTLE_RATES` in place is what makes that testable;
+`override_settings(REST_FRAMEWORK=…)` never reaches it, because DRF copies the rates into a class
+attribute at import.
+
+**Accepted without change, with reasons:** bandit's 93 findings are all LOW and all noise — test
+fixtures plus false positives on strings like `'password_reset'` and `'10/hour'`, and `random` used
+only by `seed_data`. That last one was verified rather than assumed: `random` appears nowhere outside
+the seeder, and both real generators (`verification.py`, `billing/keys.py`) use `secrets`.
+`pip-audit`'s only hits are three CVEs in `mcp`, which is pinned by **semgrep itself** and is not a
+project dependency — re-running against the declared dependencies alone reports nothing.
+
+**Two corrections to previously recorded beliefs.** `npm audit` is now completely clean: the
+`react-router-dom` advisories the Working Log described as open were resolved upstream, and the entry
+has been removed rather than carried forward. And installing the tooling did *not* relock the
+project — `Pipfile.lock` is untouched and Django is still 6.0.8 with DRF 3.17.2.
+
+**Deliberately left open — needs an owner decision.** `SECRET_KEY` and `DEBUG` both default to their
+*unsafe* values, so a deploy missing `DJANGO_SECRET_KEY` runs on the key committed to this repo, and
+`SIMPLE_JWT` has no separate `SIGNING_KEY`, so that key signs every token. The obvious hardening is to
+refuse to boot when `DEBUG` is off and the key is still the default — but if the live deployment is
+currently running on that default, shipping the guard takes production down on the next release.
+Confirm whether `DJANGO_SECRET_KEY` is set on Heroku first. Everything else in `check --deploy`
+already passes: HSTS, SSL redirect, secure and HTTP-only cookies, `X_FRAME_OPTIONS`.
+
+Verified: `manage.py test` 350 passed; `npm test` 178 passed; lint and build clean.
+
+---
+
 ## 2026-08-10 — Account menu and OTP password reset
 
 An account menu replaces the bare Sign out button, and `/settings` carries a three-screen password

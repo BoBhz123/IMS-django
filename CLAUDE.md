@@ -50,8 +50,15 @@ not total — it is strongest on stock arithmetic, account isolation, and subscr
 **Settings are env-var driven** in `ims/settings.py`: `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`,
 `ALLOWED_HOSTS`, `DATABASE_URL`, `SENTRY_DSN`, and the `AWS_*` block (Cloudflare R2) all fall back to
 local-dev defaults when unset. The local DB is Postgres (`inventory` on localhost:5432, user
-`postgres`). `CORS_ALLOW_ALL_ORIGINS = True` is still on — dev-only, flag it rather than fixing it as a
-drive-by change.
+`postgres`). `CORS_ALLOW_ALL_ORIGINS` follows `DEBUG` since Phase 8, and `CORS_ALLOWED_ORIGINS` is
+read from the environment (comma-separated) with the Vite dev origins as the fallback — so adding a
+production domain is a config change, not a deploy.
+
+`DJANGO_SECRET_KEY` and `DJANGO_DEBUG` both fall back to their **unsafe** values, which Phase 8
+recorded as F-06 and deliberately did not "fix": a deploy missing `DJANGO_SECRET_KEY` runs on the key
+committed here, and `SIMPLE_JWT` has no separate `SIGNING_KEY`, so that key signs every token. Adding
+a refuse-to-boot guard needs confirmation that the variable is set on Heroku first — otherwise the
+guard takes production down on the next release.
 
 **This app is deployed** (Heroku, with WhiteNoise serving the built React app and R2 for media).
 Deployment steps are not in scope for routine work — never run migrations, resets, or config changes
@@ -69,8 +76,7 @@ Things loosened deliberately for local development. Check each before a producti
    *This one cannot reach production by itself:* `server.*` configures the Vite dev server only,
    and `vite build` ignores it, so nothing in `dist/` is affected. The exposure is the local
    machine while a tunnel is actually running — treat the tunnel as public, because it is.
-2. **`CORS_ALLOW_ALL_ORIGINS = True`** in `ims/settings.py` — this one *does* ship. Flagged for
-   Phase 8 (`PLAN.md`), not to be fixed as a drive-by change.
+2. ~~**`CORS_ALLOW_ALL_ORIGINS = True`**~~ — fixed in Phase 8; it now follows `DEBUG`.
 3. **`BILLING_PRICE_MONTHLY_USD` / `BILLING_PRICE_ONE_TIME_USD`** — the committed `15` / `299` are
    display-only placeholders, not agreed pricing. See the Phase 2.5 section.
 
@@ -181,8 +187,9 @@ code with the API export views, so a formula/format fix usually needs to happen 
 **Full design:** `docs/superpowers/specs/2026-08-07-saas-single-db-migration-design.md`
 **Completed work log:** `HISTORY.md` — read it at session start.
 
-**Status:** Phases 1–7 complete. **Phase 8** (security audit) is gated on the user installing the
-scanning tools — see `PLAN.md`, Task 8.0; do not start it before they confirm.
+**Status:** Phases 1–8 complete. One item from Phase 8 is deliberately open and needs an owner
+decision — F-06, the `DJANGO_SECRET_KEY` boot guard; see the Settings note above and the findings
+report.
 **Phase 2.5b-2** remains blocked on Paddle merchant approval; see the PAUSE STATUS below.
 
 Phases are a dependency chain. 3–5 all touch models that Phase 2 restructures, so running them out of
@@ -334,9 +341,15 @@ import, or the constraint dropped) rather than silently taking the first match. 
 through `maxQuantityFor` so Phase 1's stock cap still holds; purchase scans are uncapped, because a
 purchase adds stock.
 
-### Phase 8 — Security audit — **blocked, by design**
-Do not start. `PLAN.md` Task 8.0 requires the user to install `pip-audit`, `bandit` and `semgrep`
-and confirm before any Phase 8 work begins.
+### Phase 8 — Security audit — **done**
+Findings: `docs/superpowers/specs/2026-08-09-phase-8-security-audit-findings.md`. See `HISTORY.md`.
+
+Fixed: an unscoped nested product-image route (**cross-account read and write** — the most serious
+bug found in the project, and no scanner saw it; the isolation matrix did), CSV formula injection in
+4 of the 5 exporters, CORS wide open outside `DEBUG`, and unthrottled CSV exports.
+
+Open by design: **F-06**, the `SECRET_KEY`/`DEBUG` fail-open default. Needs confirmation that
+`DJANGO_SECRET_KEY` is set on Heroku before a boot guard can be added safely.
 
 ### Phase 4 — Barcodes — **done**
 Optional indexed `Product.barcode` in `ProductViewSet.search_fields`, so `?search=` covers it. Form
@@ -482,8 +495,25 @@ Append here when something bites. Do not repeat these.
   validator — the constraint then surfaces as an uncaught `IntegrityError` 500 instead of a 400. See
   `AccountUniqueNameMixin` and `ProductSerializer.validate_barcode`. Both strip before comparing,
   because the model strips before storing.
-- **`react-router-dom` has 2 open high-severity advisories** (`npm audit`). `npm audit fix --force`
-  downgrades to 7.11.0, a breaking change — left alone deliberately; raise it as its own decision.
+- **Scanners do not find authorization bugs.** Phase 8's worst finding — an unscoped nested route
+  allowing cross-account read *and* write — was invisible to semgrep, bandit and pip-audit, because
+  it looks like ordinary ORM code. It took a test that crossed the tenant boundary. Run the matrix
+  (`inventory.tests.TenantIsolationMatrixTests`), and add any new scoped collection to its
+  `RESOURCES` list.
+- **Overriding `get_queryset()` on a scoped viewset silently opts out of `AccountScopedMixin`.**
+  Always chain through `super().get_queryset()`. `ProductImageViewSet` declared
+  `account_lookup = 'product__account'` and never reached it for four phases, which made the viewset
+  *look* scoped. A nested route also needs the parent checked in `perform_create` — queryset scoping
+  governs reads only, and the parent id comes off the URL.
+- **`csv_format.text()` escapes formula-leading cells; never apply it to `money()` output.** `-`
+  leads a formula and also leads a negative line profit, so escaping money emits `'-6.00` and turns
+  the numeric columns back into text — undoing the redesign that made them summable.
+- **DRF caches throttle rates in a class attribute.** `override_settings(REST_FRAMEWORK=…)` does not
+  change them: `SimpleRateThrottle.THROTTLE_RATES` is bound at import and `api_settings` rebuilds a
+  different dict. Patch `ScopedRateThrottle.THROTTLE_RATES` in place instead.
+- **`settings.DEBUG` is forced to `False` by the test runner**, *after* `ims/settings.py` has been
+  imported. Anything derived from `DEBUG` at import time therefore cannot be asserted in-process —
+  check it in a subprocess, or the test proves nothing about production.
 - **`@zxing/library` must stay behind `await import()`.** A top-level import puts ~450 kB into every
   page load of a bundle already past Vite's size warning. Measured: the entry chunk grows ~5 kB and
   the library gets its own chunk. Check `npm run build` output after touching a scanner call site.
