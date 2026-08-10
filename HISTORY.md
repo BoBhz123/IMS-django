@@ -8,6 +8,63 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-10 — Account menu and OTP password reset
+
+An account menu replaces the bare Sign out button, and `/settings` carries a three-screen password
+reset driven by the same emailed 6-digit code Phase 2.5a built for onboarding.
+
+**Codes are now scoped by `purpose`.** Reusing `EmailVerification` for a second flow without a
+discriminator breaks three ways: a signup code can be spent at the password-reset endpoint,
+requesting a reset silently expires a signup code the user is halfway through typing, and both flows
+share one five-sends-per-hour budget so using either exhausts the other. Every query in
+`accounts/verification.py` now filters on it, the throttle scopes are separate for the same reason,
+and the field defaults to `email_verification` — which is what makes the backfill correct, since
+every row predating it came from signup.
+
+**The three screens are not three decisions.** The obvious build gives step 2 a verify endpoint and
+step 3 a "set password" endpoint that trusts it, which makes the code decorative: anyone holding a
+borrowed session skips to step 3 and locks the owner out. Here `confirm/` takes the code *and* the
+new password in one request and consumes the code there, so the decision is made exactly once.
+Step 2 exists only so a typo is caught before the user is asked to think up a password, and it
+checks with `consume=False` so the code survives to be spent. A wrong guess at that endpoint still
+counts against the attempt cap — not counting would make it a free oracle for grinding six digits.
+`test_a_valid_session_alone_cannot_change_the_password` is the test that pins this.
+
+**Password rules run before the code is spent.** The other order costs a user who picks something
+Django's validators dislike a fresh email and a 60-second wait, which reads as the app being broken.
+Validation goes through the configured `AUTH_PASSWORD_VALIDATORS`, not a hand-rolled length check,
+so this flow cannot become the one way into the app that accepts `12345`.
+
+**A reset blacklists every outstanding refresh token.** Resetting is what someone does when they
+think they are compromised; the SPA holds JWTs, and a refresh token issued beforehand stays valid
+for its full 30 days unless blacklisted, so without this the reset locks out nobody. Access tokens
+already issued still run out their remaining hours — closing that needs a revocation check on every
+request, which is a larger change, and is stated here rather than left as a silent gap.
+
+The flow sheds `HasActiveSubscription` as well as being authenticated: changing a password is not a
+paid feature, and someone who thinks their account is compromised must be able to secure it. It is
+not open to anonymous callers, which is why the enumeration problem a forgot-password endpoint has
+does not exist here — the code goes to the address on file for the authenticated user.
+
+**Menu, not a button.** Sign out sat one mis-tap from the theme toggle in both the dock and the
+mobile chrome. It now costs a deliberate second tap, which is the right price for the only
+irreversible control in the shell. Escape returns focus to the trigger rather than stranding a
+keyboard user with nothing focused.
+
+`lib/passwordReset.js` holds the step and validation logic so it is testable without React, matching
+`lib/onboarding.js`. Its `errorMessage` reads DRF's two shapes — `{detail}` for a flow error and
+`{field: [messages]}` for a rejected password — because reading only `detail` renders
+`[object Object]` for exactly the case that matters most.
+
+**Known limitation:** a lapsed account cannot reach `/settings` in the SPA, because
+`routeForAccountStatus` sends any unpaid status to `/subscription` before the app shell renders. The
+API allows it; only the router does not. Loosening that would put a hole in the paywall, so it is
+recorded rather than fixed.
+
+Verified: `manage.py test` 318 passed; `npm test` 178 passed; lint and build clean.
+
+---
+
 ## 2026-08-10 — Barcodes are unique per account
 
 Reversing Phase 4's decision at the owner's direction: every product carries its own barcode, so

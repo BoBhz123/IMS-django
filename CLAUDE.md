@@ -371,6 +371,17 @@ it was judged the larger risk. That redesign also made all money numeric, added 
 
 Append here when something bites. Do not repeat these.
 
+- **`EmailVerification` rows are scoped by `purpose`.** Any new query against that table must filter
+  on it, or a code issued for one flow becomes spendable in another and the two flows start expiring
+  each other's outstanding codes and sharing one hourly send budget. `issue_code`/`verify_code` both
+  take `purpose`; the default is `email_verification` only because that flow predates the field.
+- **A multi-step OTP flow must not spread its decision across steps.** If the endpoint that changes
+  something trusts an earlier "verify" call, being authenticated is enough to skip the code entirely
+  and the extra screens are theatre. `PasswordResetConfirmView` takes the code and the new password in
+  one request; `PasswordResetVerifyView` uses `consume=False` and grants nothing. Keep it that way.
+- **Changing a password must blacklist outstanding refresh tokens.** The SPA holds JWTs, so Django's
+  session invalidation does nothing here, and a refresh token issued before the change stays valid for
+  30 days. `accounts/views.py::_revoke_refresh_tokens`.
 - **`CLAUDE.md` was badly stale** (2026-08-07): described MySQL, no frontend, no multi-tenancy, and a
   Pipfile missing `djoser`. All four were wrong. Verify this file against the code before trusting it,
   and update it when the architecture moves.

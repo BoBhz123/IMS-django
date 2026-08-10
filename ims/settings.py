@@ -245,6 +245,11 @@ REST_FRAMEWORK = {
         'verify_email': '30/hour',
         'resend_code': '10/hour',
         'redeem_key': '20/hour',
+        # Must stay comfortably above verification.MAX_ATTEMPTS (5), or a user who mistypes
+        # gets a 429 where they should get "request a new code". The verify scope covers the
+        # check and the confirm endpoint together, since both take the same code.
+        'password_reset_request': '10/hour',
+        'password_reset_verify': '30/hour',
     },
 }
 

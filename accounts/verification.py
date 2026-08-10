@@ -28,6 +28,10 @@ EXPIRED = 'expired'
 LOCKED = 'locked'
 NO_CODE = 'no_code'
 
+# Re-exported from the model so callers have one name to import alongside issue/verify.
+EMAIL_VERIFICATION = EmailVerification.EMAIL_VERIFICATION
+PASSWORD_RESET = EmailVerification.PASSWORD_RESET
+
 
 class ResendThrottled(Exception):
     def __init__(self, retry_after):
@@ -47,14 +51,18 @@ def hash_code(code):
     ).hexdigest()
 
 
-def issue_code(user):
+def issue_code(user, purpose=EMAIL_VERIFICATION):
     """
     Returns (row, plaintext_code). The plaintext exists only long enough to be emailed and is
     never persisted or logged. Raises ResendThrottled.
+
+    Every query here is scoped to `purpose`: the cooldown, the hourly cap and the expiry of
+    outstanding codes are all per flow. Sharing them would mean a password reset request
+    silently killing a signup code the user is halfway through typing.
     """
     now = timezone.now()
     window = EmailVerification.objects.filter(
-        user=user, created_at__gt=now - timedelta(hours=1),
+        user=user, purpose=purpose, created_at__gt=now - timedelta(hours=1),
     )
 
     latest = window.order_by('-created_at').first()
@@ -68,21 +76,31 @@ def issue_code(user):
         raise ResendThrottled(max(int(remaining.total_seconds()) + 1, 1))
 
     # Expire anything still outstanding, so a code the user abandoned cannot be used later.
-    EmailVerification.objects.filter(user=user, consumed_at__isnull=True).update(expires_at=now)
+    EmailVerification.objects.filter(
+        user=user, purpose=purpose, consumed_at__isnull=True,
+    ).update(expires_at=now)
 
     code = generate_code()
     row = EmailVerification.objects.create(
-        user=user, code_hash=hash_code(code), created_at=now, expires_at=now + CODE_TTL,
+        user=user, purpose=purpose, code_hash=hash_code(code),
+        created_at=now, expires_at=now + CODE_TTL,
     )
     return row, code
 
 
-def verify_code(user, code):
-    """Returns OK / INVALID / EXPIRED / LOCKED / NO_CODE. Never raises on bad input."""
+def verify_code(user, code, purpose=EMAIL_VERIFICATION, consume=True):
+    """
+    Returns OK / INVALID / EXPIRED / LOCKED / NO_CODE. Never raises on bad input.
+
+    `consume=False` checks a code without spending it, so a multi-screen flow can tell the
+    user about a typo before asking them for anything else. It is not a weaker check: a wrong
+    guess still counts against MAX_ATTEMPTS, or the check would be a free oracle to grind the
+    six-digit space against.
+    """
     now = timezone.now()
     row = (
         EmailVerification.objects
-        .filter(user=user, consumed_at__isnull=True)
+        .filter(user=user, purpose=purpose, consumed_at__isnull=True)
         .order_by('-created_at')
         .first()
     )
@@ -99,6 +117,7 @@ def verify_code(user, code):
         EmailVerification.objects.filter(pk=row.pk).update(attempts=F('attempts') + 1)
         return INVALID
 
-    row.consumed_at = now
-    row.save(update_fields=['consumed_at'])
+    if consume:
+        row.consumed_at = now
+        row.save(update_fields=['consumed_at'])
     return OK

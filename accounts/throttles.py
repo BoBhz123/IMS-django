@@ -18,6 +18,24 @@ class ResendCodeThrottle(ScopedRateThrottle):
     scope = 'resend_code'
 
 
+class PasswordResetRequestThrottle(ScopedRateThrottle):
+    """
+    Separate scope from resend_code, matching the separate purpose on the code itself. A
+    shared scope would let signup resends eat the budget for securing a compromised account.
+    """
+
+    scope = 'password_reset_request'
+
+
+class PasswordResetVerifyThrottle(ScopedRateThrottle):
+    """
+    Covers both the check and the confirm endpoint, which is the point: they take the same
+    credential, so throttling only one leaves the other as the way to grind it.
+    """
+
+    scope = 'password_reset_verify'
+
+
 class RedeemKeyThrottle(ScopedRateThrottle):
     """
     The key space is about 10^17, so this is not the primary defence — it exists so a
