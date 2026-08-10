@@ -1,6 +1,6 @@
 import { useState } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
-import { Lock, User } from 'lucide-react'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
+import { Lock, Mail } from 'lucide-react'
 import { useAuth } from '@/context/AuthContext'
 import { GlassCard } from '@/components/ui/GlassCard'
 
@@ -8,7 +8,9 @@ export function Login() {
   const { login } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
-  const [username, setUsername] = useState('')
+  // The email *is* the username: AUTH_USER_MODEL was not swapped, so simplejwt still
+  // authenticates against the username column and login() posts this into it.
+  const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState(null)
   const [submitting, setSubmitting] = useState(false)
@@ -18,10 +20,10 @@ export function Login() {
     setSubmitting(true)
     setError(null)
     try {
-      await login(username, password)
+      await login(email, password)
       navigate(location.state?.from?.pathname ?? '/', { replace: true })
     } catch {
-      setError('Incorrect username or password.')
+      setError('Incorrect email or password.')
     } finally {
       setSubmitting(false)
     }
@@ -48,15 +50,15 @@ export function Login() {
         </div>
 
         <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-          <Field icon={User} label="Username">
+          <Field icon={Mail} label="Email">
             <input
-              type="text"
-              autoComplete="username"
-              value={username}
-              onChange={(event) => setUsername(event.target.value)}
+              type="email"
+              autoComplete="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
               required
               className="w-full bg-transparent text-[14px] text-text-primary placeholder:text-text-tertiary focus:outline-none"
-              placeholder="admin"
+              placeholder="you@example.com"
             />
           </Field>
 
@@ -82,6 +84,13 @@ export function Login() {
             {submitting ? 'Signing in…' : 'Sign In'}
           </button>
         </form>
+
+        <p className="mt-6 text-center text-[13px] text-text-secondary">
+          New here?{' '}
+          <Link to="/signup" className="font-medium text-accent-blue hover:underline">
+            Create an account
+          </Link>
+        </p>
       </GlassCard>
     </div>
   )

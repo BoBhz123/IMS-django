@@ -11,7 +11,8 @@ from .views import spa_index
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('inventory/', include('inventory.urls')),
-    path('tenants/', include('tenants.urls')),
+    path('accounts/', include('accounts.urls')),
+    path('billing/', include('accounts.billing.urls')),
 
     # Djoser Authentication Endpoints
     path('auth/', include('djoser.urls')),
@@ -32,10 +33,10 @@ if settings.DEBUG:
 # an image/png was expected — which the browser correctly refuses to render as an image.
 # django.views.static.serve itself has no such guard, so calling it directly here serves
 # unconditionally, regardless of DEBUG. This app has no other route for locally-stored media
-# (no nginx/whitenoise-for-media, and S3/R2 isn't provisioned yet) — still not a
-# production-grade solution on its own (Heroku's ephemeral filesystem means locally-stored
-# uploads don't survive a dyno restart/deploy) — see ims/storage.py's TenantS3Storage, which
-# activates automatically once AWS_STORAGE_BUCKET_NAME is set.
+# (no nginx/whitenoise-for-media) — and it is not a production-grade solution on its own
+# (Heroku's ephemeral filesystem means locally-stored uploads don't survive a dyno
+# restart/deploy) — see ims/storage.py's MediaS3Storage, which takes over automatically once
+# AWS_STORAGE_BUCKET_NAME is set.
 urlpatterns += [
     re_path(
         r'^%s(?P<path>.*)$' % re.escape(settings.MEDIA_URL.lstrip('/')),

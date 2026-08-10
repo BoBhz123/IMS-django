@@ -73,16 +73,11 @@ SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 # Application definition
 
-# Multi-tenancy (django-tenants): apps in SHARED_APPS live only in the public schema
-# (shared login, admin, tenant registry); apps in TENANT_APPS are migrated into every
-# tenant's own PostgreSQL schema, giving each tenant fully isolated data. `inventory`
-# is tenant-scoped — that's the actual per-tenant business data (Products, Orders, ...).
-# `django.contrib.contenttypes` is listed in both, per django-tenants convention, since
-# tenant-schema models may need a local ContentType table.
-SHARED_APPS = [
-    'django_tenants',  # mandatory, must be first
-    'tenants',  # app holding the Tenant/Domain models
-
+# Single database, one schema. Data ownership is an `account` foreign key on every
+# business model (see accounts/models.py), not a Postgres schema — see
+# docs/superpowers/specs/2026-08-07-saas-single-db-migration-design.md for why the
+# schema-per-tenant setup was removed.
+INSTALLED_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -97,6 +92,9 @@ SHARED_APPS = [
     'corsheaders',
     'djoser',
     'axes',
+    #local apps
+    'accounts',
+    'inventory',
     #dev apps
     'playground',
 ]
@@ -106,25 +104,7 @@ SHARED_APPS = [
 # middleware short-circuits on DEBUG=False anyway, so gating both here changes nothing
 # locally and removes it entirely from the deployed app.
 if DEBUG:
-    SHARED_APPS.append('debug_toolbar')
-
-TENANT_APPS = [
-    'django.contrib.contenttypes',
-    #local apps
-    'inventory',
-]
-
-INSTALLED_APPS = list(SHARED_APPS) + [app for app in TENANT_APPS if app not in SHARED_APPS]
-
-TENANT_MODEL = 'tenants.Tenant'
-TENANT_DOMAIN_MODEL = 'tenants.Domain'
-
-DATABASE_ROUTERS = ('django_tenants.routers.TenantSyncRouter',)
-
-# Base domain new tenants are provisioned under (see tenants/views.py::TenantOnboardingView),
-# i.e. a tenant with schema_name "company" gets domain "company.myimsapp.com". Override via
-# env var for other deployments; this app's only real production domain is myimsapp.com.
-TENANT_BASE_DOMAIN = os.environ.get('TENANT_BASE_DOMAIN', 'myimsapp.com')
+    INSTALLED_APPS.append('debug_toolbar')
 
 AUTHENTICATION_BACKENDS = [
     'axes.backends.AxesStandaloneBackend',
@@ -132,7 +112,6 @@ AUTHENTICATION_BACKENDS = [
 ]
 
 MIDDLEWARE = [
-    'django_tenants.middleware.main.TenantMainMiddleware',  # must run first — sets the DB schema for the request
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
@@ -174,7 +153,7 @@ WSGI_APPLICATION = 'ims.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django_tenants.postgresql_backend',
+        'ENGINE': 'django.db.backends.postgresql',
         'NAME': 'inventory',
         'HOST': 'localhost',
         'PORT': '5432',
@@ -183,11 +162,10 @@ DATABASES = {
     }
 }
 
-# Heroku (and any other DATABASE_URL-based host) sets DATABASE_URL — parse it if present,
-# forcing the tenant-aware engine (dj_database_url would otherwise default to plain
-# django.db.backends.postgresql, which breaks schema routing entirely). Local dev has no
-# DATABASE_URL, so config() returns {} and the DATABASES['default'] block above is unchanged.
-_database_url_config = dj_database_url.config(engine='django_tenants.postgresql_backend')
+# Heroku (and any other DATABASE_URL-based host) sets DATABASE_URL — parse it if present.
+# Local dev has no DATABASE_URL, so config() returns {} and the DATABASES['default'] block
+# above is unchanged.
+_database_url_config = dj_database_url.config()
 if _database_url_config:
     DATABASES['default'] = _database_url_config
 
@@ -248,9 +226,39 @@ REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
+    # Per-model Django permissions were a proxy for "may this person use the app" in a
+    # single-tenant install. In SaaS the real gates are account scoping (which row can you
+    # see) and subscription status (may you see anything at all). Per-model roles come back
+    # when accounts get staff members with different capabilities.
     'DEFAULT_PERMISSION_CLASSES': (
-        'inventory.permissions.FullDjangoModelPermissions', 
-    )
+        'rest_framework.permissions.IsAuthenticated',
+        'accounts.permissions.HasActiveSubscription',
+    ),
+    # Opt-in per view rather than a global default. The inventory API is already gated by
+    # authentication plus subscription, and a blanket rate limit there would throttle the
+    # dashboard's own burst of parallel requests on page load.
+    #
+    # verify_email must stay well above verification.MAX_ATTEMPTS, or a legitimately
+    # locked-out user gets a 429 instead of the "request a new code" message that tells them
+    # what to do.
+    'DEFAULT_THROTTLE_RATES': {
+        'verify_email': '30/hour',
+        'resend_code': '10/hour',
+        'redeem_key': '20/hour',
+        # Must stay comfortably above verification.MAX_ATTEMPTS (5), or a user who mistypes
+        # gets a 429 where they should get "request a new code". The verify scope covers the
+        # check and the confirm endpoint together, since both take the same code.
+        'password_reset_request': '10/hour',
+        'password_reset_verify': '30/hour',
+    },
+}
+
+
+DJOSER = {
+    'SERIALIZERS': {
+        'user_create': 'accounts.serializers.UserCreateWithAccountSerializer',
+        'user_create_password_retype': 'accounts.serializers.UserCreateWithAccountSerializer',
+    },
 }
 
 
@@ -306,15 +314,11 @@ WHITENOISE_ROOT = BASE_DIR / 'frontend' / 'dist'
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
-# Namespaces every uploaded file (e.g. ProductImage) under media/<tenant_schema_name>/...
-# instead of a single shared media/ tree, so tenants can never see each other's uploads —
-# matching the schema-level isolation `inventory` already has. "%s" is where django-tenants
-# inserts the active tenant's schema_name (see django_tenants.utils.parse_tenant_config_path).
-MULTITENANT_RELATIVE_MEDIA_ROOT = '%s'
-
+# Uploads are namespaced per account by ProductImage's upload_to callable
+# (inventory.models.product_image_path), not by the storage backend.
 STORAGES = {
     'default': {
-        'BACKEND': 'django_tenants.files.storage.TenantFileSystemStorage',
+        'BACKEND': 'django.core.files.storage.FileSystemStorage',
     },
     'staticfiles': {
         'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
@@ -322,8 +326,8 @@ STORAGES = {
 }
 
 # Cloudflare R2 / AWS S3 (both speak the S3 API — set AWS_S3_ENDPOINT_URL for R2, leave
-# unset for real AWS S3) for production media, still namespaced per tenant — see
-# ims.storage.TenantS3Storage. Sourced entirely from env vars: nothing here is a real
+# unset for real AWS S3) for production media — see ims.storage.MediaS3Storage.
+# Sourced entirely from env vars: nothing here is a real
 # credential. Only takes effect when AWS_STORAGE_BUCKET_NAME is actually set (Heroku config
 # vars); local dev has none of these set, so STORAGES['default'] above is left as-is.
 AWS_STORAGE_BUCKET_NAME = os.environ.get('AWS_STORAGE_BUCKET_NAME')
@@ -342,13 +346,28 @@ AWS_DEFAULT_ACL = None  # R2 doesn't support canned ACLs the way S3 does
 AWS_QUERYSTRING_AUTH = False  # serve plain URLs, not presigned ones
 
 if AWS_STORAGE_BUCKET_NAME:
-    STORAGES['default']['BACKEND'] = 'ims.storage.TenantS3Storage'
+    STORAGES['default']['BACKEND'] = 'ims.storage.MediaS3Storage'
 
+# Resend over plain SMTP (smtp.resend.com:587, user 'resend', password = the API key), so
+# Django's own backend is reused and no SDK dependency is added. Left unset, these fall back
+# to the local smtp4dev container.
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-EMAIL_HOST = 'localhost'
-EMAIL_PORT = 25  # Matches the smtp4dev container port mapping
-EMAIL_HOST_USER = ''
-EMAIL_HOST_PASSWORD = ''
-EMAIL_USE_TLS = False
-EMAIL_USE_SSL = False
-DEFAULT_FROM_EMAIL = 'ims-system@local.test'
+EMAIL_HOST = os.environ.get('EMAIL_HOST', 'localhost')
+EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '25'))  # 25 matches smtp4dev's port mapping
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'False') == 'True'
+EMAIL_USE_SSL = os.environ.get('EMAIL_USE_SSL', 'False') == 'True'
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'ims-system@local.test')
+
+# --- Billing -------------------------------------------------------------------------
+# 'dummy' refuses card checkout and leaves discount keys as the only activation route.
+# 'paddle' is reserved for Phase 2.5b-2 and currently raises ImproperlyConfigured rather
+# than half-working.
+BILLING_PROVIDER = os.environ.get('BILLING_PROVIDER', 'dummy')
+
+# Display only — what the plan cards show. The server never accepts an amount from the
+# client; when Paddle lands, the charged amount comes from a configured price id, and these
+# exist purely so the SPA has something to render.
+BILLING_PRICE_MONTHLY_USD = os.environ.get('BILLING_PRICE_MONTHLY_USD', '15')
+BILLING_PRICE_ONE_TIME_USD = os.environ.get('BILLING_PRICE_ONE_TIME_USD', '299')

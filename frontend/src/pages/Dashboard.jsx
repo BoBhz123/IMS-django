@@ -6,7 +6,6 @@ import {
   fillSeriesGaps,
   formatDate,
   formatPeriodLabel,
-  parseMoney,
   shortId,
 } from '@/lib/format'
 import { useCurrency } from '@/context/CurrencyContext'
@@ -38,7 +37,12 @@ function toChartSeries(series, granularity) {
   return series.map((row) => ({
     label: formatPeriodLabel(row.period, granularity),
     revenue: row.total_revenue,
+    // Purchases. The series deliberately keeps the total_costs key while the summary tile
+    // renamed to inventory_outlays — here it sits nowhere near a COGS figure.
     cost: row.total_costs,
+    expenses: row.total_expenses ?? 0,
+    grossProfit: row.gross_profit ?? 0,
+    netProfit: row.net_profit ?? 0,
   }))
 }
 
@@ -219,15 +223,16 @@ export function Dashboard() {
 
   const { carouselTabs, sparkline, recentOrders, productsCount } = state.data
   const stats = statsState.data
-  const periodRevenue = stats ? parseMoney(stats.value.total_revenue) : 0
-  const periodCost = stats ? parseMoney(stats.value.total_costs) : 0
-  const periodProfit = stats ? parseMoney(stats.value.net_profit) : 0
-  const currentRevenue = stats ? parseMoney(stats.current.total_revenue) : 0
-  const previousRevenue = stats ? parseMoney(stats.previous.total_revenue) : 0
-  const currentCost = stats ? parseMoney(stats.current.total_costs) : 0
-  const previousCost = stats ? parseMoney(stats.previous.total_costs) : 0
-  const currentProfit = currentRevenue - currentCost
-  const previousProfit = previousRevenue - previousCost
+  // Analytics money arrives as raw numbers since Phase 3. It used to be pre-formatted as
+  // "$1,234.00" and parsed straight back out here so the LBP toggle could reformat it.
+  const money = (source, key) => (stats ? Number(stats[source][key] ?? 0) : 0)
+
+  // Each delta compares the server's own figure for each window. The profit delta used to be
+  // computed here as revenue − purchases, which was the cash-flow definition wearing the
+  // profit label — the confusion this phase set out to remove.
+  const delta = (key, goodWhenUp) =>
+    percentDelta(money('current', key), money('previous', key), goodWhenUp)
+
   const deltaLabel = stats?.deltaLabel ?? 'vs. last month'
   const statsLoading = statsState.status === 'loading'
 
@@ -241,33 +246,52 @@ export function Dashboard() {
       </div>
 
       <div
-        className={`grid grid-cols-2 gap-4 lg:grid-cols-4 transition-opacity ${statsLoading ? 'opacity-60' : ''}`}
+        className={`grid grid-cols-2 gap-4 lg:grid-cols-3 transition-opacity ${statsLoading ? 'opacity-60' : ''}`}
       >
         <StatTile
           index={0}
           label="Total revenue"
-          value={formatAmount(periodRevenue)}
-          delta={percentDelta(currentRevenue, previousRevenue, true)}
+          value={formatAmount(money('value', 'total_revenue'))}
+          delta={delta('total_revenue', true)}
           deltaLabel={deltaLabel}
           sparkline={sparkline.map((t) => t.revenue)}
         />
+        {/* The profit tiles draw real per-period figures: the series carries COGS since
+            Phase 6, so gross and net profit are computed the same way here as in the
+            summary rather than approximated from revenue minus purchases. */}
         <StatTile
           index={1}
-          label="Total costs"
-          value={formatAmount(periodCost)}
-          delta={percentDelta(currentCost, previousCost, false)}
+          label="Gross profit"
+          value={formatAmount(money('value', 'gross_profit'))}
+          delta={delta('gross_profit', true)}
           deltaLabel={deltaLabel}
-          sparkline={sparkline.map((t) => t.cost)}
+          sparkline={sparkline.map((t) => t.grossProfit)}
         />
         <StatTile
           index={2}
-          label="Net profit"
-          value={formatAmount(periodProfit)}
-          delta={percentDelta(currentProfit, previousProfit, true)}
+          label="Expenses"
+          value={formatAmount(money('value', 'total_expenses'))}
+          delta={delta('total_expenses', false)}
           deltaLabel={deltaLabel}
-          sparkline={sparkline.map((t) => t.revenue - t.cost)}
+          sparkline={sparkline.map((t) => t.expenses)}
         />
-        <StatTile index={3} label="Products in catalog" value={productsCount.toLocaleString()} />
+        <StatTile
+          index={3}
+          label="Net profit"
+          value={formatAmount(money('value', 'net_profit'))}
+          delta={delta('net_profit', true)}
+          deltaLabel={deltaLabel}
+          sparkline={sparkline.map((t) => t.netProfit)}
+        />
+        <StatTile
+          index={4}
+          label="Inventory outlays"
+          value={formatAmount(money('value', 'inventory_outlays'))}
+          delta={delta('inventory_outlays', false)}
+          deltaLabel={deltaLabel}
+          sparkline={sparkline.map((t) => t.cost)}
+        />
+        <StatTile index={5} label="Products in catalog" value={productsCount.toLocaleString()} />
       </div>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
@@ -343,8 +367,8 @@ function RecentOrdersTable({ orders }) {
 function DashboardSkeleton() {
   return (
     <div className="flex flex-col gap-6">
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        {Array.from({ length: 4 }).map((_, i) => (
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-3">
+        {Array.from({ length: 6 }).map((_, i) => (
           <div key={i} className="h-24 animate-pulse rounded-squircle bg-canvas-2" />
         ))}
       </div>

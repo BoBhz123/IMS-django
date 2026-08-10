@@ -4,23 +4,26 @@ import { motion } from 'framer-motion'
 import {
   Building2,
   LayoutDashboard,
-  LogOut,
   Moon,
   Package,
+  Receipt,
   ShoppingCart,
   Sun,
+  Tags,
   Truck,
   Users,
 } from 'lucide-react'
 import { useTheme } from '@/context/ThemeContext'
-import { useAuth } from '@/context/AuthContext'
 import { useCurrency } from '@/context/CurrencyContext'
+import { UserMenu } from './UserMenu'
 
 export const NAV_ITEMS = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
   { to: '/products', label: 'Products', icon: Package },
+  { to: '/categories', label: 'Categories', icon: Tags },
   { to: '/orders', label: 'Orders', icon: ShoppingCart },
   { to: '/purchases', label: 'Purchases', icon: Truck },
+  { to: '/expenses', label: 'Expenses', icon: Receipt },
   { to: '/customers', label: 'Customers', icon: Users },
   { to: '/suppliers', label: 'Suppliers', icon: Building2 },
 ]
@@ -37,7 +40,6 @@ export function Dock() {
   const [hoveredIndex, setHoveredIndex] = useState(null)
   const { theme, toggleTheme } = useTheme()
   const { currency, toggleCurrency } = useCurrency()
-  const { logout } = useAuth()
 
   return (
     <nav
@@ -63,9 +65,7 @@ export function Dock() {
       <DockButton label={theme === 'dark' ? 'Light mode' : 'Dark mode'} onClick={toggleTheme}>
         {theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}
       </DockButton>
-      <DockButton label="Sign out" onClick={logout}>
-        <LogOut size={18} />
-      </DockButton>
+      <UserMenu placement="right" />
     </nav>
   )
 }

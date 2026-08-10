@@ -60,7 +60,12 @@ function messageFor(error) {
     return 'There was a problem with your request. Please check your input and try again.'
   }
   if (status === 401) return 'Your session has expired. Please sign in again.'
-  if (status === 403) return "You don't have permission to do that."
+  if (status === 403) {
+    // HasActiveSubscription's dict message arrives flat — DRF passes a dict `detail`
+    // straight through as the body rather than nesting it under another `detail`.
+    if (body?.code === 'subscription_expired') return body.detail
+    return "You don't have permission to do that."
+  }
   if (status === 404) return 'That resource could not be found.'
   if (status >= 500) return 'Server error — please try again in a moment.'
   return typeof body?.detail === 'string' ? body.detail : 'Something went wrong. Please try again.'
@@ -83,6 +88,15 @@ api.interceptors.response.use(
     const { config, response } = error
     // The login/refresh endpoints show their own inline errors (see Login.jsx) — don't also toast them.
     const isAuthEndpoint = config?.url?.includes('/auth/jwt/')
+
+    // A lapsed subscription is a billing state, not a failed request — send the app to the
+    // subscribe screen instead of toasting an error on every call the dashboard makes.
+    if (response?.status === 403 && response.data?.code === 'subscription_expired') {
+      if (window.location.pathname !== '/subscription') {
+        window.location.assign('/subscription')
+      }
+      throw error
+    }
 
     if (response?.status !== 401 || config._retried || isAuthEndpoint) {
       if (!isAuthEndpoint) notifyError(error)

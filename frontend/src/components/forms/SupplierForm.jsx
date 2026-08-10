@@ -2,10 +2,22 @@ import { useState } from 'react'
 import { Loader2 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { SlideOver } from '@/components/ui/SlideOver'
+import { useOpenSession } from '@/hooks/useOpenSession'
 
 const emptyForm = { name: '', phone_number: '' }
 
-export function SupplierForm({ open, onClose, onSaved, supplier }) {
+export function SupplierForm({ open, onClose, ...rest }) {
+  // Keyed body: every opening remounts it so the fields go back to their defaults instead of
+  // holding whatever was last submitted. See useOpenSession.
+  const session = useOpenSession(open)
+  return (
+    <SlideOver open={open} onClose={onClose} title={rest.supplier ? 'Edit supplier' : 'Add supplier'}>
+      <SupplierFormBody key={session} onClose={onClose} {...rest} />
+    </SlideOver>
+  )
+}
+
+function SupplierFormBody({ onClose, onSaved, supplier }) {
   const isEdit = Boolean(supplier)
   const [form, setForm] = useState(() =>
     supplier ? { name: supplier.name, phone_number: supplier.phone_number ?? '' } : emptyForm,
@@ -42,27 +54,25 @@ export function SupplierForm({ open, onClose, onSaved, supplier }) {
   }
 
   return (
-    <SlideOver open={open} onClose={onClose} title={isEdit ? 'Edit supplier' : 'Add supplier'}>
-      <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-        <Field label="Name" error={errors.name}>
-          <TextInput value={form.name} onChange={(v) => update('name', v)} required />
-        </Field>
-        <Field label="Phone number" error={errors.phone_number}>
-          <TextInput value={form.phone_number} onChange={(v) => update('phone_number', v)} />
-        </Field>
+    <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+      <Field label="Name" error={errors.name}>
+        <TextInput value={form.name} onChange={(v) => update('name', v)} required />
+      </Field>
+      <Field label="Phone number" error={errors.phone_number}>
+        <TextInput value={form.phone_number} onChange={(v) => update('phone_number', v)} />
+      </Field>
 
-        {errors.detail && <p className="text-[13px] text-accent-red">{errors.detail[0]}</p>}
+      {errors.detail && <p className="text-[13px] text-accent-red">{errors.detail[0]}</p>}
 
-        <button
-          type="submit"
-          disabled={saving}
-          className="mt-2 flex items-center justify-center gap-2 rounded-xl bg-accent-blue py-2.5 text-[14px] font-semibold text-white hover:opacity-90 disabled:opacity-60"
-        >
-          {saving && <Loader2 size={14} className="animate-spin" />}
-          {isEdit ? 'Save changes' : 'Add supplier'}
-        </button>
-      </form>
-    </SlideOver>
+      <button
+        type="submit"
+        disabled={saving}
+        className="mt-2 flex items-center justify-center gap-2 rounded-xl bg-accent-blue py-2.5 text-[14px] font-semibold text-white hover:opacity-90 disabled:opacity-60"
+      >
+        {saving && <Loader2 size={14} className="animate-spin" />}
+        {isEdit ? 'Save changes' : 'Add supplier'}
+      </button>
+    </form>
   )
 }
 

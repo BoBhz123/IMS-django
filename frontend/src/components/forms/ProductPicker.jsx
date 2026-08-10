@@ -3,8 +3,15 @@ import { ChevronDown, Loader2, Search } from 'lucide-react'
 import { ProductThumbnail } from '@/components/ui/ProductThumbnail'
 import { useProductSearch } from '@/hooks/useProductSearch'
 
-/** Native <select> can't render option thumbnails across browsers, so this is a small custom listbox instead. */
-export function ProductPicker({ value, onChange }) {
+/**
+ * Native <select> can't render option thumbnails across browsers, so this is a small custom
+ * listbox instead.
+ *
+ * `selectedName` is the parent's fallback label. The picker only learns a product's name by
+ * being clicked, so a line filled some other way — a barcode scan — would otherwise keep
+ * reading "Select product" while holding a real product id.
+ */
+export function ProductPicker({ value, onChange, selectedName }) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [selectedProduct, setSelectedProduct] = useState(null)
@@ -34,6 +41,12 @@ export function ProductPicker({ value, onChange }) {
     setQuery('')
   }
 
+  // Trust the local copy only while it still describes the id the parent holds — the parent can
+  // change `value` underneath us, and showing the previous product's name and thumbnail would
+  // be worse than showing none.
+  const shown = selectedProduct && String(selectedProduct.id) === String(value) ? selectedProduct : null
+  const shownName = shown?.name || selectedName || ''
+
   return (
     <div ref={rootRef} className="relative min-w-0 flex-1">
       <button
@@ -41,9 +54,9 @@ export function ProductPicker({ value, onChange }) {
         onClick={() => setOpen((o) => !o)}
         className="flex w-full items-center gap-2 rounded-lg border border-hairline bg-canvas px-2 py-1.5 text-left text-[13px] text-text-primary focus:outline-none"
       >
-        <ProductThumbnail image={selectedProduct?.images?.[0]?.image} name={selectedProduct?.name} size="xs" />
-        <span className={`min-w-0 flex-1 truncate ${selectedProduct ? 'text-text-primary' : 'text-text-tertiary'}`}>
-          {selectedProduct ? selectedProduct.name : 'Select product'}
+        <ProductThumbnail image={shown?.images?.[0]?.image} name={shownName} size="xs" />
+        <span className={`min-w-0 flex-1 truncate ${shownName ? 'text-text-primary' : 'text-text-tertiary'}`}>
+          {shownName || 'Select product'}
         </span>
         <ChevronDown size={14} className="shrink-0 text-text-tertiary" />
       </button>
@@ -74,13 +87,21 @@ export function ProductPicker({ value, onChange }) {
                 <button
                   key={product.id}
                   type="button"
+                  disabled={product.stock_quantity <= 0}
                   onClick={() => handleSelect(product)}
-                  className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[13px] hover:bg-canvas-2 ${
+                  className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[13px] enabled:hover:bg-canvas-2 disabled:cursor-not-allowed disabled:opacity-45 ${
                     String(product.id) === String(value) ? 'bg-accent-blue/10 text-accent-blue' : 'text-text-primary'
                   }`}
                 >
                   <ProductThumbnail image={product.images?.[0]?.image} name={product.name} size="xs" />
                   <span className="min-w-0 flex-1 truncate">{product.name}</span>
+                  <span
+                    className={`shrink-0 text-[11px] tabular-nums ${
+                      product.stock_quantity <= 0 ? 'text-accent-red' : 'text-text-tertiary'
+                    }`}
+                  >
+                    {product.stock_quantity <= 0 ? 'Out of stock' : `${product.stock_quantity} left`}
+                  </span>
                 </button>
               ))}
           </div>
