@@ -169,13 +169,20 @@ _database_url_config = dj_database_url.config()
 if _database_url_config:
     DATABASES['default'] = _database_url_config
 
-CORS_ALLOW_ALL_ORIGINS = True
+# Tied to DEBUG rather than left on. A wildcard lets any site on the internet make
+# credentialed cross-origin calls with a victim's browser; it was a dev convenience carried
+# from before this app had accounts, and it is a real exposure the moment auth moves to
+# cookies or a same-site scheme. Local dev is unchanged because DEBUG is True there.
+CORS_ALLOW_ALL_ORIGINS = DEBUG
 
-# Explicit allowlist, kept alongside the wildcard above for when CORS_ALLOW_ALL_ORIGINS
-# is eventually turned off (that flag takes precedence over this list while it's True).
-# Covers the Vite dev server both un-tenanted and via the tenant1 subdomain used for
-# local multi-tenant testing.
+# The production contract. Read from the environment so adding a domain is a config change
+# rather than a code deploy; the literals are the local dev fallback — the Vite dev server
+# both un-tenanted and via the subdomain used for local testing.
 CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',')
+    if origin.strip()
+] or [
     'http://localhost:5173',
     'http://tenant1.localhost:5173',
 ]
@@ -250,6 +257,11 @@ REST_FRAMEWORK = {
         # check and the confirm endpoint together, since both take the same code.
         'password_reset_request': '10/hour',
         'password_reset_verify': '30/hour',
+        # The CSV exports walk every line item an account has ever recorded — the most
+        # expensive request an authenticated caller can make, and the cheapest to repeat in
+        # a loop. 30/hour is far above any real use (the SPA exports on a button press) and
+        # far below what it takes to tie up the database.
+        'exports': '30/hour',
     },
 }
 

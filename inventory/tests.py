@@ -1,7 +1,11 @@
 import csv
-import re
 import io
+import os
+import re
+import subprocess
+import sys
 import tempfile
+from unittest import mock
 from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
 from decimal import Decimal
@@ -12,7 +16,10 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.forms.models import model_to_dict
 from django.db import IntegrityError, transaction
 from django.db.models import Sum
-from django.test import TestCase, override_settings
+from django.conf import settings
+from django.core.cache import cache
+from django.test import Client, TestCase, override_settings
+from rest_framework.throttling import ScopedRateThrottle
 from django.utils import timezone
 from rest_framework.test import APIClient, APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -2492,3 +2499,263 @@ class SubscriptionGateMatrixTests(AccountFixtureMixin, TestCase):
         for path in self.PROTECTED:
             with self.subTest(path=path):
                 self.assertEqual(APIClient().get(path).status_code, 401, path)
+
+
+class CSVFormulaInjectionTests(AccountFixtureMixin, TestCase):
+    """
+    A cell starting '=', '+', '-', '@', tab or CR executes as a formula when the file is
+    opened in Excel, LibreOffice or Sheets. Every exporter writes user-controlled names.
+
+    The path that makes this more than self-harm: the *admin* exports span every account and
+    are opened by the platform superadmin, so any subscriber can name a customer
+    `=HYPERLINK(...)` and attack the platform owner.
+    """
+
+    HOSTILE = '=HYPERLINK("http://attacker","Click")'
+
+    def setUp(self):
+        self.account, self.user, self.client, self.header = self.make_account_user('csvi')
+        self.category = Category.objects.create(name=self.HOSTILE, account=self.account)
+        self.supplier = Supplier.objects.create(name=self.HOSTILE, account=self.account)
+        self.customer = Customer.objects.create(name=self.HOSTILE, account=self.account)
+        self.product = Product.objects.create(
+            name=self.HOSTILE, description='', cost_price='4.00',
+            default_sell_price='10.00', category=self.category, supplier=self.supplier,
+            stock_quantity=100, account=self.account, barcode='=1+1',
+        )
+        order = Order.objects.create(
+            account=self.account, exchange_rate=89000, customer=self.customer,
+        )
+        OrderItem.objects.create(
+            order=order, product=self.product, quantity=1, unit_price=Decimal('10.00'),
+            unit_cost_price=Decimal('4.00'),
+        )
+        purchase = Purchase.objects.create(
+            account=self.account, exchange_rate=89000, supplier=self.supplier,
+        )
+        PurchaseItem.objects.create(
+            purchase_order=purchase, product=self.product, quantity=1,
+            unit_price=Decimal('4.00'),
+        )
+
+    def assert_no_live_formula(self, body, path):
+        for row in csv.reader(io.StringIO(body)):
+            for cell in row:
+                self.assertFalse(
+                    cell.startswith(('=', '+', '@', '\t', '\r')),
+                    f'{path}: cell {cell!r} would execute as a formula',
+                )
+
+    def test_no_export_emits_a_live_formula(self):
+        for path in (
+            '/inventory/orders/export/csv/',
+            '/inventory/purchases/export/csv/',
+            '/inventory/products/export/csv/',
+        ):
+            with self.subTest(path=path):
+                response = self.client.get(path, HTTP_AUTHORIZATION=self.header)
+                self.assertEqual(response.status_code, 200)
+                self.assert_no_live_formula(response.content.decode(), path)
+
+    def test_the_hostile_name_is_still_present_just_defused(self):
+        # Escaping must neutralise the cell, not drop the data — the owner still has to be
+        # able to see which product this is.
+        response = self.client.get(
+            '/inventory/products/export/csv/', HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertIn('HYPERLINK', response.content.decode())
+
+    def test_negative_money_is_not_escaped_into_text(self):
+        # The trap. '-' is in the escape set and money() renders a negative line profit as
+        # '-6.00'. Escaping that would emit "'-6.00", turning the numeric columns back into
+        # text and undoing the export redesign that made them summable.
+        losing = Order.objects.create(account=self.account, exchange_rate=89000)
+        OrderItem.objects.create(
+            order=losing, product=self.product, quantity=1,
+            unit_price=Decimal('1.00'), unit_cost_price=Decimal('7.00'),
+        )
+        response = self.client.get(
+            '/inventory/orders/export/csv/', HTTP_AUTHORIZATION=self.header,
+        )
+        body = response.content.decode()
+        self.assertIn('-6.00', body)
+        self.assertNotIn("'-6.00", body)
+
+    def test_the_admin_exports_are_escaped_too(self):
+        # The two admin actions are separate code with near-identical names; CLAUDE.md warns
+        # that a formula fix usually needs both. This is the half a scanner did not flag.
+        admin_user = User.objects.create_superuser(
+            username='root8', email='root8@example.com', password='pw12345!',
+        )
+        admin_client = Client()
+        admin_client.force_login(admin_user)
+
+        for model, action in (
+            ('order', 'export_orders_to_csv'), ('purchase', 'export_purchases_to_csv'),
+        ):
+            with self.subTest(model=model):
+                ids = [str(row.pk) for row in {
+                    'order': Order, 'purchase': Purchase,
+                }[model].objects.all()]
+                response = admin_client.post(
+                    f'/admin/inventory/{model}/',
+                    {'action': action, '_selected_action': ids},
+                )
+                self.assertEqual(response.status_code, 200, response.status_code)
+                body = b''.join(response.streaming_content).decode() if getattr(
+                    response, 'streaming', False,
+                ) else response.content.decode()
+                self.assert_no_live_formula(body, action)
+
+
+class ExportThrottleTests(AccountFixtureMixin, TestCase):
+    """
+    The exports walk every line item an account has ever recorded — by far the most
+    expensive thing an authenticated caller can ask for, and the cheapest to ask for in a
+    loop.
+    """
+
+    def setUp(self):
+        self.account, self.user, self.client, self.header = self.make_account_user('thr1')
+        self.other_account, _, self.other_client, self.other_header = self.make_account_user(
+            'thr2',
+        )
+
+    def setUp_rates(self, rate):
+        # DRF copies DEFAULT_THROTTLE_RATES into SimpleRateThrottle.THROTTLE_RATES as a class
+        # attribute at import, so override_settings(REST_FRAMEWORK=...) never reaches it —
+        # api_settings rebuilds a new dict while the class keeps the old one. Patching the
+        # dict in place is what actually changes the rate.
+        return mock.patch.dict(ScopedRateThrottle.THROTTLE_RATES, {'exports': rate})
+
+    def test_the_exports_throttle_after_the_configured_rate(self):
+        cache.clear()
+        with self.setUp_rates('3/hour'):
+            statuses = [
+                self.client.get(
+                    '/inventory/orders/export/csv/', HTTP_AUTHORIZATION=self.header,
+                ).status_code
+                for _ in range(4)
+            ]
+        self.assertEqual(statuses[:3], [200, 200, 200])
+        self.assertEqual(statuses[3], 429)
+
+    def test_all_three_exports_share_one_budget(self):
+        # One scope across the three views: they are equally expensive, so a per-view budget
+        # would just mean three times the ceiling for the same database work.
+        cache.clear()
+        with self.setUp_rates('2/hour'):
+            self.client.get('/inventory/orders/export/csv/', HTTP_AUTHORIZATION=self.header)
+            self.client.get('/inventory/purchases/export/csv/', HTTP_AUTHORIZATION=self.header)
+            response = self.client.get(
+                '/inventory/products/export/csv/', HTTP_AUTHORIZATION=self.header,
+            )
+        self.assertEqual(response.status_code, 429)
+
+    def test_one_account_exhausting_its_budget_does_not_affect_another(self):
+        # Per-user, not global. A shared counter would let any one subscriber deny the
+        # export to everyone else on the platform.
+        cache.clear()
+        with self.setUp_rates('2/hour'):
+            for _ in range(3):
+                self.client.get(
+                    '/inventory/orders/export/csv/', HTTP_AUTHORIZATION=self.header,
+                )
+            response = self.other_client.get(
+                '/inventory/orders/export/csv/', HTTP_AUTHORIZATION=self.other_header,
+            )
+        self.assertEqual(response.status_code, 200)
+
+    def test_the_configured_production_rate_is_sane(self):
+        # Above any real use (the SPA exports on a button press), below anything that ties up
+        # the database. Pinned so it cannot drift to a value that throttles normal work.
+        rate = settings.REST_FRAMEWORK['DEFAULT_THROTTLE_RATES']['exports']
+        count, _, period = rate.partition('/')
+        self.assertEqual(period, 'hour')
+        self.assertGreaterEqual(int(count), 10)
+
+
+class CORSConfigurationTests(TestCase):
+    """
+    CORS_ALLOW_ALL_ORIGINS was a dev convenience carried since before there were accounts.
+    It is asserted here rather than merely set, because the failure is silent: a wildcard in
+    production is invisible until someone points it out.
+    """
+
+    def test_the_wildcard_is_off_when_debug_is_off(self):
+        """
+        Evaluated in a subprocess, because the test runner forces settings.DEBUG to False
+        *after* ims.settings has been imported — so in-process the two values can never
+        agree, and asserting on them here would prove nothing about production.
+        """
+        script = (
+            'import django, os; django.setup(); from django.conf import settings; '
+            'print(settings.DEBUG, settings.CORS_ALLOW_ALL_ORIGINS, '
+            'len(settings.CORS_ALLOWED_ORIGINS))'
+        )
+        result = subprocess.run(
+            [sys.executable, '-c', script],
+            capture_output=True, text=True, timeout=120,
+            env={
+                **os.environ,
+                'DJANGO_SETTINGS_MODULE': 'ims.settings',
+                'DJANGO_DEBUG': 'False',
+                'ALLOWED_HOSTS': 'example.com',
+            },
+            cwd=str(settings.BASE_DIR),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        debug, wildcard, allowlist_size = result.stdout.split()
+        self.assertEqual(debug, 'False')
+        self.assertEqual(wildcard, 'False', 'CORS is wide open with DEBUG off')
+        self.assertGreater(int(allowlist_size), 0, 'no allowlist to fall back on')
+
+    def test_the_allowlist_can_be_set_from_the_environment(self):
+        # So adding a domain is a config change, not a code deploy.
+        script = (
+            'import django; django.setup(); from django.conf import settings; '
+            'print(",".join(settings.CORS_ALLOWED_ORIGINS))'
+        )
+        result = subprocess.run(
+            [sys.executable, '-c', script],
+            capture_output=True, text=True, timeout=120,
+            env={
+                **os.environ,
+                'DJANGO_SETTINGS_MODULE': 'ims.settings',
+                'DJANGO_DEBUG': 'False',
+                'ALLOWED_HOSTS': 'example.com',
+                'CORS_ALLOWED_ORIGINS': 'https://a.example.com, https://b.example.com',
+            },
+            cwd=str(settings.BASE_DIR),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(), 'https://a.example.com,https://b.example.com',
+        )
+
+    def test_an_allowlist_exists_for_when_the_wildcard_is_off(self):
+        self.assertTrue(settings.CORS_ALLOWED_ORIGINS)
+
+    def test_an_unlisted_origin_gets_no_allow_origin_header(self):
+        with override_settings(
+            DEBUG=False,
+            CORS_ALLOW_ALL_ORIGINS=False,
+            CORS_ALLOWED_ORIGINS=['https://ims.example.com'],
+        ):
+            response = self.client.get(
+                '/inventory/products/', HTTP_ORIGIN='https://attacker.example',
+            )
+            self.assertNotIn('Access-Control-Allow-Origin', response)
+
+    def test_a_listed_origin_is_allowed(self):
+        with override_settings(
+            DEBUG=False,
+            CORS_ALLOW_ALL_ORIGINS=False,
+            CORS_ALLOWED_ORIGINS=['https://ims.example.com'],
+        ):
+            response = self.client.get(
+                '/inventory/products/', HTTP_ORIGIN='https://ims.example.com',
+            )
+            self.assertEqual(
+                response['Access-Control-Allow-Origin'], 'https://ims.example.com',
+            )

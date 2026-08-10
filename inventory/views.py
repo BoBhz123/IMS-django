@@ -11,10 +11,11 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
 from rest_framework.views import APIView
+from rest_framework.throttling import ScopedRateThrottle
 from .filters import ProductFilter,PurchaseFilter,OrderFilter,ExpenseFilter
 from .pagination import DefaultPagination
 from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order,Expense,LINE_TOTAL,LINE_COGS
-from .csv_format import iso as _iso, money as _money
+from .csv_format import iso as _iso, money as _money, text as _csv_safe
 from .reporting import DateWindow
 from .serializers import *
 import csv
@@ -304,13 +305,12 @@ class AnalyticsView(APIView):
 
      
      
-def _csv_safe(value):
-    if isinstance(value, str) and value.startswith(('=', '+', '-', '@', '\t', '\r')):
-        return "'" + value
-    return value
-
-
 class ExportProductsCSVView(APIView):
+    # Scoped throttle rather than the project default (there is none): these three are
+    # the only endpoints whose cost grows with the account's entire history.
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'exports'
+
     def get(self, request):
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = 'attachment; filename="products_export.csv"'
@@ -362,6 +362,11 @@ class ExportProductsCSVView(APIView):
 
 
 class ExportOrdersCSVView(APIView):
+    # Scoped throttle rather than the project default (there is none): these three are
+    # the only endpoints whose cost grows with the account's entire history.
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'exports'
+
     def get(self, request):
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = 'attachment; filename="orders_detailed_export.csv"'
@@ -429,11 +434,11 @@ class ExportOrdersCSVView(APIView):
 
             writer.writerow([
                 item.order.id,
-                item.order.customer.name if item.order.customer else "No Customer",
+                _csv_safe(item.order.customer.name if item.order.customer else "No Customer"),
                 _iso(item.order.placed_at),
                 item.order.exchange_rate,
-                item.product.name if item.product else "Unknown Product",
-                item.product.barcode or '' if item.product else '',
+                _csv_safe(item.product.name if item.product else "Unknown Product"),
+                _csv_safe(item.product.barcode or '' if item.product else ''),
                 item.quantity,
                 item.unit_multiplier,
                 units,
@@ -454,6 +459,11 @@ class ExportOrdersCSVView(APIView):
     
     
 class ExportPurchasesCSVView(APIView):
+    # Scoped throttle rather than the project default (there is none): these three are
+    # the only endpoints whose cost grows with the account's entire history.
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'exports'
+
     def get(self, request):
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = 'attachment; filename="purchases_detailed_export.csv"'
@@ -506,11 +516,14 @@ class ExportPurchasesCSVView(APIView):
 
             writer.writerow([
                 item.purchase_order.id,
-                item.purchase_order.supplier.name if item.purchase_order.supplier else "No Supplier",
+                _csv_safe(
+                    item.purchase_order.supplier.name
+                    if item.purchase_order.supplier else "No Supplier"
+                ),
                 _iso(item.purchase_order.placed_at),
                 item.purchase_order.exchange_rate,
-                item.product.name if item.product else "Unknown Product",
-                item.product.barcode or '' if item.product else '',
+                _csv_safe(item.product.name if item.product else "Unknown Product"),
+                _csv_safe(item.product.barcode or '' if item.product else ''),
                 item.quantity,
                 item.unit_multiplier,
                 units,
