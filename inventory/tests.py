@@ -8,6 +8,8 @@ from decimal import Decimal
 
 from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.forms.models import model_to_dict
 from django.db import IntegrityError, transaction
 from django.db.models import Sum
 from django.test import TestCase, override_settings
@@ -20,6 +22,14 @@ from inventory.models import (
     Product, ProductImage, Purchase, PurchaseItem, Supplier, items_cogs,
 )
 from inventory.reporting import DateWindow
+from accounts.models import Account
+
+# Smallest valid GIF — enough for an ImageField to accept without shipping a fixture file.
+_ONE_PIXEL_GIF = (
+    b'GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!'
+    b'\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00'
+    b'\x02\x02D\x01\x00;'
+)
 
 
 class AccountFixtureMixin:
@@ -2149,3 +2159,336 @@ class SupplierProtectedDeleteTests(AccountFixtureMixin, APITestCase):
 
         self.assertEqual(response.status_code, 409)
         self.assertTrue(Supplier.objects.filter(id=supplier.id).exists())
+
+
+class TenantIsolationMatrixTests(AccountFixtureMixin, TestCase):
+    """
+    Exhaustive cross-account matrix over every scoped collection.
+
+    The repo already had isolation tests, but each was written alongside the feature that
+    introduced it, so coverage tracked whoever remembered. This drives every case from
+    RESOURCES, which turns "someone added an endpoint and forgot to scope it" into a failing
+    test rather than a silent leak. Adding a resource without adding it here is itself the
+    visible omission.
+
+    404 and never 403 throughout: a 403 on someone else's row confirms the row exists, which
+    is an existence oracle across the tenant boundary. AccountScopedMixin gets this right by
+    filtering the queryset rather than checking ownership after lookup, and this pins it.
+    """
+
+    # name -> callable(self, account) building one row owned by that account
+    RESOURCES = [
+        'products', 'categories', 'suppliers', 'customers', 'expenses', 'orders', 'purchases',
+    ]
+
+    def setUp(self):
+        self.a_account, _, self.a_client, self.a_header = self.make_account_user('iso_a')
+        self.b_account, _, self.b_client, self.b_header = self.make_account_user('iso_b')
+        self.a = self.build_rows(self.a_account)
+        self.b = self.build_rows(self.b_account)
+
+    def build_rows(self, account):
+        category = Category.objects.create(name='Widgets', account=account)
+        supplier = Supplier.objects.create(name='Acme', account=account)
+        # Name carries the account id so a leak is identifiable in a CSV: every other
+        # row in this fixture is deliberately named identically across both accounts.
+        customer = Customer.objects.create(
+            name=f'Customer of {account.id}', phone_number='123', account=account,
+        )
+        product = Product.objects.create(
+            name='Widget', description='', cost_price='4.00', default_sell_price='10.00',
+            category=category, supplier=supplier, stock_quantity=100, account=account,
+        )
+        expense = Expense.objects.create(
+            account=account, description='Rent', amount=Decimal('50.00'),
+        )
+        order = Order.objects.create(account=account, exchange_rate=89000, customer=customer)
+        OrderItem.objects.create(
+            order=order, product=product, quantity=1, unit_price=Decimal('10.00'),
+            unit_cost_price=Decimal('4.00'),
+        )
+        purchase = Purchase.objects.create(
+            account=account, exchange_rate=89000, supplier=supplier,
+        )
+        PurchaseItem.objects.create(
+            purchase_order=purchase, product=product, quantity=1, unit_price=Decimal('4.00'),
+        )
+        return {
+            'products': product, 'categories': category, 'suppliers': supplier,
+            'customers': customer, 'expenses': expense, 'orders': order,
+            'purchases': purchase,
+        }
+
+    def url(self, resource, row=None):
+        return (
+            f'/inventory/{resource}/{row.id}/' if row else f'/inventory/{resource}/'
+        )
+
+    # --- the matrix ---
+
+    def test_a_list_never_contains_another_accounts_row(self):
+        for resource in self.RESOURCES:
+            with self.subTest(resource=resource):
+                response = self.b_client.get(
+                    self.url(resource), HTTP_AUTHORIZATION=self.b_header,
+                )
+                self.assertEqual(response.status_code, 200, response.data)
+                body = response.data
+                rows = body['results'] if isinstance(body, dict) and 'results' in body else body
+                foreign_id = self.a[resource].id
+                self.assertNotIn(
+                    foreign_id, [row['id'] for row in rows],
+                    f'{resource}: account A row leaked into account B list',
+                )
+
+    def test_retrieving_another_accounts_row_is_404(self):
+        for resource in self.RESOURCES:
+            with self.subTest(resource=resource):
+                response = self.b_client.get(
+                    self.url(resource, self.a[resource]), HTTP_AUTHORIZATION=self.b_header,
+                )
+                self.assertEqual(response.status_code, 404, f'{resource}: {response.status_code}')
+
+    def test_patching_another_accounts_row_is_404_and_changes_nothing(self):
+        for resource in self.RESOURCES:
+            with self.subTest(resource=resource):
+                row = self.a[resource]
+                # Refresh first: the fixture assigned prices as strings, so comparing an
+                # in-memory copy against a reloaded one reports a spurious difference.
+                row.refresh_from_db()
+                before = model_to_dict(row)
+                response = self.b_client.patch(
+                    self.url(resource, row), {'name': 'Hijacked', 'description': 'Hijacked'},
+                    format='json', HTTP_AUTHORIZATION=self.b_header,
+                )
+                self.assertEqual(response.status_code, 404, f'{resource}: {response.status_code}')
+                row.refresh_from_db()
+                self.assertEqual(model_to_dict(row), before, f'{resource} was modified')
+
+    def test_deleting_another_accounts_row_is_404_and_the_row_survives(self):
+        for resource in self.RESOURCES:
+            with self.subTest(resource=resource):
+                row = self.a[resource]
+                response = self.b_client.delete(
+                    self.url(resource, row), HTTP_AUTHORIZATION=self.b_header,
+                )
+                self.assertEqual(response.status_code, 404, f'{resource}: {response.status_code}')
+                self.assertTrue(
+                    type(row).objects.filter(pk=row.pk).exists(), f'{resource} was deleted',
+                )
+
+    # --- POST referencing another account's row by id ---
+
+    def test_a_product_cannot_be_created_against_another_accounts_category(self):
+        response = self.b_client.post(
+            '/inventory/products/',
+            {
+                'name': 'Sneaky', 'description': '', 'cost_price': '1.00',
+                'default_sell_price': '2.00', 'category': self.a['categories'].id,
+            },
+            format='json', HTTP_AUTHORIZATION=self.b_header,
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn('category', response.data)
+
+    def test_a_product_cannot_be_created_against_another_accounts_supplier(self):
+        response = self.b_client.post(
+            '/inventory/products/',
+            {
+                'name': 'Sneaky', 'description': '', 'cost_price': '1.00',
+                'default_sell_price': '2.00', 'category': self.b['categories'].id,
+                'supplier': self.a['suppliers'].id,
+            },
+            format='json', HTTP_AUTHORIZATION=self.b_header,
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn('supplier', response.data)
+
+    def test_an_order_cannot_be_placed_against_another_accounts_product(self):
+        # The one that matters most: accepted, it would deduct stock from A's inventory.
+        stock_before = self.a['products'].stock_quantity
+        response = self.b_client.post(
+            '/inventory/orders/',
+            {'items': [{
+                'product': self.a['products'].id, 'quantity': 1, 'unit_price': '10.00',
+            }]},
+            format='json', HTTP_AUTHORIZATION=self.b_header,
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.a['products'].refresh_from_db()
+        self.assertEqual(self.a['products'].stock_quantity, stock_before)
+
+    def test_an_order_cannot_be_placed_for_another_accounts_customer(self):
+        response = self.b_client.post(
+            '/inventory/orders/',
+            {
+                'customer': self.a['customers'].id,
+                'items': [{
+                    'product': self.b['products'].id, 'quantity': 1, 'unit_price': '10.00',
+                }],
+            },
+            format='json', HTTP_AUTHORIZATION=self.b_header,
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+
+    def test_a_purchase_cannot_be_recorded_against_another_accounts_product(self):
+        stock_before = self.a['products'].stock_quantity
+        response = self.b_client.post(
+            '/inventory/purchases/',
+            {
+                'supplier': self.b['suppliers'].id,
+                'items': [{
+                    'product': self.a['products'].id, 'quantity': 5, 'unit_price': '4.00',
+                }],
+            },
+            format='json', HTTP_AUTHORIZATION=self.b_header,
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.a['products'].refresh_from_db()
+        self.assertEqual(self.a['products'].stock_quantity, stock_before)
+
+    # --- nested images, which reach their account through the parent product ---
+
+    def test_another_accounts_product_images_are_not_listable(self):
+        response = self.b_client.get(
+            f"/inventory/products/{self.a['products'].id}/images/",
+            HTTP_AUTHORIZATION=self.b_header,
+        )
+        # Empty rather than 404: the nested list is scoped, so a foreign product simply has
+        # no visible images. What must never happen is A's rows appearing in the body.
+        rows = response.data['results'] if isinstance(response.data, dict) else response.data
+        self.assertEqual(rows, [], response.data)
+
+    def test_an_image_cannot_be_attached_to_another_accounts_product(self):
+        image = SimpleUploadedFile('x.gif', _ONE_PIXEL_GIF, content_type='image/gif')
+        response = self.b_client.post(
+            f"/inventory/products/{self.a['products'].id}/images/",
+            {'image': image}, format='multipart', HTTP_AUTHORIZATION=self.b_header,
+        )
+        self.assertEqual(response.status_code, 404, response.status_code)
+        self.assertEqual(self.a['products'].images.count(), 0)
+
+    # --- the manually-scoped APIViews, which AccountScopedMixin does not cover ---
+
+    def test_analytics_counts_only_the_callers_rows(self):
+        # AnalyticsView is an APIView, so it scopes by hand — the mixin does not apply. A
+        # regression here is invisible: the numbers are merely wrong, never an error.
+        response = self.b_client.get('/inventory/analytics/', HTTP_AUTHORIZATION=self.b_header)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Decimal(str(response.data['total_revenue'])), Decimal('10.00'))
+        self.assertEqual(Decimal(str(response.data['total_expenses'])), Decimal('50.00'))
+        self.assertEqual(response.data['products_count'], 1)
+
+    def test_the_csv_exports_carry_only_the_callers_rows(self):
+        # Both accounts hold identically-named rows, so a leak cannot be spotted by name.
+        # Row counts can: one data row each, plus a header, plus a TOTALS footer where the
+        # exporter has one.
+        expected_rows = {
+            '/inventory/orders/export/csv/': 3,
+            '/inventory/purchases/export/csv/': 3,
+            '/inventory/products/export/csv/': 2,  # catalogue export has no TOTALS row
+        }
+        for path, expected in expected_rows.items():
+            with self.subTest(path=path):
+                response = self.b_client.get(path, HTTP_AUTHORIZATION=self.b_header)
+                self.assertEqual(response.status_code, 200)
+                body = response.content.decode()
+                rows = [line for line in body.splitlines() if line.strip()]
+                self.assertEqual(len(rows), expected, f'{path} returned {rows}')
+                # A's customer name is unique to A and would show up in any order leak.
+                self.assertNotIn(f'Customer of {self.a_account.id}', body)
+
+
+class SubscriptionGateMatrixTests(AccountFixtureMixin, TestCase):
+    """
+    Every non-live status must lock every protected endpoint, and must *not* lock the
+    endpoints that exist to get the account back to live.
+
+    Phase 2.5a's documented trap is that the wall blocks its own exit: miss one escape hatch
+    and the account is unrecoverable without an admin. This asserts both halves for every
+    status rather than for the one status a feature happened to be written against.
+    """
+
+    NON_LIVE = [
+        Account.PENDING_VERIFICATION,
+        Account.PENDING_PAYMENT,
+        Account.PAST_DUE,
+        Account.CANCELED,
+    ]
+
+    PROTECTED = [
+        '/inventory/products/', '/inventory/categories/', '/inventory/suppliers/',
+        '/inventory/customers/', '/inventory/expenses/', '/inventory/orders/',
+        '/inventory/purchases/', '/inventory/analytics/',
+        '/inventory/orders/export/csv/', '/inventory/purchases/export/csv/',
+        '/inventory/products/export/csv/',
+    ]
+
+    ESCAPE_HATCHES = [
+        ('get', '/accounts/subscription/'),
+        ('post', '/accounts/verify-email/'),
+        ('post', '/accounts/resend-code/'),
+        ('post', '/accounts/password-reset/request/'),
+        ('get', '/billing/config/'),
+        ('post', '/billing/redeem-key/'),
+    ]
+
+    def setUp(self):
+        self.account, self.user, self.client, self.header = self.make_account_user('gate')
+
+    def set_status(self, status_value, expires_at=None):
+        self.account.subscription_status = status_value
+        self.account.expires_at = expires_at
+        self.account.save(update_fields=['subscription_status', 'expires_at'])
+
+    def test_every_non_live_status_locks_every_protected_endpoint(self):
+        for status_value in self.NON_LIVE:
+            self.set_status(status_value)
+            for path in self.PROTECTED:
+                with self.subTest(status=status_value, path=path):
+                    response = self.client.get(path, HTTP_AUTHORIZATION=self.header)
+                    self.assertEqual(response.status_code, 403, f'{status_value} {path}')
+
+    def test_active_but_expired_is_treated_as_locked(self):
+        # The column says active; expires_at says otherwise. Liveness is computed from both,
+        # because nothing flips active -> past_due without a scheduled job that does not exist.
+        self.set_status(Account.ACTIVE, expires_at=timezone.now() - timedelta(days=1))
+        for path in self.PROTECTED:
+            with self.subTest(path=path):
+                response = self.client.get(path, HTTP_AUTHORIZATION=self.header)
+                self.assertEqual(response.status_code, 403, path)
+
+    def test_active_and_unexpired_reaches_everything(self):
+        self.set_status(Account.ACTIVE, expires_at=timezone.now() + timedelta(days=1))
+        for path in self.PROTECTED:
+            with self.subTest(path=path):
+                response = self.client.get(path, HTTP_AUTHORIZATION=self.header)
+                self.assertEqual(response.status_code, 200, path)
+
+    def test_the_escape_hatches_stay_reachable_from_every_locked_status(self):
+        for status_value in self.NON_LIVE:
+            self.set_status(status_value)
+            for method, path in self.ESCAPE_HATCHES:
+                with self.subTest(status=status_value, path=path):
+                    response = getattr(self.client, method)(
+                        path, {}, format='json', HTTP_AUTHORIZATION=self.header,
+                    )
+                    # Any answer but 403 — these validate their input and may 400 or 429,
+                    # which is fine. 403 is the failure: the wall blocking its own exit.
+                    self.assertNotEqual(
+                        response.status_code, 403,
+                        f'{status_value}: {path} is behind the paywall it exists to lift',
+                    )
+
+    def test_a_user_with_no_membership_reaches_nothing(self):
+        stranger = User.objects.create_user(username='stranger', password='pw12345!')
+        header = f'JWT {RefreshToken.for_user(stranger).access_token}'
+        for path in self.PROTECTED:
+            with self.subTest(path=path):
+                response = self.client.get(path, HTTP_AUTHORIZATION=header)
+                self.assertEqual(response.status_code, 403, path)
+
+    def test_anonymous_reaches_nothing(self):
+        for path in self.PROTECTED:
+            with self.subTest(path=path):
+                self.assertEqual(APIClient().get(path).status_code, 401, path)

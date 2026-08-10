@@ -163,6 +163,44 @@ boot guard is added.
 
 ---
 
+## F-08 — Nested product-image route was unscoped · **HIGH** · fixed
+
+**Where:** `inventory/views.py:26` (`ProductImageViewSet`)
+**Found by:** the Task 8.2 isolation matrix. **No scanner found this** — not semgrep, not bandit.
+It needed a test that actually crossed the tenant boundary.
+
+```python
+account_lookup = 'product__account'          # declared…
+
+def get_queryset(self):
+    return ProductImage.objects.filter(product_id=self.kwargs['product_pk'])   # …never reached
+```
+
+The override replaced `AccountScopedMixin.get_queryset()` instead of chaining through it, so the
+only filter applied was the product id **taken from the URL**. Product ids are sequential integers.
+Any authenticated subscriber could therefore walk `/inventory/products/<n>/images/` across the whole
+platform and, for every other account's products:
+
+- **list** their images (confirmed: HTTP 200 with rows, not 404),
+- **attach** an image to another account's product (confirmed: the POST succeeded),
+- and, by the same queryset, retrieve and **delete** individual images.
+
+This is the exact failure mode `CLAUDE.md` warns about — "scoping is two independent halves" — with a
+third half this codebase had not written down: a viewset that *overrides* `get_queryset` silently
+opts out of the mixin, and the declared `account_lookup` gives a false impression of coverage while
+doing nothing.
+
+**Severity HIGH** rather than MEDIUM: cross-tenant read *and* write, reachable by any subscriber with
+no special knowledge beyond an incrementing integer.
+
+**Fixed** in the same commit as its regression tests — `get_queryset` now chains through `super()`,
+and `perform_create` resolves the parent product through the account-scoped queryset, 404ing on a
+foreign one. Tests:
+`TenantIsolationMatrixTests.test_another_accounts_product_images_are_not_listable` and
+`…test_an_image_cannot_be_attached_to_another_accounts_product`.
+
+---
+
 ## F-07 — `CORS_ALLOW_ALL_ORIGINS = True` · **MEDIUM** · fixed in Task 8.3
 
 **Where:** `ims/settings.py`
@@ -184,6 +222,12 @@ is complete, not because it was a discovery.
 | F-05 bandit `random` in seeder | LOW | accepted |
 | F-06 `SECRET_KEY`/`DEBUG` fail open | MEDIUM | **owner decision** |
 | F-07 CORS wide open | MEDIUM | fix in Task 8.3 |
+| F-08 nested image route unscoped | **HIGH** | fixed |
 
-**One real code defect** (F-01), one **deployment question for the owner** (F-06), one planned
+**Two real code defects** (F-08, F-01), one **deployment question for the owner** (F-06), one planned
 hardening (F-07), one documentation correction (F-03). Everything else is noise from the scanners.
+
+**The most serious finding came from a test, not a scanner.** F-08 is cross-tenant read and write,
+and semgrep, bandit and pip-audit were all silent on it — an authorization bug looks like ordinary
+ORM code. The scanners earned their place on F-01, which reading had missed for four phases; the
+matrix earned its place on F-08. Neither would have found the other.

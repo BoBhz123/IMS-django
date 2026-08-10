@@ -1,4 +1,4 @@
-from django.shortcuts import render
+from django.shortcuts import get_object_or_404, render
 from django.db.models import Prefetch,F,Q,DateField,ProtectedError
 from django.db.models.aggregates import Sum,Count
 from rest_framework import status
@@ -27,6 +27,7 @@ class ProductImageViewSet(AccountScopedMixin, ModelViewSet):
     # ProductImage has no account column — it is owned through its product.
     account_lookup = 'product__account'
 
+    queryset = ProductImage.objects.all()
     serializer_class = ProductImageSerializer
     parser_classes = [MultiPartParser, FormParser]
 
@@ -34,10 +35,26 @@ class ProductImageViewSet(AccountScopedMixin, ModelViewSet):
         return {**super().get_serializer_context(), 'product_id': self.kwargs['product_pk']}
 
     def get_queryset(self):
-        return ProductImage.objects.filter(product_id=self.kwargs['product_pk'])
+        # Chained through super() deliberately. This used to be a bare
+        # `ProductImage.objects.filter(product_id=...)`, which silently discarded
+        # AccountScopedMixin's filter and left the nested route unscoped — `account_lookup`
+        # above was declared but never reached. Any authenticated subscriber could then list,
+        # replace or delete another account's product images by guessing a product id.
+        # Found by the Phase 8 isolation matrix.
+        return super().get_queryset().filter(product_id=self.kwargs['product_pk'])
+
+    def get_product_or_404(self):
+        # 404 rather than 403: a 403 would confirm the product exists while belonging to
+        # someone else, which is an existence oracle across the tenant boundary.
+        return get_object_or_404(
+            Product.objects.filter(account=self.account), pk=self.kwargs['product_pk'],
+        )
 
     def perform_create(self, serializer):
-        # Not AccountScopedMixin's save(account=...): there is no such field to stamp.
+        # Not AccountScopedMixin's save(account=...): there is no such field to stamp. The
+        # ownership check therefore has to happen explicitly — the queryset scoping above
+        # governs reads only, and the parent product id comes straight off the URL.
+        self.get_product_or_404()
         serializer.save()
 
 
