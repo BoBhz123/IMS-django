@@ -26,7 +26,8 @@ describe('lookupByBarcode', () => {
   })
 
   it('reports several matches as ambiguous rather than guessing', async () => {
-    // Barcodes are deliberately non-unique. Picking the first would add the wrong product.
+    // Barcodes are unique per account, so this is the "the database disagreed" path — a bulk
+    // import, or the constraint dropped. Picking the first would add the wrong product.
     get.mockResolvedValue({ data: { count: 2, results: [{ id: 1 }, { id: 2 }] } })
     expect((await lookupByBarcode('2000000000001')).status).toBe('ambiguous')
   })

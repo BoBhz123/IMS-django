@@ -108,6 +108,33 @@ class ProductSerializer(AccountScopedSerializerMixin, serializers.ModelSerialize
     account_scoped_fields = {'category': Category, 'supplier': Supplier}
 
     images = ProductImageSerializer(many=True, read_only=True)
+
+    def validate_barcode(self, value):
+        """
+        One code, one product — checked here as well as in the database.
+
+        Same reasoning as AccountUniqueNameMixin: `account` is stamped in perform_create and
+        is not a serializer field, so DRF sees `barcode` as unconstrained and the
+        UniqueConstraint would surface as an uncaught IntegrityError 500. Scanning the wrong
+        box is an everyday mistake and deserves a field error.
+
+        Stripped before comparing because Product.save() strips before storing — otherwise a
+        trailing space walks past this check and hits the constraint anyway.
+        """
+        barcode = (value or '').strip()
+        account = self.context.get('account')
+        if not barcode or account is None:
+            return barcode
+
+        clashes = Product.objects.filter(account=account, barcode=barcode)
+        if self.instance is not None:
+            clashes = clashes.exclude(pk=self.instance.pk)
+        if clashes.exists():
+            raise serializers.ValidationError(
+                'Another product already uses this barcode.'
+            )
+        return barcode
+
     class Meta():
         model = Product
         # allow_blank so the SPA can clear the field by sending '' — Product.save()

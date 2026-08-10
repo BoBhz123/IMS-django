@@ -328,10 +328,11 @@ verification on a physical phone is the owner's; automated coverage mocks the de
 automation is forbidden here.
 
 Scanned lookups resolve through `lookupByBarcode` (`frontend/src/hooks/useBarcodeLookup.js`), which
-returns `found | ambiguous | not_found | error`. Ambiguity is a real state, not an edge case — Phase 4
-deliberately left barcodes non-unique — so the UI asks which product rather than taking the first
-match. Order scans increment through `maxQuantityFor` so Phase 1's stock cap still holds; purchase
-scans are uncapped, because a purchase adds stock.
+returns `found | ambiguous | not_found | error`. Since 2026-08-10 barcodes are unique per account, so
+`ambiguous` should not occur; it is kept as the safe response to the database saying otherwise (a bulk
+import, or the constraint dropped) rather than silently taking the first match. Order scans increment
+through `maxQuantityFor` so Phase 1's stock cap still holds; purchase scans are uncapped, because a
+purchase adds stock.
 
 ### Phase 8 — Security audit — **blocked, by design**
 Do not start. `PLAN.md` Task 8.0 requires the user to install `pip-audit`, `bandit` and `semgrep`
@@ -341,9 +342,17 @@ and confirm before any Phase 8 work begins.
 Optional indexed `Product.barcode` in `ProductViewSet.search_fields`, so `?search=` covers it. Form
 input, list tag, admin search, seeded data. See `HISTORY.md`. Camera scanning is still a later phase.
 
-Deliberately **indexed, not unique** — a shop reuses one code across loose goods and own-label lines.
-`ProductBarcodeTests.test_two_products_may_share_a_barcode` pins that, so adding the constraint later
-is a decision that breaks a test rather than a silent change.
+**Superseded (2026-08-10): barcodes are unique per account.** Phase 4 shipped the field indexed but
+not unique, on the reasoning that a shop reuses one code across loose goods. Reversed at the owner's
+direction — one code, one product. `UniqueConstraint(['account', 'barcode'])`, never global: an EAN
+identifies a real-world product, so a global constraint would let the first account to record one
+block every other account from recording the same item. See `HISTORY.md`.
+
+The `'' → NULL` normalization in `Product.save()` is load-bearing for it — NULLs do not collide in a
+unique index but two `''` rows do, so without it the second product entered with no barcode is
+rejected. A duplicate is a 400 from `ProductSerializer.validate_barcode`, not an `IntegrityError`
+500, for the same reason `AccountUniqueNameMixin` exists: `account` is not a serializer field, so DRF
+generates no validator for the constraint.
 
 ### Phase 5 — CSV export totals row — **done**
 All four transaction exports end in a TOTALS row — both API views and both admin actions. The
@@ -453,7 +462,15 @@ Append here when something bites. Do not repeat these.
   different `unit_multiplier`s is meaningless. `Total Units` (`quantity * unit_multiplier`) is the
   column that carries a real physical count, and it is the one totalled.
 - **`Product.barcode` is normalized in `Product.save()`** — `''` becomes `NULL` and surrounding
-  whitespace is stripped. Query by the stripped value; do not assume `''` is ever stored.
+  whitespace is stripped. Query by the stripped value; do not assume `''` is ever stored. This is
+  load-bearing for the per-account unique constraint added on 2026-08-10: NULLs do not collide, two
+  `''` rows do. Any new write path that skips `save()` (`bulk_create`, `update()`, raw SQL) must
+  normalize for itself or it will either store `''` or trip the constraint.
+- **A per-account unique constraint needs a serializer validator too.** `account` is stamped in
+  `perform_create`, so DRF never sees it as a serializer field and generates no `UniqueTogether`
+  validator — the constraint then surfaces as an uncaught `IntegrityError` 500 instead of a 400. See
+  `AccountUniqueNameMixin` and `ProductSerializer.validate_barcode`. Both strip before comparing,
+  because the model strips before storing.
 - **`react-router-dom` has 2 open high-severity advisories** (`npm audit`). `npm audit fix --force`
   downgrades to 7.11.0, a breaking change — left alone deliberately; raise it as its own decision.
 - **`@zxing/library` must stay behind `await import()`.** A top-level import puts ~450 kB into every

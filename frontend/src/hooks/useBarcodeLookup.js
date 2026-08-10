@@ -7,8 +7,10 @@ import { api } from '@/lib/api'
  * barcode): a scanner submits a complete code, and a fuzzy match would silently add the
  * wrong product to an order.
  *
- * Several matches are reported as ambiguous rather than resolved by guessing — barcodes are
- * deliberately non-unique in this app, so a shop can reuse one across loose goods.
+ * Several matches are reported as ambiguous rather than resolved by guessing. Barcodes are
+ * now unique per account, so this should not occur — it is kept as the safe response to the
+ * database saying otherwise (a bulk import, or the constraint being dropped), because the
+ * alternative is silently adding whichever product the API happened to return first.
  *
  * `error` is kept distinct from `not_found` on purpose: not_found should invite the user to
  * add the product, error should invite them to retry. Collapsing the two sends people off

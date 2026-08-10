@@ -118,9 +118,10 @@ class Product(models.Model):
     stock_quantity = models.IntegerField(default=1,blank=False)
     supplier = models.ForeignKey(Supplier,on_delete=models.PROTECT,blank=True,null=True)
     category= models.ForeignKey(Category,on_delete=models.PROTECT,related_name='products')
-    # Optional, and indexed rather than unique: a shop legitimately reuses one code across
-    # loose goods and own-label lines, and a unique constraint would reject that outright.
-    # Stored as NULL when absent, never '' — see save() below.
+    # Optional, but unique within the account when present: one code identifies one product.
+    # Stored as NULL when absent, never '' — see save() below. That normalization is what
+    # makes the constraint workable: NULLs do not collide in a unique index, but a second
+    # '' row would, and being told an empty barcode is "already taken" is unexplainable.
     barcode = models.CharField(max_length=64, blank=True, null=True, db_index=True)
 
     objects = AccountScopedManager()
@@ -146,6 +147,12 @@ class Product(models.Model):
         ]
         constraints = [
             models.UniqueConstraint(fields=['account', 'name'], name='uniq_product_account_name'),
+            # Per account, never global: an EAN identifies a real-world product, so a global
+            # constraint would let the first shop to record one block every other shop from
+            # recording the same item. Rows with no barcode hold NULL and never collide.
+            models.UniqueConstraint(
+                fields=['account', 'barcode'], name='uniq_product_account_barcode',
+            ),
         ]
 
 

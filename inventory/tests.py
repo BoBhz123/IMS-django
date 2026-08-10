@@ -8,6 +8,7 @@ from decimal import Decimal
 
 from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
+from django.db import IntegrityError, transaction
 from django.db.models import Sum
 from django.test import TestCase, override_settings
 from django.utils import timezone
@@ -1220,10 +1221,13 @@ class AnalyticsFinancialsTests(AccountFixtureMixin, TestCase):
 
 class ProductBarcodeTests(AccountFixtureMixin, TestCase):
     """
-    An optional barcode, searchable through the same ?search= the products list already uses.
-    Deliberately indexed rather than unique: the phase brief asks for a lookup aid, and a
-    unique constraint would reject the loose-goods and own-label cases where a shop
-    legitimately reuses one code.
+    An optional barcode, searchable through the same ?search= the products list already uses,
+    and unique per account: one code identifies one product.
+
+    Phase 4 originally left the field non-unique so a shop could reuse a code across loose
+    goods. That was reversed at the owner's direction — every product carries its own
+    barcode — so the constraint is `(account, barcode)`, never a global one: two shops both
+    stocking the same real-world item must both be able to record its EAN.
     """
 
     def setUp(self):
@@ -1321,12 +1325,124 @@ class ProductBarcodeTests(AccountFixtureMixin, TestCase):
         product.refresh_from_db()
         self.assertIsNone(product.barcode)
 
-    def test_two_products_may_share_a_barcode(self):
-        # Indexed, not unique — see the class docstring. This test exists so that adding a
-        # unique constraint later is a deliberate decision that breaks a test, not a silent one.
+    def test_two_products_in_one_account_cannot_share_a_barcode(self):
         self.make_product(barcode='5901234123457')
-        self.make_product(name='Loose goods', barcode='5901234123457')
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                self.make_product(name='Loose goods', barcode='5901234123457')
+
+    def test_two_accounts_may_use_the_same_barcode(self):
+        # The constraint is per account, deliberately. An EAN identifies a real-world product,
+        # so the first shop to record one must not block every other shop from recording it.
+        other_account, _, _, _ = self.make_account_user('bc3')
+        other_category = Category.objects.create(name='Theirs', account=other_account)
+
+        self.make_product(barcode='5901234123457')
+        self.make_product(
+            name='Theirs', account=other_account, category=other_category,
+            barcode='5901234123457',
+        )
         self.assertEqual(Product.objects.filter(barcode='5901234123457').count(), 2)
+
+    def test_any_number_of_products_may_have_no_barcode(self):
+        # The barcode is optional, and NULLs do not collide in a unique index. This is why
+        # save() normalizes '' to NULL: two empty strings *would* collide, and the second
+        # product entered without a code would be rejected for no reason a user could see.
+        for name in ('One', 'Two', 'Three'):
+            self.make_product(name=name)
+        self.assertEqual(Product.objects.filter(barcode__isnull=True).count(), 3)
+
+    def test_the_api_rejects_a_duplicate_barcode_with_400_not_500(self):
+        # Reusing a code is an everyday mistake — scanning the wrong box, or entering a
+        # product twice — so it has to come back as a field error, not an uncaught
+        # IntegrityError. DRF cannot generate this validator itself: `account` is stamped in
+        # perform_create and is not a serializer field, so it sees `barcode` as unconstrained.
+        self.make_product(barcode='5901234123457')
+        response = self.client.post(
+            self.url,
+            {
+                'name': 'Duplicate', 'description': '', 'cost_price': '1.00',
+                'default_sell_price': '2.00', 'category': self.category.id,
+                'barcode': '5901234123457',
+            },
+            format='json',
+            HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn('barcode', response.data)
+        self.assertEqual(Product.objects.filter(name='Duplicate').count(), 0)
+
+    def test_a_duplicate_that_differs_only_in_whitespace_is_rejected(self):
+        # save() strips before storing, so the check has to strip before comparing or a
+        # trailing space walks straight past the serializer and into an IntegrityError.
+        self.make_product(barcode='5901234123457')
+        response = self.client.post(
+            self.url,
+            {
+                'name': 'Padded', 'description': '', 'cost_price': '1.00',
+                'default_sell_price': '2.00', 'category': self.category.id,
+                'barcode': '  5901234123457 ',
+            },
+            format='json',
+            HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+
+    def test_another_accounts_barcode_is_not_a_clash(self):
+        other_account, _, _, _ = self.make_account_user('bc4')
+        other_category = Category.objects.create(name='Theirs', account=other_account)
+        self.make_product(
+            name='Theirs', account=other_account, category=other_category,
+            barcode='5901234123457',
+        )
+
+        response = self.client.post(
+            self.url,
+            {
+                'name': 'Mine', 'description': '', 'cost_price': '1.00',
+                'default_sell_price': '2.00', 'category': self.category.id,
+                'barcode': '5901234123457',
+            },
+            format='json',
+            HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+
+    def test_a_product_can_be_saved_holding_the_barcode_it_already_has(self):
+        # Editing the price of a product must not fail because its own barcode "already
+        # exists" — the clash check has to exclude the row being updated.
+        product = self.make_product(barcode='5901234123457')
+        response = self.client.patch(
+            f'{self.url}{product.id}/',
+            {'default_sell_price': '11.00', 'barcode': '5901234123457'},
+            format='json', HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_moving_a_barcode_onto_another_product_is_rejected(self):
+        self.make_product(barcode='5901234123457')
+        other = self.make_product(name='Red Gadget', barcode='4006381333931')
+
+        response = self.client.patch(
+            f'{self.url}{other.id}/', {'barcode': '5901234123457'},
+            format='json', HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        other.refresh_from_db()
+        self.assertEqual(other.barcode, '4006381333931')
+
+    def test_several_products_can_be_cleared_of_their_barcodes(self):
+        # Clearing sends '', which save() turns into NULL. If it stored '' instead, the
+        # second product cleared would collide with the first.
+        first = self.make_product(barcode='5901234123457')
+        second = self.make_product(name='Red Gadget', barcode='4006381333931')
+        for product in (first, second):
+            response = self.client.patch(
+                f'{self.url}{product.id}/', {'barcode': ''},
+                format='json', HTTP_AUTHORIZATION=self.header,
+            )
+            self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(Product.objects.filter(barcode__isnull=True).count(), 2)
 
 
 class CSVExportTotalsTests(AccountFixtureMixin, TestCase):
@@ -1837,15 +1953,20 @@ class BarcodeLookupFilterTests(AccountFixtureMixin, TestCase):
         self.assertEqual(response.data['count'], 1)
         self.assertEqual(response.data['results'][0]['name'], 'Widget')
 
-    def test_a_shared_barcode_returns_every_match(self):
-        # Barcodes are deliberately non-unique (Phase 4). The caller disambiguates; the API
-        # must not silently pick one.
+    def test_a_scan_resolves_to_exactly_one_product(self):
+        # Phase 4 allowed a code to be shared and this test asserted the API returned every
+        # match. Barcodes are now unique per account, so a successful scan can only ever be
+        # one product — which is what lets the scanner add a line without asking.
         self.make_product('Loose apples', barcode='2000000000001')
-        self.make_product('Loose pears', barcode='2000000000001')
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                self.make_product('Loose pears', barcode='2000000000001')
+
         response = self.client.get(
             self.url, {'barcode': '2000000000001'}, HTTP_AUTHORIZATION=self.header,
         )
-        self.assertEqual(response.data['count'], 2)
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(response.data['results'][0]['name'], 'Loose apples')
 
     def test_the_lookup_is_account_scoped(self):
         other_account, _, _, _ = self.make_account_user('blk2')

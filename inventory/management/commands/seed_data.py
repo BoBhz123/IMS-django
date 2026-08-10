@@ -235,9 +235,26 @@ class Command(BaseCommand):
         text = urllib.parse.quote(initials)
         return f"https://placehold.co/400x400/{hex_color}/ffffff.webp?text={text}&font=roboto"
 
+    def _unique_barcode(self, taken):
+        """Draw a 13-digit code not already in `taken`, and record it there."""
+        while True:
+            barcode = str(random.randint(1000000000000, 9999999999999))
+            if barcode not in taken:
+                taken.add(barcode)
+                return barcode
+
     def _seed_products(self, account, categories, suppliers, count):
         existing_names = set(
             Product.objects.for_account(account).values_list("name", flat=True)
+        )
+        # Barcodes are unique per account, and seed_data is run repeatedly against the same
+        # demo account, so a fresh draw has to avoid the codes already stored as well as the
+        # ones handed out in this run. A collision here would abort the seed on an
+        # IntegrityError roughly once in a very long while — long enough to be baffling.
+        existing_barcodes = set(
+            Product.objects.for_account(account)
+            .exclude(barcode__isnull=True)
+            .values_list("barcode", flat=True)
         )
         pool = []
         for category_name, names in CATEGORY_PRODUCTS.items():
@@ -269,7 +286,7 @@ class Command(BaseCommand):
                 # A 13-digit EAN-shaped code on most products, but not all — the field is
                 # optional and the UI has to look right for the ones without one.
                 barcode=(
-                    str(random.randint(1000000000000, 9999999999999))
+                    self._unique_barcode(existing_barcodes)
                     if random.random() > 0.2 else None
                 ),
             )

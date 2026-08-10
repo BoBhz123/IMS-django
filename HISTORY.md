@@ -8,6 +8,52 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-10 — Barcodes are unique per account
+
+Reversing Phase 4's decision at the owner's direction: every product carries its own barcode, so
+`Product` gains `UniqueConstraint(['account', 'barcode'])`. Phase 4 left the field indexed but not
+unique on the reasoning that a shop reuses one code across loose goods; the owner's actual working
+rule is one code, one product, and the loose-goods case is not how this business runs.
+
+**Per account, never global** — the shape Phase 4 said to use if the constraint was ever added. An
+EAN identifies a real-world product, so a global constraint would let the first shop to record
+`5901234123457` block every other shop from recording the same item. Two accounts sharing a code is
+tested explicitly, not left to be inferred.
+
+**Phase 4's `save()` normalization is what makes the constraint workable, and it was written for
+this.** NULLs do not collide in a unique index, but two `''` rows do — without `'' → NULL`, the
+second product entered with no barcode would be rejected for a reason no user could act on. The
+stripping half matters too: the check has to strip before comparing, or `' 5901234123457'` walks past
+the serializer and hits the constraint as a 500.
+
+**The migration clears duplicates before it constrains.** Rows predating this may share a code, and
+`AddConstraint` against them fails outright, leaving a half-applied deployment. Within each account
+the earliest product keeps the code and the rest go to NULL — the honest answer, since a shared code
+means the database cannot say which product it identifies, and a generated suffix would fabricate a
+barcode matching no physical label. The cleared products are printed by name so they can be rescanned.
+Applied to the local dev database it found one real duplicate and named it.
+
+**A duplicate is a 400 naming the field, not a 500.** DRF cannot generate the validator itself:
+`account` is stamped in `perform_create` and is not a serializer field, so it sees `barcode` as
+unconstrained — the same trap `AccountUniqueNameMixin` was written for on `name`. Reusing a code is
+an everyday mistake (scanning the wrong box, entering a product twice) and belongs under the input.
+`ProductForm` already rendered `errors.barcode`; a test now pins that wiring.
+
+`seed_data` draws its 13-digit codes against a set of the ones already taken. Random draws from a
+9×10¹² range collide rarely enough that an `IntegrityError` mid-seed would be baffling rather than
+instructive.
+
+**`lookupByBarcode`'s `ambiguous` branch is kept**, though a scan can no longer match two products in
+one account. It is now the safe response to the database disagreeing — a bulk import, or the
+constraint being dropped — and the alternative is silently adding whichever row the API returned
+first. Phase 7's `BarcodeLookupFilterTests.test_a_shared_barcode_returns_every_match` was replaced
+with one asserting a scan resolves to exactly one product.
+
+Verified: `manage.py test` 290 passed; `npm test` 146 passed; lint and build clean; `seed_data` runs
+end to end against the migrated database.
+
+---
+
 ## 2026-08-09 — Phase 7: camera barcode scanning
 
 `@zxing/library` behind one `BarcodeScannerModal`, wired into three places: the product form (scan a
