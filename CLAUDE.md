@@ -43,9 +43,9 @@ frontend work done — the build catches import errors that neither the tests no
 **Do not use browser automation / Claude-in-Chrome for verification.** Verify through the Django test
 runner, Vitest unit and component tests, or direct API response checks — never by driving a browser.
 
-**Tests live in `inventory/tests.py` (69) and `accounts/tests.py` (22)**, all plain
-`TestCase`/`APIClient`. `playground/tests.py` is still the Django-generated stub. Coverage is real but
-not total — it is strongest on stock arithmetic, account isolation, and subscription gating.
+**Tests live in `inventory/tests.py` and `accounts/tests.py`**, all plain `TestCase`/`APIClient`.
+Coverage is real but not total — it is strongest on stock arithmetic, account isolation, subscription
+gating, and the security controls added in Phase 8 and the OWASP pass.
 
 **Settings are env-var driven** in `ims/settings.py`: `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`,
 `ALLOWED_HOSTS`, `DATABASE_URL`, `SENTRY_DSN`, and the `AWS_*` block (Cloudflare R2) all fall back to
@@ -94,8 +94,6 @@ Django apps under a single `ims` project, plus a React frontend:
 - **`accounts/`** — `Account` + `Membership`: who owns data, and subscription state. Also holds
   `permissions.py` (`HasActiveSubscription`), `mixins.py` (`AccountScopedMixin`), and the signup
   serializer that provisions an account.
-- **`playground/`** — scratch/dev-only app (`say_hello` view rendering `hello.html`), not part of the
-  real API surface. Don't extend it as if it were production code.
 - **`frontend/`** — React + Vite + Tailwind SPA. Built to `frontend/dist/` and served by WhiteNoise
   via `ims/views.py::spa_index`, which is the catch-all route in `ims/urls.py`.
 
@@ -511,9 +509,12 @@ Append here when something bites. Do not repeat these.
 - **JWTs live in `localStorage`, so any XSS is a full account takeover.** This is a recorded,
   accepted risk — `HttpOnly` cookies are the structural fix and a much larger change. Treat any new
   HTML-rendering or `dangerouslySetInnerHTML` path as security-critical.
-- **`playground.views.say_hello` reads every account's orders with no auth and no scoping.** It is
-  not routed, and `test_a05_the_playground_scratch_view_is_not_routed` is the tripwire. Do not
-  `include('playground.urls')`.
+- **There is no scratch app.** `playground/` was deleted on 2026-08-10: its `say_hello` view read
+  every account's orders with no auth and no scoping, and although it was never routed it sat one
+  line of `urls.py` away from being a cross-tenant leak.
+  `test_a05_every_routed_inventory_view_requires_authentication` is the generalised guard that
+  replaced it — it fails if any view routed under `/inventory/` does not demand an authenticated
+  caller. Don't add a scratch app back; use a test or the shell.
 - **Scanners do not find authorization bugs.** Phase 8's worst finding — an unscoped nested route
   allowing cross-account read *and* write — was invisible to semgrep, bandit and pip-audit, because
   it looks like ordinary ORM code. It took a test that crossed the tenant boundary. Run the matrix

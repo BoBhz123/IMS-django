@@ -1,7 +1,7 @@
 # OWASP Top 10 (2021) audit
 
 **Date:** 2026-08-10 · **Branch:** `phase-3-expenses` · **Baseline commit:** `44d365b`
-**Scope:** Django backend (`inventory/`, `accounts/`, `ims/`, `playground/`) and the React SPA
+**Scope:** Django backend (`inventory/`, `accounts/`, `ims/`, and `playground/` — since deleted) and the React SPA
 (`frontend/src/`).
 
 Follows the Phase 8 audit
@@ -166,10 +166,14 @@ verified in a subprocess.
 **⚠️ Latent risk recorded, not currently exploitable — `playground.views.say_hello`.** It
 reads `Order.objects` with **no account filter and no authentication**: every account's orders,
 to anyone. It is unreachable today because `playground.urls` is never `include()`d in
-`ims/urls.py`. `test_a05_the_playground_scratch_view_is_not_routed` is the tripwire — the view
-is one innocuous-looking line of `urls.py` away from being a cross-tenant data leak. Deleting
-the app outright is the better fix and is left as the owner's call, since it is their scratch
-space.
+`ims/urls.py`.
+
+**Resolved 2026-08-10: the app was deleted outright**, at the owner's direction — the better fix,
+taken rather than left tripwired. It defined no models, held no migrations and owned no tables, so
+removal was pure subtraction. The tripwire test was replaced by
+`test_a05_every_routed_inventory_view_requires_authentication`, which generalises the lesson: any
+view routed under `/inventory/` that does not demand an authenticated caller now fails a test,
+whatever it is called.
 
 ---
 
@@ -295,8 +299,8 @@ security audit trail (A09).
 
 **Accepted risks, deliberately:** JWTs in `localStorage` (A02 — CSP mitigates, `HttpOnly`
 cookies are the real fix), `'unsafe-inline'` in `style-src` (A05 — blocked on framer-motion),
-access tokens outliving a password change by up to a day (A07), no intra-account roles (A01),
-and the unrouted `playground` scratch view (A05 — tripwired by a test; deleting the app is the
-owner's call).
+no intra-account roles (A01),
+and access tokens outliving a password change (A07). The `playground` scratch view is no longer
+among them — the app was deleted on 2026-08-10.
 
 **No high or medium severity finding was left unfixed.**

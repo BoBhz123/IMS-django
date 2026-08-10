@@ -3047,31 +3047,38 @@ class OWASPControlTests(AccountFixtureMixin, TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.split(), ['False', 'False'])
 
-    def test_a05_the_playground_scratch_view_is_not_routed(self):
+    def test_a05_every_routed_inventory_view_requires_authentication(self):
         """
-        `playground.views.say_hello` reads `Order.objects` with **no account filter and no
-        authentication** — every account's orders, to anyone. It is not currently reachable,
-        because `playground.urls` is never `include()`d in `ims/urls.py`.
+        Generalises the finding that retired the `playground` app.
 
-        This test is the tripwire. The view is one line of urls.py away from being a
-        cross-tenant data leak, and that line looks harmless in review.
+        That app held `say_hello`, which read `Order.objects` with no account filter and no
+        authentication. It was never routed, so it was never exploitable — but it sat one
+        innocuous line of `urls.py` away from being a cross-tenant leak, and it has now been
+        deleted outright rather than left tripwired.
+
+        The lesson generalises, so this replaces the app-specific check: every view reachable
+        under /inventory/ must demand an authenticated caller. A plain Django view, which has
+        no `permission_classes` at all, routed here would be the same bug wearing a new name.
         """
-        from django.urls import get_resolver
+        from rest_framework.permissions import IsAuthenticated
 
-        def view_names(resolver, acc):
-            for pattern in resolver.url_patterns:
-                if hasattr(pattern, 'url_patterns'):
-                    view_names(pattern, acc)
-                else:
-                    callback = getattr(pattern, 'callback', None)
-                    acc.add(f'{getattr(callback, "__module__", "")}.'
-                            f'{getattr(callback, "__name__", "")}')
-            return acc
+        from inventory import urls as inventory_urls
 
-        routed = view_names(get_resolver(), set())
-        self.assertNotIn(
-            'playground.views.say_hello', routed,
-            'the unscoped scratch view is now routed — it leaks every account\'s orders',
+        unprotected = []
+        for pattern in inventory_urls.urlpatterns:
+            callback = getattr(pattern, 'callback', None)
+            view_class = getattr(callback, 'cls', None) or getattr(
+                callback, 'view_class', None,
+            )
+            if view_class is None:
+                unprotected.append(f'{pattern.pattern}: not a class-based DRF view')
+                continue
+            permissions = getattr(view_class, 'permission_classes', [])
+            if not any(issubclass(p, IsAuthenticated) for p in permissions):
+                unprotected.append(f'{pattern.pattern}: {view_class.__name__} {permissions}')
+
+        self.assertEqual(
+            unprotected, [], 'these inventory routes do not require authentication',
         )
 
     # --- A06: Vulnerable & Outdated Components ----------------------------------------

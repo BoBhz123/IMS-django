@@ -8,6 +8,34 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-10 — The playground app is deleted
+
+Closing the last item the OWASP audit left open. `playground/` held `say_hello`, which read
+`Order.objects` with no account filter and no authentication — every account's orders, to anyone.
+It was never routed, so it was never exploitable, but it sat one innocuous line of `urls.py` away
+from being a cross-tenant leak. Deleted rather than left tripwired.
+
+**Removal was pure subtraction.** The app defined no models, held no migrations beyond the empty
+`__init__.py`, and owned no tables — checked against the live dev database (`django_migrations` had
+no `playground` rows and `information_schema` no `playground%` tables) before anything was removed,
+because "it's only a scratch app" is exactly the assumption that loses data when it turns out to be
+wrong.
+
+**The tripwire test was replaced, not dropped.** `test_a05_the_playground_scratch_view_is_not_routed`
+had nothing left to guard, but the lesson generalises:
+`test_a05_every_routed_inventory_view_requires_authentication` now walks `inventory/urls.py` and
+fails if any routed view does not demand an authenticated caller. A plain Django view — which has no
+`permission_classes` at all — routed under `/inventory/` would be the same bug wearing a new name.
+
+`HISTORY.md` and the audit specs keep their original wording; the finding is annotated as resolved
+rather than rewritten, since they record what was true when they were written.
+
+Verified: `manage.py test` 387 passed; `npm test` 178 passed; build clean; `check` and
+`check --deploy` both report 0 issues; `makemigrations --check` reports no drift; `seed_data` runs
+end to end.
+
+---
+
 ## 2026-08-10 — OWASP Top 10 audit, CSP, and the security audit trail
 
 Full report: `docs/superpowers/specs/2026-08-10-owasp-top-10-audit.md`. Ten categories, each

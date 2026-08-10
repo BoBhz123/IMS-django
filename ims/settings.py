@@ -108,8 +108,6 @@ INSTALLED_APPS = [
     #local apps
     'accounts',
     'inventory',
-    #dev apps
-    'playground',
 ]
 
 # Debug toolbar is a development profiler — it should never be loaded in production, where
