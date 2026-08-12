@@ -5,6 +5,7 @@ import { ToastContainer } from '@/components/ui/ToastContainer'
 import { Login } from '@/pages/Login'
 import { Signup } from '@/pages/Signup'
 import { VerifyEmail } from '@/pages/VerifyEmail'
+import { Settings } from '@/pages/Settings'
 import { Subscription } from '@/pages/Subscription'
 import { Dashboard } from '@/pages/Dashboard'
 import { Products } from '@/pages/Products'
@@ -31,6 +32,7 @@ function App() {
             <Route path="/purchases" element={<Purchases />} />
             <Route path="/customers" element={<Customers />} />
             <Route path="/suppliers" element={<Suppliers />} />
+            <Route path="/settings" element={<Settings />} />
           </Route>
         </Route>
 

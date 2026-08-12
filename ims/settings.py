@@ -253,6 +253,10 @@ DJOSER = {
     'SERIALIZERS': {
         'user_create': 'accounts.serializers.UserCreateWithAccountSerializer',
         'user_create_password_retype': 'accounts.serializers.UserCreateWithAccountSerializer',
+        # Both keys: djoser picks 'current_user' for /users/me/ and 'user' for the rest, and
+        # setting only one leaves the other returning a payload without the subscription.
+        'user': 'accounts.serializers.UserWithSubscriptionSerializer',
+        'current_user': 'accounts.serializers.UserWithSubscriptionSerializer',
     },
 }
 
@@ -357,12 +361,38 @@ DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'ims-system@local.test
 
 # --- Billing -------------------------------------------------------------------------
 # 'dummy' refuses card checkout and leaves discount keys as the only activation route.
-# 'paddle' is reserved for Phase 2.5b-2 and currently raises ImproperlyConfigured rather
-# than half-working.
+# 'paddle' requires the PADDLE_* settings below and is what production runs.
 BILLING_PROVIDER = os.environ.get('BILLING_PROVIDER', 'dummy')
 
 # Display only — what the plan cards show. The server never accepts an amount from the
-# client; when Paddle lands, the charged amount comes from a configured price id, and these
-# exist purely so the SPA has something to render.
+# client: the charged amount comes from the configured Paddle price id, and these exist
+# purely so the SPA has something to render. **USD, always.** See CLAUDE.md — no card
+# charge in this app is ever denominated in anything else.
 BILLING_PRICE_MONTHLY_USD = os.environ.get('BILLING_PRICE_MONTHLY_USD', '15')
+BILLING_PRICE_ANNUAL_USD = os.environ.get('BILLING_PRICE_ANNUAL_USD', '150')
 BILLING_PRICE_ONE_TIME_USD = os.environ.get('BILLING_PRICE_ONE_TIME_USD', '299')
+
+# --- Paddle ---------------------------------------------------------------------------
+# 'sandbox' or 'production'. Chooses both the API host and the environment Paddle.js is
+# initialised with; the two must agree or checkout opens against the wrong catalogue.
+PADDLE_ENVIRONMENT = os.environ.get('PADDLE_ENVIRONMENT', 'sandbox')
+PADDLE_API_KEY = os.environ.get('PADDLE_API_KEY', '')
+# The client-side token, safe to ship to the browser. Distinct from the API key, which is
+# a server secret and must never reach the SPA.
+PADDLE_CLIENT_TOKEN = os.environ.get('PADDLE_CLIENT_TOKEN', '')
+# Signs incoming notifications. Without it the webhook rejects everything rather than
+# trusting unverified bodies — an unauthenticated endpoint that grants subscriptions is the
+# worst possible thing to leave open.
+PADDLE_WEBHOOK_SECRET = os.environ.get('PADDLE_WEBHOOK_SECRET', '')
+
+# Plan key -> Paddle price id. One tier, three billing choices, all granting identical
+# access; nothing in the app branches on which of these the customer bought.
+PADDLE_PRICE_MONTHLY = os.environ.get('PADDLE_PRICE_MONTHLY', '')
+PADDLE_PRICE_ANNUAL = os.environ.get('PADDLE_PRICE_ANNUAL', '')
+PADDLE_PRICE_LIFETIME = os.environ.get('PADDLE_PRICE_LIFETIME', '')
+
+# --- Local (cash / Whish) payment contact ----------------------------------------------
+# Whish and cash settle over chat, not a gateway. These drive the deep links on the
+# subscription screen; blank simply hides the corresponding button.
+WHATSAPP_NUMBER = os.environ.get('WHATSAPP_NUMBER', '')
+TELEGRAM_USERNAME = os.environ.get('TELEGRAM_USERNAME', '')

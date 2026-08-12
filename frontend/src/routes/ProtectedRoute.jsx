@@ -1,6 +1,6 @@
 import { Navigate, Outlet, useLocation } from 'react-router-dom'
 import { useAuth } from '@/context/AuthContext'
-import { routeForAccountStatus } from '@/lib/onboarding'
+import { routeForAccount } from '@/lib/onboarding'
 
 export function ProtectedRoute() {
   const { status, account } = useAuth()
@@ -19,8 +19,10 @@ export function ProtectedRoute() {
   }
 
   // An un-onboarded account authenticates fine but the API 403s everything, so rendering the
-  // app shell would just fill the screen with failed requests and error toasts.
-  const onboardingRoute = routeForAccountStatus(account?.status ?? null)
+  // app shell would just fill the screen with failed requests and error toasts. The pathname
+  // is passed so the unpaid whitelist (/subscription, /settings) can exempt itself — without
+  // it, an expired account is bounced off /settings and cannot read its own account id.
+  const onboardingRoute = routeForAccount(account, location.pathname)
   if (onboardingRoute) {
     return <Navigate to={onboardingRoute} replace />
   }

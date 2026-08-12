@@ -8,6 +8,188 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-12 — Phase 2.5b-4: one subscription contract, and a smart plan screen
+
+**The wire names changed.** `status` → `subscription_status`, `has_active_subscription` →
+`subscription_live`, `is_trialing` → `is_trial`, and `VerifyEmailView`'s bespoke `status` key
+joins them. Renamed rather than aliased: two names for one value in the same payload is a
+question every future reader has to answer, and every consumer lives in this repo.
+`subscription_payload()` is now the single projection, shared by `/accounts/subscription/` and
+by `/auth/users/me/` (nested under `subscription`, reusing the same serializer — nested rather
+than flattened because `id` and `email` would otherwise collide with the user's own).
+`SubscriptionPayloadContractTests` pins the exact field set and asserts the two endpoints
+return byte-identical bodies, because four separate frontend concerns read this shape and a
+silent rename breaks all four in different, hard-to-trace ways.
+
+**`payment_method` is inferred, not stored.** 'trial', 'card' if the Paddle ids are set,
+'manual' for anything else that reached `active` — key, cash, Whish, or an admin. A stored
+column would mean every activation path has to remember to set it; the Paddle ids are written
+only by the webhook, so their presence is already a reliable signal.
+
+**`/subscription` stops showing a price list to people who already pay.** A live subscriber
+gets a "Current active subscription" card — plan, payment type, renewal date — with the
+catalog, the Whish/cash pitch and the key box all behind a "Change or upgrade plan" reveal.
+Fronting checkout to someone who has paid reads as "we lost your payment". An account that is
+*not* live sees a `role="alert"` and the plans immediately: no extra click, because for them
+this screen is the only way back in.
+
+**Redemption now routes off the refreshed liveness, not the 200.** It was checking
+`refreshed?.status === 'active'`; a 200 from redeem is not proof of access, and routing home
+on one would have ProtectedRoute bounce the user straight back. There is a test for each
+direction.
+
+`renewalInfo` picks the clock that matters — `trial_ends_at` while trialing, `expires_at` when
+paid, and null for a lifetime licence, because "Renews: —" invites the question of whether
+something is broken. `subscriptionBadge` takes the whole account rather than a status string,
+for the reason that keeps recurring in this phase: an `active` row past its expiry still reads
+`active` in the database, so only the computed flag can be trusted.
+
+Settings gains the "Subscription & Billing" card the same helpers feed — plan, renewal date,
+account id — with the account id moved off the generic identity grid, since quoting it to
+support is a billing act.
+
+**Admin overrides sync because nothing caches.** `AdminOverrideSyncTests` activates, revokes,
+extends a trial and hand-edits an expiry through the real admin, then asserts each shows up on
+the customer's next fetch *and* opens or closes `/inventory/products/`. Writing it surfaced a
+test-only trap worth knowing: `force_authenticate` holds one `User` instance, and Django caches
+`user.membership.account` on it, so a reused client serves a stale in-memory Account and the
+sync appears broken. Real requests re-authenticate every time; the tests now build a client
+from a freshly loaded user.
+
+Verified: `manage.py test` 260 passed; `npm test` 129 passed; lint and build clean.
+
+---
+
+## 2026-08-12 — Phase 2.5b-3: unpaid whitelist and superuser-only billing admin
+
+Two gaps closed on top of 2.5b-2, plus badges. Most of the requested scope was already
+standing — `secrets`-based key generation, the redemption validation and payload, and the
+login/signup cross-links all shipped in earlier phases and are unchanged.
+
+**`/settings` joins `/subscription` on the unpaid whitelist.** An expired account was being
+bounced off every screen including its own account details, which is where the account id and
+email support asks for actually live — locking someone out of that while asking them to pay is
+hostile, and neither screen calls a gated endpoint, so allowing it costs nothing. The whitelist
+lives in `routeForAccountStatus`, which now takes the current path; `isAllowedWhileUnpaid`
+matches exact routes and nested children only, because a bare `startsWith` would let
+`/settings-export` through.
+
+**The whitelist deliberately does not apply to `pending_verification`.** An unverified account
+has not proved it owns the email address; that is a different and worse hole than an unpaid
+one, so verification still wins over the path check. There is a test pinning it.
+
+**Billing admin is superuser-only, enforced five ways.** `SuperuserOnlyAdmin` overrides
+`has_module_permission` alongside the four object permissions — the module check is what keeps
+the section off the admin index, and without it a staff user sees the links and gets a 403,
+which reads as a broken admin rather than a boundary. All five are needed because Django
+consults them independently, so a group grant would otherwise be enough to reach the models
+that hand out free subscriptions. Applied to `DiscountKey`, `DiscountKeyRedemption` and
+`ProcessedWebhookEvent`. The test grants a staff user *every* permission in the table and
+asserts they still cannot get in.
+
+**`AccountAdmin` is the deliberate exception.** It stays visible to staff, because a name and
+phone are ordinary support data and a support user who cannot find the customer cannot help
+them. What is gated is the ability to *change* what they have paid for: `get_actions` strips
+every activation action for non-superusers, and `get_readonly_fields` freezes the subscription
+and Paddle columns. Read-only rather than hidden, so support can still see why a customer is
+locked out. `get_actions` is the real gate — the action dropdown is only a UI affordance, and a
+test posts a `revoke_subscription` a staff user cannot see and asserts nothing happens.
+
+`admin.actions` takes the callables, not their names. A string there is resolved only against
+methods on the ModelAdmin, and these are module-level functions, so naming them registered
+nothing at all and every action silently vanished. The names are derived back off `__name__`
+for the gating, which is keyed by name.
+
+Status/plan/live badges via `format_html` — escaping matters because a business name is user
+input and reaches that column. `trialing` is amber rather than green: the account is live but
+on borrowed time, and that distinction is the point of scanning the column. The live badge
+shows the *computed* answer, so an `active` row whose expiry has passed reads "No" — the
+disagreement between column and enforcement becomes visible at a glance instead of via a
+support ticket.
+
+**Endpoint paths were left alone.** The request named `/api/accounts/me/`,
+`/api/accounts/redeem-code/` and friends; this app has no `/api/` prefix and the real paths are
+`/auth/users/me/`, `/accounts/subscription/`, `/billing/redeem-key/` and `/auth/jwt/blacklist/`.
+Read as identifying *which* endpoints must stay reachable rather than as a rename, since
+renaming them would break every caller in the SPA for no functional gain. `UnpaidWhitelistTests`
+pins all four as reachable while `canceled`, and the core inventory endpoints as blocked.
+
+Verified: `manage.py test` 248 passed; `npm test` 107 passed; lint and build clean.
+
+---
+
+## 2026-08-12 — Phase 2.5b-2: cardless trial, Paddle checkout, and the signed webhook
+
+The gateway half of Phase 2.5, plus a reversal: **the 14-day trial is back.** 2.5a deleted it on the
+grounds that a trial is a free bypass of the payment wall. That is still true, and the business chose
+cardless acquisition anyway — recorded here so it is not later "fixed" back as a regression.
+
+**The trial is safe because liveness is computed, not stored.** `LIVE_STATUSES` gains `TRIALING`, but
+`has_active_subscription` reads `trial_ends_at` for a trialing row, so an elapsed trial locks itself
+out with no scheduled job in existence. A `trialing` row with a *null* `trial_ends_at` denies rather
+than grants: an unbounded free trial is the one failure a payment wall cannot survive, so the null
+case fails closed. The admin's sweep action only tidies the stored column so the list filter tells
+the truth; it is explicitly not enforcement.
+
+**The clock starts at verification, not signup.** Setting `trialing` at account creation would have
+made the trial a way around email verification, since trialing grants access. So signup writes
+`trial_ends_at` (the column is never null) but leaves the status at `pending_verification`, and
+`VerifyEmailView` calls `start_trial`, which restamps from now — a customer who took three days to
+find the email still gets a full fourteen.
+
+**One tier, three billing choices.** `monthly`, `annual`, `one_time`, all granting identical access;
+nothing branches on `plan_type` to decide what a customer may do. `activate_account` now defaults
+`months` per plan via `PLAN_MONTHS`, because the webhook names a plan rather than computing a
+duration — an omitted argument would otherwise activate an annual purchase for one month.
+
+**Checkout is opened by Paddle.js, not by a server-side transaction create.** The overlay needs only
+a price id and the public client token, so starting a checkout costs no API call and cannot fail on a
+stale server key. The server's job is to decide which price the customer may buy and to stamp the
+account id into `custom_data` so the webhook can find its way back. Still no amount and no currency
+anywhere in the request — see the USD-only rule.
+
+**Only the webhook grants access.** Signature verification runs against `request.body`, not
+`request.data`: DRF's parsed dict re-serialises with different key order and whitespace and the HMAC
+stops matching. Idempotency is an *insert* — `ProcessedWebhookEvent.objects.create()` in a
+`try/except IntegrityError` — because check-then-insert lets two concurrent deliveries of the same
+retry both through, and a double activation double-extends `expires_at`. The plan comes from the
+line item's price id rather than `custom_data.plan`: custom_data is what we asked for, the line item
+is what the money bought, and when they disagree the money is the authority. An unrecognised price or
+an unmatchable account is logged and answered 200 — retrying will not fix either, and a non-2xx just
+tells Paddle to keep trying forever. `subscription.past_due` deliberately does *not* revoke: Paddle
+retries a failed card for days, and cutting access on the first failure locks out customers whose
+second attempt succeeds.
+
+**Local payments settle over chat.** WhatsApp and Telegram deep links on `/subscription`, pre-filled
+with account id, email and selected plan — the three things a customer otherwise forgets to include.
+Blank contact settings hide the button rather than rendering a link to nowhere.
+
+The plan cards became radio inputs. They had been a `role="button"` container with a "Pay with card"
+button nested inside, which is invalid ARIA — the outer control's accessible name swallows the inner
+button's text, and a screen reader cannot tell the two targets apart. The test caught it as six
+matches for three buttons.
+
+Admin gains activate-monthly/annual/lifetime, extend trial, reset trial, revoke, and the trial sweep.
+Activation runs each row through `activate_account` rather than `queryset.update()` — the old bulk
+update set the status column and left `expires_at` null, producing an account that reads active and
+computes as not live. Revoke clears both clocks, since a leftover date would keep serving a
+chargeback. `ProcessedWebhookEvent` is registered read-only: deleting a row lets the next retry
+re-activate an account.
+
+Frontend also gains a persistent trial banner (quiet until the last three days — a fortnight-long
+banner that shouts from day one is one users stop seeing) and a `/settings` page showing subscription
+state from the server's computed fields rather than re-deriving them against the device clock.
+
+**Not done, needs a human:** every Paddle credential in `.env` is a placeholder, and the three prices
+do not exist in the catalog. They could not be created from the session — the Paddle MCP connection
+is read-only and `client.products.create` fails without `product.write`. With placeholders the
+provider reports card checkout unavailable and the app falls back to keys and Whish/cash, which is
+the designed degradation. No end-to-end sandbox checkout has therefore been exercised.
+
+Verified: `manage.py test` 226 passed; `npm test` 91 passed; lint and build clean.
+
+---
+
 ## 2026-08-08 — Phase 2.5b-1: billing foundation and discount keys
 
 Everything in Phase 2.5b that does not need a live Paddle account: one activation function, a

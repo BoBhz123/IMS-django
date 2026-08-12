@@ -191,12 +191,24 @@ dashboard or hand every subscriber the platform. Drop the global `unique=True` o
 `Category`/`Customer` `.name` for per-account uniqueness, or the first account to name a product blocks
 every other account.
 
-### Phase 2.5 — Secure onboarding & payment gateway — **2.5a + 2.5b-1 done, 2.5b-2 blocked on Paddle approval**
+### Phase 2.5 — Secure onboarding & payment gateway — **done (2.5a, 2.5b-1, 2.5b-2)**
 **Design:** `docs/superpowers/specs/2026-08-08-secure-onboarding-payment-gateway-design.md`
 
-Signup takes email + password + phone, emails a 6-digit code, and grants no access until either a
-Paddle card payment (monthly subscription or one-time lifetime licence) or a 100%-off discount key is
-redeemed. **This deletes Phase 2's 14-day trial** — a trial is a free bypass of the wall.
+Signup takes email + password + phone, emails a 6-digit code, and starts a **cardless 14-day trial**
+once that code is verified. After the trial, access needs a Paddle card payment, a 100%-off discount
+key, or a manual admin activation.
+
+**⚠️ The 14-day trial was deleted in 2.5a and reinstated in 2.5b-2 (2026-08-12), by explicit
+decision.** 2.5a's reasoning — "a trial is a free bypass of the payment wall" — is still true; the
+business chose cardless acquisition over a hard wall anyway. Do not "fix" this back. What keeps it
+safe is that trial liveness is *computed* from `trial_ends_at`, never read off the status column, so
+an elapsed trial locks itself out with no scheduled job running, and a `trialing` row with a null
+`trial_ends_at` denies rather than grants.
+
+**One tier, three billing choices.** `monthly`, `annual`, `one_time` — all granting identical access.
+Nothing in the app branches on `plan_type` to decide what a customer may *do*, only on whether their
+subscription is live. The moment a feature checks `plan_type`, this becomes a tiered product and the
+whole permission story needs revisiting.
 
 **Paddle, not Stripe.** Stripe does not onboard Lebanon-registered businesses and there is no foreign
 entity. Paddle is a merchant of record, so no local acquiring relationship is needed. A provider
@@ -225,45 +237,39 @@ Split for sequencing, and 2.5b split again once the Paddle dependency was isolat
 - **2.5b-1** activation, the provider seam, discount keys, and the `/subscription` screen — **done**.
   Plan: `docs/superpowers/plans/2026-08-08-phase-2.5b1-billing-foundation-discount-keys.md`. None of
   it depends on Paddle, so a cash-only business is fully operational today.
-- **2.5b-2** Paddle checkout, the signed webhook, and `ProcessedWebhookEvent` — **blocked**. Needs
-  live credentials, and the design requires the "will Paddle accept a Lebanon-registered seller?"
-  risk validated *before* this is built, not after. Sandbox access unblocks development either way.
+- **2.5b-2** Paddle checkout, the signed webhook, and `ProcessedWebhookEvent` — **done**, see below.
+  Built against the sandbox; the "will Paddle accept a Lebanon-registered seller?" risk is still open
+  but no longer blocks anything, because keys and Whish/cash work without a gateway.
 
-Routes to `active` today: redeeming a discount key, or the `activate_accounts` Django admin action.
+Routes to `active` today: a Paddle payment (once credentials are real), redeeming a discount key, or
+the Django admin's activate/extend/reset/revoke actions. New signups also get 14 cardless trial days.
 
-#### ⏸ PAUSE STATUS — where Phase 2.5b stopped and what resumes it
+#### Phase 2.5b-2 — what shipped, and what still needs a human
 
-Read this before touching `accounts/billing/`. Work moved on to Phase 3 with 2.5b deliberately
-half-finished; that is a pause, not an oversight, and not a bug to be fixed by improvising a gateway.
+`accounts/billing/paddle.py` (checkout + signature verification), `accounts/billing/webhooks.py`
+(`POST /billing/webhook/paddle/`, `ProcessedWebhookEvent` idempotency), the `paddle_*` columns, and
+Paddle.js in the SPA are all in place. `BILLING_PROVIDER='paddle'` no longer raises.
 
-- **Completed:** Phase 2.5a (email OTP onboarding) and Phase 2.5b-1 (billing foundation and 100%-off
-  discount keys). Both are recorded in `HISTORY.md`.
-- **Paused at:** Phase 2.5b-2 — Paddle checkout, the signed webhook, `ProcessedWebhookEvent`
-  idempotency, and Paddle.js in the SPA. None of it is written.
-- **Reason for the pause:** awaiting Paddle merchant-account approval and sandbox/production
-  credentials. The design also requires the "will Paddle accept a Lebanon-registered seller?" risk
-  validated *before* 2.5b-2 is built rather than after, so this is a sequencing decision and not
-  merely a missing password.
-- **Current state:** the provider seam is live with `BILLING_PROVIDER='dummy'`. The dummy refuses card
-  checkout (`503 card_checkout_unavailable`) instead of faking a payment, and `BILLING_PROVIDER='paddle'`
-  raises `ImproperlyConfigured` on purpose until 2.5b-2 lands. Discount keys and the admin
-  `activate_accounts` action are the only routes to `active`, and they are sufficient — a cash-only
-  business is fully operational as things stand.
-- **Environment setup before any production deploy:** set `BILLING_PRICE_MONTHLY_USD` and
-  `BILLING_PRICE_ONE_TIME_USD`. The committed values (`15` and `299`) are display-only placeholders,
-  not agreed pricing. They are what the plan cards render; the server never accepts an amount from
-  the client, so these do not control what anyone is charged — but shipping them unset would quote
-  invented prices to real customers.
-
-**To resume:** get sandbox credentials, then build `accounts/billing/paddle.py` behind the existing
-`BillingProvider` interface and add the webhook. `activate_account` already accepts `grace_days`, so
-the renewal path is a new caller rather than a rewrite.
+**Still needs a human, before production:**
+- **Real Paddle credentials.** Everything in `.env` is a placeholder. `PADDLE_API_KEY`,
+  `PADDLE_CLIENT_TOKEN`, `PADDLE_WEBHOOK_SECRET` and the three `PADDLE_PRICE_*` ids all come from the
+  sandbox dashboard. With placeholders the provider reports card checkout unavailable and the app
+  falls back to keys and Whish/cash, which is the designed degradation, not a bug.
+- **The three prices do not exist in the Paddle catalog yet.** They could not be created from here:
+  the Paddle MCP connection is read-only (no `product.write`). Grant it at
+  https://vendors.paddle.com/mcps, or create them by hand under Catalog → Products. All three must be
+  **USD** — see the USD-only rule above.
+- **The webhook destination.** Point it at `/billing/webhook/paddle/` and subscribe to
+  `transaction.completed`, `subscription.activated`, `subscription.updated`, `subscription.canceled`,
+  `subscription.paused`. Anything else is logged and acknowledged.
+- **The seller-approval question is still open** ("will Paddle accept a Lebanon-registered seller?").
+  The code no longer blocks on it, because discount keys and Whish/cash work regardless.
 
 What the obvious implementation gets wrong:
 - **"No account until paid" is not implementable.** You cannot charge a card or verify an email before
   a row exists to attach them to. The account is created immediately in `pending_verification` and is
-  simply inert: `LIVE_STATUSES` narrows to `(ACTIVE,)`, so Phase 2's default `HasActiveSubscription`
-  already locks every endpoint with no new checks.
+  simply inert: `LIVE_STATUSES` is `(ACTIVE, TRIALING)` and a fresh account is neither, so Phase 2's
+  default `HasActiveSubscription` already locks every endpoint with no new checks.
 - **The paywall will block the escape from the paywall.** Every endpoint needed to get *out* of
   pending state — subscription status, resend code, verify code, create checkout, redeem key — must
   declare `permission_classes = [IsAuthenticated]` explicitly to shed the default. Miss one and the
@@ -357,10 +363,52 @@ Append here when something bites. Do not repeat these.
 - **`activate_account` (`accounts/billing/activation.py`) is the only supported way to set
   `subscription_status = ACTIVE`** outside the admin action. Assigning the column directly skips the
   expiry arithmetic — the account reads as live with a stale or absent `expires_at`.
-- **`BILLING_PROVIDER='paddle'` raises `ImproperlyConfigured` by design** until 2.5b-2. That is not a
-  broken import; the error message names the phase.
+- **`BILLING_PROVIDER='paddle'` works now** (2.5b-2). With placeholder credentials it reports card
+  checkout unavailable rather than erroring — `is_configured()` is what the plan screen asks, not
+  `name != 'dummy'`, because a half-credentialed provider takes payments exactly as well as no
+  provider at all.
+- **The Paddle webhook signs the *raw* body.** Use `request.body`, never `request.data` — DRF's
+  parsed dict re-serialises with different key order and whitespace, and the HMAC stops matching.
+- **Idempotency is an insert, not a check-then-insert.** `ProcessedWebhookEvent.objects.create()`
+  inside `try/except IntegrityError` is what makes two concurrent deliveries of the same Paddle retry
+  safe; `if not exists(): create()` lets both through and double-extends `expires_at`.
+- **A `trialing` account whose `trial_ends_at` has passed still reads `trialing` in the database.**
+  Nothing sweeps the column on a schedule (the admin action is housekeeping, not enforcement), so any
+  code branching on the bare status is wrong — ask `has_active_subscription`. This bit the frontend
+  router: `routeForAccountStatus` needs the account object, not just the status string.
+- **Don't nest a `<button>` inside a `role="button"` card.** The Subscription plan cards did this;
+  the accessible name of the outer control swallowed the inner button's text, so
+  `getAllByRole('button', {name: /pay with card/i})` matched six elements instead of three. The cards
+  are radio inputs now, which is both valid ARIA and free arrow-key navigation.
 - **Discount key codes are stored normalized** — uppercase, no dashes. Querying `DiscountKey` by the
   dash-separated form the user was shown never matches; run it through
   `accounts.billing.keys.normalize_key` first.
+- **The Paddle MCP connection is read-only.** It has no `product.write`, so prices cannot be created
+  from a session — `client.products.create` fails with "not authorized". Grant the permission at
+  https://vendors.paddle.com/mcps or use the dashboard.
+- **`ModelAdmin.actions` resolves strings against the admin class only.** Listing module-level
+  action functions by name registers nothing and every action silently disappears from the
+  dropdown — pass the callables. `get_actions` gates by *name*, so derive those off `__name__`
+  rather than retyping them.
+- **Superuser-only admin needs `has_module_permission` too**, not just the four object
+  permissions. Without it the section still renders on the admin index and only the links 403,
+  which looks like a bug rather than a boundary. `SuperuserOnlyAdmin` in `accounts/admin.py`
+  overrides all five; `AccountAdmin` deliberately does not use it (staff may look a customer
+  up; only superusers may change what they paid for, via `get_actions`/`get_readonly_fields`).
+- **The unpaid route whitelist is `/subscription` + `/settings`**, and it must not apply to
+  `pending_verification` — an unverified account has not proved it owns the address, which is a
+  worse hole than an unpaid one. Match exact paths and nested children, never bare
+  `startsWith`, or `/settings-export` walks through.
+- **The subscription wire names are `subscription_status` / `subscription_live` / `is_trial`**,
+  not the model's `has_active_subscription` / `is_trialing`. One projection —
+  `accounts.serializers.subscription_payload` — feeds both `/accounts/subscription/` and the
+  `subscription` key of `/auth/users/me/`; `SubscriptionPayloadContractTests` pins the field set.
+- **`force_authenticate` reuses one `User` instance**, and Django caches `user.membership` and
+  that membership's `account` on it. A test that reuses the client after changing the account
+  in the database reads the stale in-memory row and looks like a caching bug in the API. Build a
+  fresh client from `User.objects.get(pk=…)` per request, as `AdminOverrideSyncTests` does.
+- **This app has no `/api/` prefix.** The billing/onboarding endpoints are `/accounts/…`,
+  `/billing/…` and `/auth/…`. Requests naming `/api/accounts/redeem-code/` mean
+  `/billing/redeem-key/`.
 - **`react-router-dom` has 2 open high-severity advisories** (`npm audit`). `npm audit fix --force`
   downgrades to 7.11.0, a breaking change — left alone deliberately; raise it as its own decision.

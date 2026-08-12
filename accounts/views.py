@@ -4,9 +4,10 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from . import verification
+from .billing.activation import start_trial
 from .emails import send_verification_code
 from .models import Account, get_account
-from .serializers import SubscriptionStatusSerializer, VerifyEmailSerializer
+from .serializers import VerifyEmailSerializer, subscription_payload
 from .throttles import ResendCodeThrottle, VerifyEmailThrottle
 
 # Every view here declares IsAuthenticated on its own, dropping the project-wide
@@ -31,20 +32,10 @@ class SubscriptionStatusView(APIView):
     permission_classes = ONBOARDING_PERMISSIONS
 
     def get(self, request):
-        account = get_account(request.user)
-        if account is None:
-            # Superadmins have no membership, and neither does a user whose provisioning
-            # failed. Reporting either as "unpaid" would send the platform owner to a paywall.
-            return Response({
-                'status': None,
-                'plan_type': '',
-                'expires_at': None,
-                'has_active_subscription': bool(request.user.is_superuser),
-                'business_name': '',
-                'phone': '',
-                'email': request.user.email,
-            })
-        return Response(SubscriptionStatusSerializer(account).data)
+        # Always re-read from the database, so a superadmin's manual override in the Django
+        # admin — activate, extend, revoke — shows up on the next fetch with nothing to
+        # invalidate. There is no cache here on purpose.
+        return Response(subscription_payload(request.user))
 
 
 class VerifyEmailView(APIView):
@@ -66,12 +57,18 @@ class VerifyEmailView(APIView):
         if account and account.subscription_status == Account.PENDING_VERIFICATION:
             # Guarded rather than unconditional: re-verifying must never downgrade an account
             # that has since paid.
-            account.subscription_status = Account.PENDING_PAYMENT
-            account.save(update_fields=['subscription_status'])
+            #
+            # Verification is where the cardless trial actually begins. start_trial restamps
+            # trial_ends_at from now rather than honouring the value written at signup, so a
+            # customer who took three days to find the email still gets a full 14 — the
+            # signup value only exists so the column is never null.
+            start_trial(account)
 
+        # `subscription_status`, matching the name every other endpoint uses for this column.
+        # One name across the API is worth more than the shorter key here.
         return Response({
             'detail': 'Email verified.',
-            'status': account.subscription_status if account else None,
+            'subscription_status': account.subscription_status if account else None,
         })
 
 

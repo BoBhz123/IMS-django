@@ -3,6 +3,8 @@ import {
   formatCooldown,
   isCompleteCode,
   normalizeCode,
+  isAllowedWhileUnpaid,
+  routeForAccount,
   routeForAccountStatus,
 } from './onboarding'
 
@@ -60,5 +62,86 @@ describe('routeForAccountStatus', () => {
     // redirected to a paywall for a subscription they were never meant to have.
     expect(routeForAccountStatus(null)).toBeNull()
     expect(routeForAccountStatus(undefined)).toBeNull()
+  })
+})
+
+describe('trial routing', () => {
+  // A trial that has run out still reads `trialing` in the database — nothing sweeps the
+  // column on a schedule — so the status alone cannot decide this.
+  it('lets a running trial through', () => {
+    expect(routeForAccountStatus('trialing', { subscription_live: true })).toBeNull()
+  })
+
+  it('sends an elapsed trial to the subscribe screen', () => {
+    expect(routeForAccountStatus('trialing', { subscription_live: false })).toBe(
+      '/subscription',
+    )
+  })
+
+  it('treats a trialing status with no account object as elapsed', () => {
+    // Failing closed: rendering the dashboard for an account whose every call 403s is worse
+    // than one redundant redirect.
+    expect(routeForAccountStatus('trialing')).toBe('/subscription')
+  })
+
+  it('routeForAccount reads the status off the account', () => {
+    expect(routeForAccount({ subscription_status: 'trialing', subscription_live: true })).toBeNull()
+    expect(routeForAccount({ subscription_status: 'pending_verification' })).toBe('/signup/verify')
+    expect(routeForAccount(null)).toBeNull()
+  })
+})
+
+describe('the unpaid whitelist', () => {
+  it('lets an expired account stay on the screens it needs', () => {
+    // /subscription is the way out of the wall; /settings is where the customer finds the
+    // account id support will ask them for.
+    for (const path of ['/subscription', '/settings']) {
+      expect(routeForAccountStatus('canceled', null, path)).toBeNull()
+      expect(routeForAccountStatus('past_due', null, path)).toBeNull()
+      expect(routeForAccountStatus('trialing', { subscription_live: false }, path)).toBeNull()
+    }
+  })
+
+  it('still bounces an expired account off every other screen', () => {
+    for (const path of ['/', '/products', '/orders', '/customers']) {
+      expect(routeForAccountStatus('canceled', null, path)).toBe('/subscription')
+    }
+  })
+
+  it('does not let the whitelist bypass email verification', () => {
+    // An unverified account has not proved it owns the address. That is a different and
+    // worse hole than an unpaid one, so the whitelist deliberately does not apply.
+    expect(routeForAccountStatus('pending_verification', null, '/settings')).toBe(
+      '/signup/verify',
+    )
+  })
+
+  it('matches nested paths under a whitelisted route', () => {
+    expect(isAllowedWhileUnpaid('/settings/billing')).toBe(true)
+    expect(isAllowedWhileUnpaid('/subscription')).toBe(true)
+  })
+
+  it('does not match a route that merely starts with the same letters', () => {
+    // '/settings-export' is not '/settings'; a naive startsWith would let it through.
+    expect(isAllowedWhileUnpaid('/settings-export')).toBe(false)
+    expect(isAllowedWhileUnpaid('/subscriptions-report')).toBe(false)
+  })
+
+  it('treats a missing path as not whitelisted', () => {
+    expect(isAllowedWhileUnpaid(null)).toBe(false)
+    expect(isAllowedWhileUnpaid('')).toBe(false)
+    expect(routeForAccountStatus('canceled')).toBe('/subscription')
+  })
+
+  it('routeForAccount forwards the path', () => {
+    expect(routeForAccount({ subscription_status: 'canceled' }, '/settings')).toBeNull()
+    expect(routeForAccount({ subscription_status: 'canceled' }, '/products')).toBe('/subscription')
+  })
+
+  it('never redirects a live account regardless of path', () => {
+    expect(routeForAccount({ subscription_status: 'active' }, '/products')).toBeNull()
+    expect(
+      routeForAccount({ subscription_status: 'trialing', subscription_live: true }, '/products'),
+    ).toBeNull()
   })
 })

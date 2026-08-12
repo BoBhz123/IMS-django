@@ -7,6 +7,7 @@ import {
   LogOut,
   Moon,
   Package,
+  Settings as SettingsIcon,
   ShoppingCart,
   Sun,
   Truck,
@@ -23,6 +24,7 @@ export const NAV_ITEMS = [
   { to: '/purchases', label: 'Purchases', icon: Truck },
   { to: '/customers', label: 'Customers', icon: Users },
   { to: '/suppliers', label: 'Suppliers', icon: Building2 },
+  { to: '/settings', label: 'Settings', icon: SettingsIcon },
 ]
 
 function scaleFor(index, hoveredIndex) {

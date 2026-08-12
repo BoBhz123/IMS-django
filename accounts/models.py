@@ -1,3 +1,5 @@
+import math
+
 from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
 from django.core.validators import RegexValidator
@@ -13,28 +15,37 @@ class Account(models.Model):
 
     PENDING_VERIFICATION = 'pending_verification'
     PENDING_PAYMENT = 'pending_payment'
+    TRIALING = 'trialing'
     ACTIVE = 'active'
     PAST_DUE = 'past_due'
     CANCELED = 'canceled'
     SUBSCRIPTION_STATUS_CHOICES = [
         (PENDING_VERIFICATION, 'Pending email verification'),
         (PENDING_PAYMENT, 'Pending payment'),
+        (TRIALING, 'Free trial'),
         (ACTIVE, 'Active'),
         (PAST_DUE, 'Past due'),
         (CANCELED, 'Canceled'),
     ]
 
     MONTHLY = 'monthly'
+    ANNUAL = 'annual'
     ONE_TIME = 'one_time'
     PLAN_TYPE_CHOICES = [
         (MONTHLY, 'Monthly subscription'),
+        (ANNUAL, 'Annual subscription'),
         (ONE_TIME, 'One-time licence (lifetime)'),
     ]
 
-    # The only status that grants access. There is deliberately no trial status: a trial is
-    # by definition a free bypass of the payment wall. The pending_* states mean "signed up
-    # but not onboarded"; past_due and canceled mean "stop serving".
-    LIVE_STATUSES = (ACTIVE,)
+    # How long a cardless trial runs. One place, because the signup serializer, the admin's
+    # reset action, and the tests all have to agree on it.
+    TRIAL_DAYS = 14
+
+    # The statuses that can grant access. `trialing` is a deliberate reversal of the Phase
+    # 2.5a decision to have no trial at all — the business chose cardless acquisition over a
+    # hard wall. Note it is *can* grant, not *does*: liveness is still computed below, so a
+    # trialing row whose trial_ends_at has passed is as locked out as a canceled one.
+    LIVE_STATUSES = (ACTIVE, TRIALING)
 
     name = models.CharField(max_length=255)
     phone = models.CharField(
@@ -57,6 +68,18 @@ class Account(models.Model):
         max_length=20, choices=PLAN_TYPE_CHOICES, blank=True, default='',
     )
     expires_at = models.DateTimeField(null=True, blank=True)
+    # Separate from expires_at on purpose. Collapsing both into one column would make a
+    # lapsed trial indistinguishable from a lapsed paid subscription, and those are different
+    # sales conversations — and reactivating a paid account would silently hand back a trial.
+    trial_ends_at = models.DateTimeField(null=True, blank=True)
+
+    # Set by the Paddle webhook so a renewal or cancellation can find its way back to the
+    # right row. Blank for accounts activated by discount key, cash, or the admin.
+    paddle_customer_id = models.CharField(max_length=64, blank=True, default='', db_index=True)
+    paddle_subscription_id = models.CharField(
+        max_length=64, blank=True, default='', db_index=True,
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -73,10 +96,54 @@ class Account(models.Model):
         No scheduled job flips 'active' to 'past_due' when expires_at passes, so the column
         goes stale the moment a subscription lapses. Deriving liveness here means the
         permission class, the admin, and any future billing webhook cannot disagree.
+
+        A trial reads its own clock: trial_ends_at, not expires_at. A trialing row with no
+        trial_ends_at is not live — an unbounded free trial is the one failure mode a
+        payment wall cannot survive, so the null case denies rather than allows.
         """
         if self.subscription_status not in self.LIVE_STATUSES:
             return False
+        if self.subscription_status == self.TRIALING:
+            return self.trial_ends_at is not None and self.trial_ends_at > timezone.now()
         return self.expires_at is None or self.expires_at > timezone.now()
+
+    @property
+    def is_trialing(self):
+        return self.subscription_status == self.TRIALING and self.has_active_subscription
+
+    @property
+    def payment_method(self):
+        """
+        How this account is paying, as a coarse label for the UI.
+
+        Inferred rather than stored: there is no payment_method column, and adding one would
+        mean every activation path has to remember to set it. The Paddle ids are written only
+        by the webhook, so their presence is a reliable signal that a card is on file;
+        anything else that reached `active` got there by key, cash, Whish, or an admin, all
+        of which are the same thing to the customer reading this — a manual activation.
+        """
+        if self.subscription_status == self.TRIALING:
+            return 'trial'
+        if self.paddle_customer_id or self.paddle_subscription_id:
+            return 'card'
+        if self.subscription_status == self.ACTIVE:
+            return 'manual'
+        return ''
+
+    @property
+    def trial_days_remaining(self):
+        """
+        Whole days left, rounded up, or None when there is no live trial.
+
+        Rounded up so the last partial day reads as "1 day left" rather than "0" — a banner
+        that says zero while the app still works reads as a bug to the person seeing it.
+        """
+        if not self.trial_ends_at:
+            return None
+        seconds = (self.trial_ends_at - timezone.now()).total_seconds()
+        if seconds <= 0:
+            return 0
+        return math.ceil(seconds / 86400)
 
 
 class Membership(models.Model):
@@ -213,6 +280,28 @@ class DiscountKey(models.Model):
         if self.expires_at and self.expires_at <= now:
             return False
         return self.redemption_count < self.max_redemptions
+
+
+class ProcessedWebhookEvent(models.Model):
+    """
+    One row per gateway event we have already acted on.
+
+    Paddle retries a notification until it gets a 2xx, and a retry that re-runs activation
+    would extend expires_at a second time — the customer pays for one month and gets two.
+    The unique event_id is what makes handling idempotent: the insert is attempted first and
+    an IntegrityError means "already done", which is race-free in a way that
+    check-then-insert is not.
+    """
+
+    event_id = models.CharField(max_length=128, unique=True)
+    event_type = models.CharField(max_length=64)
+    received_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ['-received_at']
+
+    def __str__(self):
+        return f'{self.event_type} ({self.event_id})'
 
 
 class DiscountKeyRedemption(models.Model):

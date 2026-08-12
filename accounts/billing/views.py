@@ -97,6 +97,39 @@ class RedeemKeyView(APIView):
         return Response(SubscriptionStatusSerializer(account).data)
 
 
+# One tier, three ways to pay for it. Every plan grants identical access — nothing anywhere
+# in the app branches on plan_type to decide what a customer may do, only on whether their
+# subscription is live. Keep it that way: the moment a feature checks plan_type, this becomes
+# a tiered product and the whole permission story has to be revisited.
+def _plan_catalogue():
+    return [
+        {
+            'key': Account.MONTHLY,
+            'name': 'Monthly',
+            'price_usd': settings.BILLING_PRICE_MONTHLY_USD,
+            'period': 'per month',
+            'description': 'Full access, billed monthly. Cancel any time.',
+            'highlight': False,
+        },
+        {
+            'key': Account.ANNUAL,
+            'name': 'Annual',
+            'price_usd': settings.BILLING_PRICE_ANNUAL_USD,
+            'period': 'per year',
+            'description': 'Full access, billed yearly. Two months cheaper than monthly.',
+            'highlight': True,
+        },
+        {
+            'key': Account.ONE_TIME,
+            'name': 'Lifetime',
+            'price_usd': settings.BILLING_PRICE_ONE_TIME_USD,
+            'period': 'one time',
+            'description': 'Pay once, use it forever. No recurring charge.',
+            'highlight': False,
+        },
+    ]
+
+
 class BillingConfigView(APIView):
     """
     What the plan screen renders. Card checkout availability is a server fact, so the SPA
@@ -107,30 +140,37 @@ class BillingConfigView(APIView):
 
     def get(self, request):
         try:
-            card_checkout_available = get_provider().name != 'dummy'
+            provider = get_provider()
+            card_checkout_available = provider.is_configured()
         except Exception:
             # A misconfigured provider must not take down the screen that offers the
-            # discount-key alternative.
+            # discount-key and Whish/cash alternatives — that screen is the only way out of
+            # the paywall for a customer who cannot use a card at all.
+            provider = None
             card_checkout_available = False
+
+        plans = _plan_catalogue()
+        if provider is not None:
+            # Per-plan, not global: a deployment that has configured monthly but not lifetime
+            # should sell monthly rather than hide card payment altogether.
+            for plan in plans:
+                plan['card_available'] = bool(
+                    card_checkout_available and provider.price_id_for(plan['key'])
+                )
+        else:
+            for plan in plans:
+                plan['card_available'] = False
 
         return Response({
             'card_checkout_available': card_checkout_available,
-            'plans': [
-                {
-                    'key': Account.MONTHLY,
-                    'name': 'Monthly',
-                    'price_usd': settings.BILLING_PRICE_MONTHLY_USD,
-                    'period': 'per month',
-                    'description': 'Full access, billed monthly. Cancel any time.',
-                },
-                {
-                    'key': Account.ONE_TIME,
-                    'name': 'Lifetime',
-                    'price_usd': settings.BILLING_PRICE_ONE_TIME_USD,
-                    'period': 'one time',
-                    'description': 'Pay once, use it forever. No recurring charge.',
-                },
-            ],
+            'plans': plans,
+            'trial_days': Account.TRIAL_DAYS,
+            # Whish and cash settle over chat. Blank values mean the SPA hides that button
+            # rather than rendering a link to nowhere.
+            'local_payment': {
+                'whatsapp_number': getattr(settings, 'WHATSAPP_NUMBER', ''),
+                'telegram_username': getattr(settings, 'TELEGRAM_USERNAME', ''),
+            },
         })
 
 

@@ -30,6 +30,30 @@ def add_months(moment, months):
     return moment.replace(year=year, month=month, day=day)
 
 
+# How many months each recurring plan buys. Derived per plan rather than passed by callers,
+# so "annual" cannot mean twelve months at checkout and one month at renewal.
+PLAN_MONTHS = {
+    Account.MONTHLY: 1,
+    Account.ANNUAL: 12,
+}
+
+
+def start_trial(account, *, days=None, save=True):
+    """
+    Put an account onto a cardless trial, starting now.
+
+    Always restamps trial_ends_at from now rather than extending it: this is called when the
+    trial *begins*, and extending an existing value would let a repeat caller stack trials.
+    The admin's extend action is the deliberate exception and does its own arithmetic.
+    """
+    days = Account.TRIAL_DAYS if days is None else days
+    account.subscription_status = Account.TRIALING
+    account.trial_ends_at = timezone.now() + timedelta(days=days)
+    if save:
+        account.save(update_fields=['subscription_status', 'trial_ends_at'])
+    return account
+
+
 def activate_account(account, *, plan_type, months=None, grace_days=0):
     """
     Move an account to active and set its expiry. Saves and returns it.
@@ -50,16 +74,23 @@ def activate_account(account, *, plan_type, months=None, grace_days=0):
         # would still switch off on the old date.
         account.plan_type = Account.ONE_TIME
         account.expires_at = None
-    elif plan_type == Account.MONTHLY:
-        if not months or months < 1:
-            raise ValueError('A monthly activation needs a positive number of months.')
+    elif plan_type in PLAN_MONTHS:
+        # Default to the plan's own period so callers cannot activate an annual plan for one
+        # month by omitting the argument. months stays overridable for discount keys, which
+        # grant an arbitrary number.
+        months = PLAN_MONTHS[plan_type] if months is None else months
+        if months < 1:
+            raise ValueError('A recurring activation needs a positive number of months.')
         now = timezone.now()
         base = max(now, account.expires_at) if account.expires_at else now
-        account.plan_type = Account.MONTHLY
+        account.plan_type = plan_type
         account.expires_at = add_months(base, months) + timedelta(days=grace_days)
     else:
         raise ValueError(f'Unknown plan type: {plan_type!r}')
 
     account.subscription_status = Account.ACTIVE
+    # trial_ends_at is deliberately left alone: it is the record of when this account's trial
+    # ran, and clearing it would erase that. Liveness reads expires_at once status is active,
+    # so a stale trial date cannot grant or deny anything.
     account.save(update_fields=['subscription_status', 'plan_type', 'expires_at'])
     return account
