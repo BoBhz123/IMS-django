@@ -472,7 +472,21 @@ if EMAIL_USE_TLS and EMAIL_USE_SSL:
 # a wedged SMTP server holds the signup request open until the dyno's own timeout kills it,
 # and the user sees a hung page rather than "we could not send a code".
 EMAIL_TIMEOUT = int(os.environ.get('EMAIL_TIMEOUT', '10'))
-DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'ims-system@local.test')
+# The address mail is sent from, and the name shown beside it. A bare address renders in the
+# inbox as "support.imsapp" or the raw string depending on the client, which reads as
+# machine-generated; a display name is the cheapest credibility signal there is.
+#
+# Composed rather than hardcoded so DEFAULT_FROM_EMAIL can be given either form in .env: set
+# it bare and EMAIL_FROM_NAME wraps it, or set the whole "Name <addr>" string and it is left
+# alone. Double-wrapping produces a header Brevo rejects outright.
+_from_email = os.environ.get('DEFAULT_FROM_EMAIL', 'ims-system@local.test')
+EMAIL_FROM_NAME = os.environ.get('EMAIL_FROM_NAME', 'IMS Support')
+if EMAIL_FROM_NAME and '<' not in _from_email:
+    DEFAULT_FROM_EMAIL = f'{EMAIL_FROM_NAME} <{_from_email}>'
+else:
+    DEFAULT_FROM_EMAIL = _from_email
+# The bare address, for anything that needs it without the display name (SPF checks, logs).
+DEFAULT_FROM_ADDRESS = _from_email
 
 # --- Billing -------------------------------------------------------------------------
 # 'dummy' refuses card checkout and leaves discount keys as the only activation route.

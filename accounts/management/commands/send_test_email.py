@@ -10,8 +10,10 @@ import smtplib
 import traceback
 
 from django.conf import settings
-from django.core.mail import get_connection, send_mail
+from django.core.mail import get_connection
 from django.core.management.base import BaseCommand, CommandError
+
+from accounts.emails import send_verification_code
 
 # Brevo's own wording for each. Mapped because the raw SMTP codes send people looking in the
 # wrong place — 525 in particular reads like a credential problem and is not one.
@@ -47,6 +49,10 @@ class Command(BaseCommand):
             action='store_true',
             help='Print the resolved EMAIL_* settings first (the password stays masked).',
         )
+        parser.add_argument(
+            '--code', default='123456',
+            help='The sample code to show in the template. Default: 123456.',
+        )
 
     def handle(self, *args, **options):
         if options['show_config']:
@@ -56,18 +62,14 @@ class Command(BaseCommand):
         self.stdout.write(f'Sending via {settings.EMAIL_HOST}:{settings.EMAIL_PORT} '
                           f'as {settings.DEFAULT_FROM_EMAIL} → {recipient}')
 
+        # Goes through the real send_verification_code, so what lands in the inbox is exactly
+        # what a user receives — same templates, same subject, same multipart structure. A
+        # bespoke "test" body would prove the SMTP hop works and nothing about the mail
+        # people actually get, which is the half that was broken.
+        probe = _ProbeUser(recipient)
+
         try:
-            sent = send_mail(
-                subject='IMS test email',
-                message=(
-                    'If you are reading this, the IMS mail configuration works and '
-                    'verification codes will send.'
-                ),
-                from_email=settings.DEFAULT_FROM_EMAIL,
-                recipient_list=[recipient],
-                # The entire point of this command is to see the exception.
-                fail_silently=False,
-            )
+            sent = send_verification_code(probe, options['code'])
         except smtplib.SMTPException as exc:
             code = getattr(exc, 'smtp_code', None)
             self.stderr.write(self.style.ERROR(f'FAILED: {exc}'))
@@ -81,11 +83,18 @@ class Command(BaseCommand):
             raise CommandError(f'Could not reach the mail server: {exc}') from exc
 
         if not sent:
+            # send_verification_code swallows and logs, so a False here means the exception
+            # never reached the except blocks above. Re-run with the traceback visible.
             raise CommandError(
-                'send_mail() reported 0 messages sent without raising. Check EMAIL_BACKEND — '
-                'a console or locmem backend accepts everything and delivers nothing.'
+                'The send failed and was logged rather than raised. Check the accounts.emails '
+                'logger output above, and confirm EMAIL_BACKEND is the SMTP backend — console '
+                'and locmem accept everything and deliver nothing.'
             )
         self.stdout.write(self.style.SUCCESS(f'Sent. Check {recipient} (and its spam folder).'))
+        self.stdout.write(
+            '  Sent as multipart/alternative: HTML plus a plain-text part.\n'
+            '  View the source in your client to confirm both arrived.'
+        )
 
     def print_config(self):
         password = settings.EMAIL_HOST_PASSWORD or ''
@@ -110,3 +119,19 @@ class Command(BaseCommand):
             get_connection()
         except Exception as exc:
             self.stderr.write(self.style.ERROR(f'  ! Backend would not construct: {exc}'))
+
+
+class _ProbeUser:
+    """
+    The minimum send_verification_code needs: an address, a pk for the log, and no membership.
+
+    A stand-in rather than a real User row, because a diagnostic that writes to the database
+    is a diagnostic nobody wants to run against production. `membership` resolving to None is
+    what makes the template fall back to "your account" for the business name.
+    """
+
+    pk = 'test-probe'
+    membership = None
+
+    def __init__(self, email):
+        self.email = email

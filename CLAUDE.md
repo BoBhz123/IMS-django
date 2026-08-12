@@ -509,6 +509,12 @@ Append here when something bites. Do not repeat these.
 - **`525 5.7.1 Unauthorized IP address` from Brevo is not a credential problem.** It is
   Brevo's "Authorised IPs" allowlist rejecting the sending host. Rotating the SMTP key does
   nothing. `manage.py send_test_email <addr> --show-config` reproduces it and prints the hint.
+- **Transactional mail is `multipart/alternative`, always.** `accounts/emails.py` renders
+  `emails/otp_code.html` *and* `.txt`; dropping the text part is a well-known spam signal.
+  Templates are table-based with inline styles because Outlook renders through Word.
+- **`DEFAULT_FROM_EMAIL` is composed in settings** into `IMS Support <addr>` and skips wrapping
+  when the env value already has a display name. Double-wrapping produces a header Brevo
+  rejects.
 - **Brevo needs a verified sender.** `DEFAULT_FROM_EMAIL` on a free-mail domain (gmail.com)
   cannot be DKIM-signed by us, so it is spam-filed or refused even once the IP is allowed.
 - **Boolean env vars need `_env_flag`, not `== 'True'`.** That comparison read

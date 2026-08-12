@@ -9,6 +9,7 @@ from unittest.mock import patch
 from django.contrib import admin
 from django.contrib.auth.models import Permission, User
 from django.core import mail
+from django.core.mail import EmailMultiAlternatives
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.core.exceptions import ImproperlyConfigured, ValidationError
@@ -443,7 +444,7 @@ class VerificationEmailTests(TestCase):
 
     def test_a_send_failure_is_reported_not_raised(self):
         # Signup must not die because a third party's SMTP is down — the user can resend.
-        with patch('accounts.emails.send_mail', side_effect=SMTPException('boom')):
+        with patch.object(EmailMultiAlternatives, 'send', side_effect=SMTPException('boom')):
             self.assertFalse(emails.send_verification_code(self.user, '123456'))
 
     def test_no_email_address_is_not_an_error(self):
@@ -2458,7 +2459,7 @@ class PasswordResetEmailTests(TestCase):
         self.assertIn('password', message.subject.lower())
 
     def test_a_failed_send_is_reported_rather_than_raised(self):
-        with patch('accounts.emails.send_mail', side_effect=SMTPException('nope')):
+        with patch.object(EmailMultiAlternatives, 'send', side_effect=SMTPException('nope')):
             self.assertFalse(emails.send_password_reset_code(self.user, '123456'))
 
     def test_a_user_with_no_address_cannot_be_sent_one(self):
@@ -2802,7 +2803,7 @@ class EmailConfigTests(TestCase):
         user = User.objects.create_user(
             username='owner@example.com', email='owner@example.com', password='pw-12345',
         )
-        with patch('accounts.emails.send_mail', side_effect=SMTPException('boom')):
+        with patch.object(EmailMultiAlternatives, 'send', side_effect=SMTPException('boom')):
             with self.assertLogs('accounts.emails', level='ERROR') as captured:
                 sent = emails.send_verification_code(user, '123456')
 
@@ -2847,18 +2848,166 @@ class SendTestEmailCommandTests(TestCase):
         # 525 reads like a credential problem and is not one — it is Brevo's IP allowlist.
         # The mapped hint is what stops the next operator rotating a perfectly good SMTP key.
         error = smtplib.SMTPAuthenticationError(525, b'5.7.1 Unauthorized IP address')
-        with patch('django.core.mail.send_mail', side_effect=error):
-            with patch(
-                'accounts.management.commands.send_test_email.send_mail', side_effect=error,
-            ):
-                with self.assertRaises(CommandError):
-                    self.run_command('owner@example.com')
+        with patch(
+            'accounts.management.commands.send_test_email.send_verification_code',
+            side_effect=error,
+        ):
+            with self.assertRaises(CommandError):
+                self.run_command('owner@example.com')
 
     def test_a_zero_send_without_an_exception_is_still_a_failure(self):
         # send_mail returning 0 means nothing left the process, which a bare "no exception"
         # check would read as success.
         with patch(
-            'accounts.management.commands.send_test_email.send_mail', return_value=0,
+            'accounts.management.commands.send_test_email.send_verification_code',
+            return_value=False,
         ):
             with self.assertRaises(CommandError):
                 self.run_command('owner@example.com')
+
+
+@override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')
+class HtmlEmailTests(TestCase):
+    """
+    Both bodies, every time.
+
+    A single-part HTML mail with no plain-text alternative is one of the oldest spam signals
+    there is, so the multipart structure is asserted rather than assumed.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='owner@example.com', email='owner@example.com', password='pw-12345',
+        )
+        self.account = Account.objects.create(name='Corner Shop')
+        Membership.objects.create(user=self.user, account=self.account, is_owner=True)
+
+    def sent(self):
+        self.assertEqual(len(mail.outbox), 1)
+        return mail.outbox[0]
+
+    def html_of(self, message):
+        alternatives = {mimetype: body for body, mimetype in message.alternatives}
+        self.assertIn('text/html', alternatives)
+        return alternatives['text/html']
+
+    # --- structure ------------------------------------------------------------------------
+
+    def test_a_verification_email_carries_both_bodies(self):
+        emails.send_verification_code(self.user, '123456')
+        message = self.sent()
+
+        # The text part is the real content, not a "please enable HTML" stub — worth as
+        # little to a filter as it is to someone reading on a watch.
+        self.assertIn('123456', message.body)
+        self.assertIn('Confirm your email address', message.body)
+        self.assertIn('123456', self.html_of(message))
+
+    def test_a_password_reset_email_carries_both_bodies(self):
+        emails.send_password_reset_code(self.user, '654321')
+        message = self.sent()
+        self.assertIn('654321', message.body)
+        self.assertIn('654321', self.html_of(message))
+        self.assertIn('Reset your password', message.body)
+
+    def test_the_html_part_is_declared_as_html(self):
+        emails.send_verification_code(self.user, '123456')
+        self.assertEqual(self.sent().alternatives[0][1], 'text/html')
+
+    # --- headers --------------------------------------------------------------------------
+
+    def test_the_from_header_carries_a_display_name(self):
+        with override_settings(DEFAULT_FROM_EMAIL='IMS Support <support@example.com>'):
+            emails.send_verification_code(self.user, '123456')
+        self.assertEqual(self.sent().from_email, 'IMS Support <support@example.com>')
+
+    def test_subjects_are_branded_and_distinct(self):
+        emails.send_verification_code(self.user, '123456')
+        emails.send_password_reset_code(self.user, '654321')
+
+        verification_subject, reset_subject = (m.subject for m in mail.outbox)
+        self.assertTrue(verification_subject.startswith('[IMS] '))
+        self.assertTrue(reset_subject.startswith('[IMS] '))
+        # Distinct, or the two land in one Gmail thread and the reader opens the wrong code.
+        self.assertNotEqual(verification_subject, reset_subject)
+
+    # --- rendering ------------------------------------------------------------------------
+
+    def test_the_html_names_the_business_and_the_expiry(self):
+        emails.send_verification_code(self.user, '123456')
+        html = self.html_of(self.sent())
+        self.assertIn('Corner Shop', html)
+        self.assertIn('Valid for 10 minutes', html)
+
+    def test_an_account_less_user_still_renders(self):
+        # Superadmins and half-provisioned users have no membership; the template must not
+        # render "None's IMS account".
+        orphan = User.objects.create_user(
+            username='orphan@example.com', email='orphan@example.com', password='pw-12345',
+        )
+        emails.send_verification_code(orphan, '123456')
+        html = self.html_of(self.sent())
+        # No possessive dangling off nothing, and no literal "None".
+        self.assertNotIn('None', html)
+        self.assertNotIn('&rsquo;s IMS', html)
+        self.assertIn('automated message from IMS', html)
+
+    def test_the_expiry_line_is_singular_at_one_minute(self):
+        with patch.object(verification, 'CODE_TTL', timedelta(minutes=1)):
+            emails.send_verification_code(self.user, '123456')
+        self.assertIn('Valid for 1 minute.', self.html_of(self.sent()))
+
+    def test_the_html_has_no_remote_content(self):
+        # A code email that fetches remote images shows "images not displayed" warnings,
+        # adds filter weight, and delays the one thing the reader wants.
+        emails.send_verification_code(self.user, '123456')
+        html = self.html_of(self.sent())
+        self.assertNotIn('<img', html.lower())
+        self.assertNotIn('http://', html)
+        self.assertNotIn('https://', html)
+
+    def test_the_html_uses_inline_styles_not_a_style_block(self):
+        # Outlook renders through Word, which drops <style> blocks entirely.
+        emails.send_verification_code(self.user, '123456')
+        html = self.html_of(self.sent())
+        self.assertNotIn('<style', html.lower())
+        self.assertIn('style="', html)
+
+    def test_the_preheader_is_hidden_but_present(self):
+        emails.send_verification_code(self.user, '123456')
+        html = self.html_of(self.sent())
+        self.assertIn('mso-hide:all', html)
+        self.assertIn('Your IMS verification code', html)
+
+    def test_the_code_is_escaped_like_any_other_context(self):
+        emails.send_verification_code(self.user, '<script>x</script>')
+        self.assertNotIn('<script>', self.html_of(self.sent()))
+
+
+@override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')
+class SendTestEmailTemplateTests(TestCase):
+    """The CLI probe must send what users actually get, or it proves the wrong half."""
+
+    def test_the_probe_sends_the_real_template(self):
+        out = StringIO()
+        call_command('send_test_email', 'someone@example.com', stdout=out, stderr=StringIO())
+
+        self.assertEqual(len(mail.outbox), 1)
+        message = mail.outbox[0]
+        self.assertEqual(message.subject, '[IMS] Your verification code')
+        self.assertIn('123456', message.body)
+        self.assertIn('123456', message.alternatives[0][0])
+        self.assertEqual(message.alternatives[0][1], 'text/html')
+
+    def test_the_sample_code_is_overridable(self):
+        call_command(
+            'send_test_email', 'someone@example.com', code='999111',
+            stdout=StringIO(), stderr=StringIO(),
+        )
+        self.assertIn('999111', mail.outbox[0].body)
+
+    def test_the_probe_writes_no_user_row(self):
+        # A diagnostic that writes to the database is one nobody runs against production.
+        before = User.objects.count()
+        call_command('send_test_email', 'someone@example.com', stdout=StringIO(), stderr=StringIO())
+        self.assertEqual(User.objects.count(), before)

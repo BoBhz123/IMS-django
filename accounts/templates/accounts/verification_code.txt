@@ -1,6 +1,0 @@
-Your verification code is {{ code }}
-
-Enter it in the app to finish setting up {{ business_name }}.
-
-The code expires in {{ ttl_minutes }} minutes. If you did not create an account, ignore this
-email — nothing has been charged and no data has been stored.

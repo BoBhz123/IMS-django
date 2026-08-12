@@ -1,0 +1,102 @@
+{% comment %}
+One-time-code email, used by both signup verification and password reset.
+
+Table-based with inline styles on purpose. Outlook on Windows renders through Word, which
+ignores <style> blocks, flexbox, grid, border-radius and margin on most elements — so the
+layout is nested tables with cellpadding, and every rule that matters is on the element.
+
+Deliberately no images, no web fonts, no tracking pixel. A transactional code email that
+fetches remote content shows "images not displayed" warnings in Gmail and Outlook, adds
+spam-filter weight, and delays the one thing the reader wants, which is six digits.
+{% endcomment %}<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#f4f5f7;margin:0;padding:0;">
+  <tr>
+    <td align="center" style="padding:24px 12px;">
+
+      {# Preheader: the grey preview line next to the subject in every inbox list. Left
+         unset, clients scrape the first visible text, which here would be the brand name
+         repeated. Hidden in the body itself by the zero dimensions. #}
+      <div style="display:none;max-height:0;overflow:hidden;mso-hide:all;font-size:1px;line-height:1px;color:#f4f5f7;">
+        {{ preheader }}
+      </div>
+
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="600" style="width:600px;max-width:100%;background-color:#ffffff;border:1px solid #e3e5e8;border-radius:8px;">
+
+        <tr>
+          <td align="center" style="padding:28px 32px 8px 32px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+            <span style="font-size:20px;font-weight:700;color:#1c1f23;letter-spacing:0.5px;">IMS</span>
+            <div style="font-size:12px;color:#6b7280;padding-top:2px;">Inventory &amp; Order Management</div>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="padding:16px 32px 0 32px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+            <h1 style="margin:0 0 12px 0;font-size:19px;line-height:26px;font-weight:600;color:#1c1f23;">
+              {{ heading }}
+            </h1>
+            <p style="margin:0 0 20px 0;font-size:15px;line-height:23px;color:#3f4550;">
+              {{ intro }}
+            </p>
+          </td>
+        </tr>
+
+        {# The code. Its own bordered table rather than a styled <div>, because Word drops
+           background-color and padding on divs and the code would sit unboxed on white. #}
+        <tr>
+          <td style="padding:0 32px;">
+            <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#f7f8fa;border:1px solid #e3e5e8;border-radius:6px;">
+              <tr>
+                <td align="center" style="padding:22px 16px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+                  <div style="font-size:11px;font-weight:600;letter-spacing:1px;color:#6b7280;text-transform:uppercase;padding-bottom:8px;">
+                    {{ code_label }}
+                  </div>
+                  {# letter-spacing adds a trailing gap after the last glyph, which reads as
+                     off-centre. The matching negative margin-right pulls it back. #}
+                  <div style="font-family:'SF Mono',Menlo,Consolas,'Courier New',monospace;font-size:34px;line-height:40px;font-weight:700;color:#1c1f23;letter-spacing:8px;margin-right:-8px;">
+                    {{ code }}
+                  </div>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <tr>
+          <td align="center" style="padding:14px 32px 0 32px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+            <p style="margin:0;font-size:13px;line-height:20px;color:#6b7280;">
+              Valid for {{ ttl_minutes }} minute{{ ttl_minutes|pluralize }}. It can be used once.
+            </p>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="padding:20px 32px 4px 32px;">
+            <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+              <tr><td style="border-top:1px solid #e3e5e8;font-size:0;line-height:0;">&nbsp;</td></tr>
+            </table>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="padding:8px 32px 24px 32px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+            <p style="margin:0;font-size:13px;line-height:20px;color:#6b7280;">
+              {{ reassurance }}
+            </p>
+          </td>
+        </tr>
+
+      </table>
+
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="600" style="width:600px;max-width:100%;">
+        <tr>
+          <td align="center" style="padding:16px 32px 8px 32px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+            <p style="margin:0;font-size:12px;line-height:18px;color:#8b919c;">
+              This is an automated message from {% if business_name %}{{ business_name }}&rsquo;s {% endif %}IMS{% if not business_name %} Inventory &amp; Order Management{% endif %}.<br>
+              Please do not reply — this address is not monitored.
+            </p>
+          </td>
+        </tr>
+      </table>
+
+    </td>
+  </tr>
+</table>

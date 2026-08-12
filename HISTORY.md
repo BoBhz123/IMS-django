@@ -8,6 +8,52 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-12 — HTML transactional email
+
+Codes now go out as `multipart/alternative` — a table-based HTML part and a real plain-text
+part — from `emails/otp_code.{html,txt}`, one template pair for both the signup and password
+reset flows. They differ in wording, not layout, and a second copy of the table scaffolding is
+a second thing to keep rendering correctly in Outlook.
+
+**The plain-text part is not decoration.** A single-part HTML mail with no text alternative is
+one of the oldest spam signals there is. It renders the same content properly rather than
+being a "please enable HTML" stub, which is worth as little to a filter as it is to someone
+reading on a watch.
+
+Table-based with inline styles because Outlook on Windows renders through Word, which drops
+`<style>` blocks, flexbox, grid, and `margin` on most elements. The code sits in its own
+bordered table rather than a styled `<div>` for the same reason — Word drops `background-color`
+and `padding` on divs and the code would sit unboxed on white. `letter-spacing` adds a trailing
+gap after the last glyph, so a matching negative `margin-right` pulls it back to centre.
+
+No images, no web fonts, no tracking pixel. Remote content triggers "images not displayed"
+warnings, adds filter weight, and delays the one thing the reader wants.
+
+`DEFAULT_FROM_EMAIL` is composed into `IMS Support <…>` in settings, and it detects an address
+that already carries a display name rather than double-wrapping — the doubled header is one
+Brevo rejects outright. `DEFAULT_FROM_ADDRESS` keeps the bare form for anything that needs it.
+
+`send_test_email` now sends through the real `send_verification_code`, so the probe puts
+exactly what a user receives into the inbox. A bespoke test body proved the SMTP hop worked
+and nothing about the mail people actually get, which was the half that was broken. It uses a
+`_ProbeUser` stand-in rather than creating a row — a diagnostic that writes to the database is
+one nobody runs against production.
+
+The footer wording caught a real bug in review: with no membership, `business_name` fell back
+to the phrase "your account" and the footer read "from your account's IMS account". The
+fallback is now empty and the templates word its absence themselves.
+
+**HTML does not fix the spam placement, and should not be claimed to.** The dominant signal is
+still that `support.imsapp@gmail.com` cannot be DKIM-signed by us — Brevo relays it, Gmail sees
+a gmail.com sender arriving from a third party, and files it accordingly. Sending from a domain
+we control, with SPF and DKIM published, is the actual fix. This work removes the
+easy signals (missing text part, no display name, unbranded subject) and makes the mail look
+like what it is.
+
+Verified: `manage.py test` 520 passed; a real send through Brevo landed in the target inbox.
+
+---
+
 ## 2026-08-12 — One trial per account, an encrypted payment log, and the email-config fix
 
 **`has_used_trial` latches on the first trial.** A null `trial_ends_at` could not stand in for

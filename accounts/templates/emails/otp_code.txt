@@ -1,0 +1,13 @@
+{{ heading }}
+
+{{ intro }}
+
+{{ code_label }}: {{ code }}
+
+Valid for {{ ttl_minutes }} minute{{ ttl_minutes|pluralize }}. It can be used once.
+
+{{ reassurance }}
+
+--
+This is an automated message from {% if business_name %}{{ business_name }}'s {% endif %}IMS{% if not business_name %} Inventory & Order Management{% endif %}.
+Please do not reply — this address is not monitored.
