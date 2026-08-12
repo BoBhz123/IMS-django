@@ -19,14 +19,14 @@ from . import verification
 logger = logging.getLogger(__name__)
 
 
-def send_verification_code(user, code):
+def _send_code(user, code, *, template, subject, what):
     """Returns True if the message was handed to the mail backend. Never raises."""
     if not user.email:
-        logger.error('No email address for user %s — cannot send a verification code', user.pk)
+        logger.error('No email address for user %s — cannot send %s', user.pk, what)
         return False
 
     account = getattr(getattr(user, 'membership', None), 'account', None)
-    body = render_to_string('accounts/verification_code.txt', {
+    body = render_to_string(template, {
         'code': code,
         'business_name': account.name if account else 'your account',
         'ttl_minutes': int(verification.CODE_TTL.total_seconds() // 60),
@@ -34,7 +34,7 @@ def send_verification_code(user, code):
 
     try:
         send_mail(
-            subject='Your verification code',
+            subject=subject,
             message=body,
             from_email=settings.DEFAULT_FROM_EMAIL,
             recipient_list=[user.email],
@@ -42,6 +42,24 @@ def send_verification_code(user, code):
         )
     except Exception:
         # Reported to Sentry through the logging integration; the caller decides what to do.
-        logger.exception('Failed to send a verification code to user %s', user.pk)
+        logger.exception('Failed to send %s to user %s', what, user.pk)
         return False
     return True
+
+
+def send_verification_code(user, code):
+    return _send_code(
+        user, code,
+        template='accounts/verification_code.txt',
+        subject='Your verification code',
+        what='a verification code',
+    )
+
+
+def send_password_reset_code(user, code):
+    return _send_code(
+        user, code,
+        template='accounts/password_reset_code.txt',
+        subject='Your password reset code',
+        what='a password reset code',
+    )

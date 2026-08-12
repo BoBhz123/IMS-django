@@ -9,9 +9,11 @@ import { Settings } from '@/pages/Settings'
 import { Subscription } from '@/pages/Subscription'
 import { Dashboard } from '@/pages/Dashboard'
 import { Products } from '@/pages/Products'
+import { Categories } from '@/pages/Categories'
 import { Orders } from '@/pages/Orders'
 import { Purchases } from '@/pages/Purchases'
 import { Customers } from '@/pages/Customers'
+import { Expenses } from '@/pages/Expenses'
 import { Suppliers } from '@/pages/Suppliers'
 
 function App() {
@@ -28,9 +30,11 @@ function App() {
           <Route element={<AppShell />}>
             <Route path="/" element={<Dashboard />} />
             <Route path="/products" element={<Products />} />
+            <Route path="/categories" element={<Categories />} />
             <Route path="/orders" element={<Orders />} />
             <Route path="/purchases" element={<Purchases />} />
             <Route path="/customers" element={<Customers />} />
+            <Route path="/expenses" element={<Expenses />} />
             <Route path="/suppliers" element={<Suppliers />} />
             <Route path="/settings" element={<Settings />} />
           </Route>

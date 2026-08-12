@@ -10,6 +10,7 @@ from ..models import Account, DiscountKey, DiscountKeyRedemption, get_account
 from ..serializers import SubscriptionStatusSerializer
 from ..throttles import RedeemKeyThrottle
 from . import get_provider
+from ..audit import log_auth_event
 from .activation import activate_account
 from .base import ProviderUnavailable, UnknownPlan
 from .keys import normalize_key
@@ -91,6 +92,17 @@ class RedeemKeyView(APIView):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # A subscription was granted without a card payment — the event most worth being
+        # able to reconstruct later, since it is the one that moves money outside the
+        # gateway. The key id, not the code: the code is a bearer credential.
+        log_auth_event(
+            'subscription_granted_by_key',
+            request.user,
+            account=account.pk,
+            key_id=key.pk,
+            grants=key.grants,
+        )
 
         # The SPA re-routes off this body, so return exactly what GET /accounts/subscription/
         # returns rather than a bespoke shape it would need a second parser for.

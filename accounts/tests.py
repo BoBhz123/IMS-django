@@ -2106,3 +2106,354 @@ class AdminOverrideSyncTests(TestCase):
 
         self.assertFalse(self.payload()['subscription_live'])
         self.assertEqual(self.as_customer().get('/inventory/products/').status_code, 403)
+class CodePurposeTests(TestCase):
+    """
+    Codes are scoped to what they were issued for.
+
+    Without a purpose, one `EmailVerification` table serves two flows and three things go
+    wrong: a signup code can be replayed at the password-reset endpoint, requesting a reset
+    silently expires an outstanding signup code, and the two flows share one
+    five-sends-per-hour budget so using either one exhausts the other.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='owner@example.com', email='owner@example.com', password='pw12345!',
+        )
+
+    def test_a_signup_code_does_not_verify_as_a_password_reset(self):
+        _, code = verification.issue_code(self.user)
+        self.assertEqual(
+            verification.verify_code(
+                self.user, code, purpose=verification.PASSWORD_RESET,
+            ),
+            verification.NO_CODE,
+        )
+
+    def test_a_reset_code_does_not_verify_as_an_email_verification(self):
+        _, code = verification.issue_code(self.user, purpose=verification.PASSWORD_RESET)
+        self.assertEqual(verification.verify_code(self.user, code), verification.NO_CODE)
+
+    def test_issuing_a_reset_code_leaves_an_outstanding_signup_code_alone(self):
+        _, signup_code = verification.issue_code(self.user)
+        verification.issue_code(self.user, purpose=verification.PASSWORD_RESET)
+        self.assertEqual(verification.verify_code(self.user, signup_code), verification.OK)
+
+    def test_the_hourly_send_cap_is_counted_per_purpose(self):
+        # Exhaust the signup budget outright, then prove a reset can still be requested.
+        for _ in range(verification.MAX_SENDS_PER_HOUR):
+            row, _ = verification.issue_code(self.user)
+            row.created_at = timezone.now() - timedelta(seconds=90)
+            row.save(update_fields=['created_at'])
+
+        with self.assertRaises(verification.ResendThrottled):
+            verification.issue_code(self.user)
+
+        row, code = verification.issue_code(self.user, purpose=verification.PASSWORD_RESET)
+        self.assertIsNotNone(code)
+
+    def test_codes_default_to_the_email_verification_purpose(self):
+        row, _ = verification.issue_code(self.user)
+        self.assertEqual(row.purpose, verification.EMAIL_VERIFICATION)
+
+
+class NonConsumingCheckTests(TestCase):
+    """
+    `consume=False` is what lets the reset UI tell the user about a typo before it asks them
+    to think up a password, without spending the code they will need one screen later.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='owner@example.com', email='owner@example.com', password='pw12345!',
+        )
+
+    def test_a_check_leaves_the_code_usable(self):
+        _, code = verification.issue_code(self.user, purpose=verification.PASSWORD_RESET)
+        for _ in range(3):
+            self.assertEqual(
+                verification.verify_code(
+                    self.user, code, purpose=verification.PASSWORD_RESET, consume=False,
+                ),
+                verification.OK,
+            )
+        # Still spendable afterwards, exactly once.
+        self.assertEqual(
+            verification.verify_code(
+                self.user, code, purpose=verification.PASSWORD_RESET,
+            ),
+            verification.OK,
+        )
+        self.assertEqual(
+            verification.verify_code(
+                self.user, code, purpose=verification.PASSWORD_RESET,
+            ),
+            verification.NO_CODE,
+        )
+
+    def test_a_wrong_guess_still_counts_against_the_cap(self):
+        # Not consuming must not mean not counting, or the check endpoint is a free oracle to
+        # grind the six-digit space against.
+        row, _ = verification.issue_code(self.user, purpose=verification.PASSWORD_RESET)
+        verification.verify_code(
+            self.user, '000000', purpose=verification.PASSWORD_RESET, consume=False,
+        )
+        row.refresh_from_db()
+        self.assertEqual(row.attempts, 1)
+
+
+class PasswordResetEndpointTests(TestCase):
+    """
+    Three endpoints for a three-screen flow, but only one of them decides anything: the
+    password changes in `confirm`, which takes the code and the new password together.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='owner@example.com', email='owner@example.com', password='oldpw12345!',
+        )
+        self.account = Account.objects.create(
+            name='Corner Shop', subscription_status=Account.ACTIVE,
+        )
+        Membership.objects.create(user=self.user, account=self.account, is_owner=True)
+        self.client = APIClient()
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f'JWT {RefreshToken.for_user(self.user).access_token}',
+        )
+        mail.outbox = []
+
+    def issue(self):
+        _, code = verification.issue_code(self.user, purpose=verification.PASSWORD_RESET)
+        return code
+
+    # --- request ---
+
+    def test_requesting_a_code_emails_one(self):
+        response = self.client.post('/accounts/password-reset/request/')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn('owner@example.com', mail.outbox[0].to)
+        self.assertEqual(
+            EmailVerification.objects.filter(
+                user=self.user, purpose=verification.PASSWORD_RESET,
+            ).count(),
+            1,
+        )
+
+    def test_the_emailed_code_is_not_in_the_response(self):
+        response = self.client.post('/accounts/password-reset/request/')
+        self.assertNotIn('code', response.data)
+
+    def test_requesting_twice_in_a_row_is_throttled(self):
+        self.client.post('/accounts/password-reset/request/')
+        response = self.client.post('/accounts/password-reset/request/')
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.data['code'], 'resend_throttled')
+
+    # --- verify (the check that decides nothing) ---
+
+    def test_verifying_the_right_code_succeeds(self):
+        code = self.issue()
+        response = self.client.post(
+            '/accounts/password-reset/verify/', {'code': code}, format='json',
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_verifying_does_not_spend_the_code(self):
+        code = self.issue()
+        self.client.post('/accounts/password-reset/verify/', {'code': code}, format='json')
+        response = self.client.post(
+            '/accounts/password-reset/confirm/',
+            {'code': code, 'new_password': 'brandNewPw!2026', 'confirm_password': 'brandNewPw!2026'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_verifying_a_wrong_code_is_a_400(self):
+        self.issue()
+        response = self.client.post(
+            '/accounts/password-reset/verify/', {'code': '000000'}, format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['code'], 'invalid_code')
+
+    # --- confirm ---
+
+    def test_the_password_changes(self):
+        code = self.issue()
+        response = self.client.post(
+            '/accounts/password-reset/confirm/',
+            {'code': code, 'new_password': 'brandNewPw!2026', 'confirm_password': 'brandNewPw!2026'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password('brandNewPw!2026'))
+
+    def test_a_valid_session_alone_cannot_change_the_password(self):
+        # The whole point of the flow. If confirm accepted an authenticated request without a
+        # code, the three screens would be theatre: anyone with a borrowed session could set a
+        # new password and lock the owner out.
+        self.issue()
+        response = self.client.post(
+            '/accounts/password-reset/confirm/',
+            {'new_password': 'brandNewPw!2026', 'confirm_password': 'brandNewPw!2026'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password('oldpw12345!'))
+
+    def test_a_wrong_code_does_not_change_the_password(self):
+        self.issue()
+        response = self.client.post(
+            '/accounts/password-reset/confirm/',
+            {'code': '000000', 'new_password': 'brandNewPw!2026', 'confirm_password': 'brandNewPw!2026'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['code'], 'invalid_code')
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password('oldpw12345!'))
+
+    def test_a_signup_code_cannot_be_spent_here(self):
+        _, signup_code = verification.issue_code(self.user)
+        response = self.client.post(
+            '/accounts/password-reset/confirm/',
+            {'code': signup_code, 'new_password': 'brandNewPw!2026', 'confirm_password': 'brandNewPw!2026'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password('oldpw12345!'))
+
+    def test_the_code_is_single_use(self):
+        code = self.issue()
+        self.client.post(
+            '/accounts/password-reset/confirm/',
+            {'code': code, 'new_password': 'brandNewPw!2026', 'confirm_password': 'brandNewPw!2026'},
+            format='json',
+        )
+        response = self.client.post(
+            '/accounts/password-reset/confirm/',
+            {'code': code, 'new_password': 'anotherPw!2026', 'confirm_password': 'anotherPw!2026'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password('brandNewPw!2026'))
+
+    def test_a_weak_password_is_rejected_by_djangos_validators(self):
+        code = self.issue()
+        response = self.client.post(
+            '/accounts/password-reset/confirm/',
+            {'code': code, 'new_password': '12345', 'confirm_password': '12345'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('new_password', response.data)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password('oldpw12345!'))
+
+    def test_a_rejected_password_does_not_burn_the_code(self):
+        # Otherwise picking a password the validators dislike costs the user a fresh email
+        # and a 60-second wait, which reads as the app being broken.
+        code = self.issue()
+        self.client.post(
+            '/accounts/password-reset/confirm/',
+            {'code': code, 'new_password': '12345', 'confirm_password': '12345'},
+            format='json',
+        )
+        response = self.client.post(
+            '/accounts/password-reset/confirm/',
+            {'code': code, 'new_password': 'brandNewPw!2026', 'confirm_password': 'brandNewPw!2026'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_mismatched_confirmation_is_rejected(self):
+        code = self.issue()
+        response = self.client.post(
+            '/accounts/password-reset/confirm/',
+            {'code': code, 'new_password': 'brandNewPw!2026', 'confirm_password': 'different!2026'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password('oldpw12345!'))
+
+    def test_existing_refresh_tokens_stop_working(self):
+        # A reset is what someone does when they think their account is compromised. If the
+        # attacker's refresh token outlives it, the reset achieved nothing.
+        stale = RefreshToken.for_user(self.user)
+        code = self.issue()
+        self.client.post(
+            '/accounts/password-reset/confirm/',
+            {'code': code, 'new_password': 'brandNewPw!2026', 'confirm_password': 'brandNewPw!2026'},
+            format='json',
+        )
+        response = APIClient().post(
+            '/auth/jwt/refresh/', {'refresh': str(stale)}, format='json',
+        )
+        self.assertEqual(response.status_code, 401)
+
+    # --- permissions ---
+
+    def test_anonymous_callers_are_rejected(self):
+        for path in ('request', 'verify', 'confirm'):
+            response = APIClient().post(f'/accounts/password-reset/{path}/')
+            self.assertEqual(response.status_code, 401, path)
+
+    def test_the_flow_is_reachable_without_a_live_subscription(self):
+        # Changing a password is not a paid feature, and someone locked out of a lapsed
+        # account still needs to be able to secure it.
+        self.account.subscription_status = Account.PENDING_PAYMENT
+        self.account.save(update_fields=['subscription_status'])
+
+        code = self.issue()
+        response = self.client.post(
+            '/accounts/password-reset/confirm/',
+            {'code': code, 'new_password': 'brandNewPw!2026', 'confirm_password': 'brandNewPw!2026'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_one_users_code_cannot_reset_anothers_password(self):
+        victim = User.objects.create_user(
+            username='victim@example.com', email='victim@example.com', password='victimPw123!',
+        )
+        _, victim_code = verification.issue_code(
+            victim, purpose=verification.PASSWORD_RESET,
+        )
+        response = self.client.post(
+            '/accounts/password-reset/confirm/',
+            {'code': victim_code, 'new_password': 'brandNewPw!2026', 'confirm_password': 'brandNewPw!2026'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+        victim.refresh_from_db()
+        self.assertTrue(victim.check_password('victimPw123!'))
+
+
+class PasswordResetEmailTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='owner@example.com', email='owner@example.com', password='pw12345!',
+        )
+        mail.outbox = []
+
+    def test_the_email_carries_the_code_and_says_what_it_is_for(self):
+        self.assertTrue(emails.send_password_reset_code(self.user, '123456'))
+        self.assertEqual(len(mail.outbox), 1)
+        message = mail.outbox[0]
+        self.assertIn('123456', message.body)
+        self.assertIn('password', message.subject.lower())
+
+    def test_a_failed_send_is_reported_rather_than_raised(self):
+        with patch('accounts.emails.send_mail', side_effect=SMTPException('nope')):
+            self.assertFalse(emails.send_password_reset_code(self.user, '123456'))
+
+    def test_a_user_with_no_address_cannot_be_sent_one(self):
+        self.user.email = ''
+        self.user.save(update_fields=['email'])
+        self.assertFalse(emails.send_password_reset_code(self.user, '123456'))

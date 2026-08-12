@@ -1,6 +1,7 @@
-from django.shortcuts import render
-from django.db.models import Prefetch,F,Q,DateField
-from django.db.models.aggregates import Sum
+from django.shortcuts import get_object_or_404, render
+from django.db.models import Prefetch,F,Q,DateField,ProtectedError
+from django.db.models.aggregates import Sum,Count
+from rest_framework import status
 from django.db.models.functions import TruncDate,TruncWeek,TruncMonth,TruncYear
 from django.http import HttpResponse
 from django_filters.rest_framework import DjangoFilterBackend
@@ -10,12 +11,13 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
 from rest_framework.views import APIView
-from .filters import ProductFilter,PurchaseFilter,OrderFilter
+from rest_framework.throttling import ScopedRateThrottle
+from .filters import ProductFilter,PurchaseFilter,OrderFilter,ExpenseFilter
 from .pagination import DefaultPagination
-from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order,LINE_TOTAL
+from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order,Expense,LINE_TOTAL,LINE_COGS
+from .csv_format import iso as _iso, money as _money, text as _csv_safe
+from .reporting import DateWindow
 from .serializers import *
-from datetime import date, timedelta
-from django.utils import timezone
 import csv
 
 from accounts.mixins import AccountScopedMixin
@@ -26,6 +28,7 @@ class ProductImageViewSet(AccountScopedMixin, ModelViewSet):
     # ProductImage has no account column — it is owned through its product.
     account_lookup = 'product__account'
 
+    queryset = ProductImage.objects.all()
     serializer_class = ProductImageSerializer
     parser_classes = [MultiPartParser, FormParser]
 
@@ -33,10 +36,26 @@ class ProductImageViewSet(AccountScopedMixin, ModelViewSet):
         return {**super().get_serializer_context(), 'product_id': self.kwargs['product_pk']}
 
     def get_queryset(self):
-        return ProductImage.objects.filter(product_id=self.kwargs['product_pk'])
+        # Chained through super() deliberately. This used to be a bare
+        # `ProductImage.objects.filter(product_id=...)`, which silently discarded
+        # AccountScopedMixin's filter and left the nested route unscoped — `account_lookup`
+        # above was declared but never reached. Any authenticated subscriber could then list,
+        # replace or delete another account's product images by guessing a product id.
+        # Found by the Phase 8 isolation matrix.
+        return super().get_queryset().filter(product_id=self.kwargs['product_pk'])
+
+    def get_product_or_404(self):
+        # 404 rather than 403: a 403 would confirm the product exists while belonging to
+        # someone else, which is an existence oracle across the tenant boundary.
+        return get_object_or_404(
+            Product.objects.filter(account=self.account), pk=self.kwargs['product_pk'],
+        )
 
     def perform_create(self, serializer):
-        # Not AccountScopedMixin's save(account=...): there is no such field to stamp.
+        # Not AccountScopedMixin's save(account=...): there is no such field to stamp. The
+        # ownership check therefore has to happen explicitly — the queryset scoping above
+        # governs reads only, and the parent product id comes straight off the URL.
+        self.get_product_or_404()
         serializer.save()
 
 
@@ -47,17 +66,44 @@ class ProductViewSet(AccountScopedMixin, ModelViewSet):
    filter_backends = [DjangoFilterBackend,SearchFilter,OrderingFilter]
    filterset_class = ProductFilter
    pagination_class = DefaultPagination
-   search_fields = ['name','description']
+   # barcode is here so a scanned code finds its product through the same ?search= the list
+   # already uses, rather than needing a second endpoint.
+   search_fields = ['name','description','barcode']
    ordering_fields = ['name','default_sell_price']
    
     
 
-class  CategoryViewSet(AccountScopedMixin, ModelViewSet):
-    queryset = Category.objects.all()
+class ProtectedDeleteMixin:
+    """Turn a PROTECT foreign key into a 409 instead of an uncaught 500.
+
+    `Product.category` and `Product.supplier` are both `on_delete=PROTECT`, so deleting one that
+    still has products raises `ProtectedError` straight out of the view. DRF has no handler for
+    it, so the browser gets a 500 and the user gets no idea what to do about it.
+    """
+
+    protected_delete_message = 'This record is still in use and cannot be deleted.'
+
+    def destroy(self, request, *args, **kwargs):
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response(
+                {'detail': self.protected_delete_message},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+
+class  CategoryViewSet(ProtectedDeleteMixin, AccountScopedMixin, ModelViewSet):
+    # product_count drives the Categories screen: it shows how many products a category holds
+    # and disables its delete button, so the 409 below is the backstop rather than the norm.
+    queryset = Category.objects.annotate(product_count=Count('products'))
     serializer_class = CategorySerializer
     filter_backends = [SearchFilter,OrderingFilter]
     ordering_fields= ['name']
     search_fields = ['name']
+    protected_delete_message = (
+        'This category still has products in it. Move those products to another category first.'
+    )
 
 class CustomerViewSet(AccountScopedMixin, ModelViewSet):
     queryset = Customer.objects.all()
@@ -66,12 +112,15 @@ class CustomerViewSet(AccountScopedMixin, ModelViewSet):
     ordering_fields= ['name']
     search_fields = ['name']
     
-class SupplierViewSet(AccountScopedMixin, ModelViewSet):
+class SupplierViewSet(ProtectedDeleteMixin, AccountScopedMixin, ModelViewSet):
     queryset = Supplier.objects.all()
     serializer_class = SupplierSerializer
     filter_backends = [SearchFilter,OrderingFilter]
     ordering_fields= ['name']
     search_fields = ['name']
+    protected_delete_message = (
+        'This supplier still has products assigned to it. Reassign those products first.'
+    )
     
 class _TotalAnnotationMixin:
     """
@@ -138,13 +187,6 @@ GROUP_BY_TRUNC = {
     'year': TruncYear,
 }
 
-# 'all_time' is intentionally absent: it means "no date filtering", the existing default behavior.
-PERIOD_WINDOW_DAYS = {
-    'last_month': 30,
-    'last_year': 365,
-}
-
-
 class AnalyticsView(APIView):
     # Deliberately not IsAdminUser. The dashboard calls this on every load, so admin-only
     # would force every subscriber to be is_staff — which now means platform admin over
@@ -158,60 +200,45 @@ class AnalyticsView(APIView):
             OrderItem.objects.filter(order__account=account)
             if account else OrderItem.objects.none()
         )
+        expenses = Expense.objects.for_account(account)
 
-        year = request.query_params.get('year')
-        month = request.query_params.get('month')
-        start_date = request.query_params.get('start_date')
-        end_date = request.query_params.get('end_date')
         group_by = request.query_params.get('group_by')
-        period = request.query_params.get('period')
 
-        if period in PERIOD_WINDOW_DAYS:
-            cutoff = timezone.now() - timedelta(days=PERIOD_WINDOW_DAYS[period])
-            orders = orders.filter(placed_at__gte=cutoff)
-            purchases = purchases.filter(placed_at__gte=cutoff)
-            products = products.filter(order__placed_at__gte=cutoff)
+        window = DateWindow.from_query_params(request.query_params)
+        orders = window.apply(orders, 'placed_at')
+        purchases = window.apply(purchases, 'placed_at')
+        products = window.apply(products, 'order__placed_at')
+        expenses = window.apply(expenses, 'spent_at')
 
-        if year:
-            orders = orders.filter(placed_at__year=year)
-            purchases = purchases.filter(placed_at__year=year)
-            products = products.filter(order__placed_at__year=year)
-
-        if month:
-            orders = orders.filter(placed_at__month=month)
-            purchases = purchases.filter(placed_at__month=month)
-            products = products.filter(order__placed_at__month=month)
-
-        if start_date:
-            orders = orders.filter(placed_at__date__gte=start_date)
-            purchases = purchases.filter(placed_at__date__gte=start_date)
-            products = products.filter(order__placed_at__date__gte=start_date)
-
-        if end_date:
-            orders = orders.filter(placed_at__date__lte=end_date)
-            purchases = purchases.filter(placed_at__date__lte=end_date)
-            products = products.filter(order__placed_at__date__lte=end_date)
-
-        revenue_query = orders.aggregate(
-            total_revenue=Sum(LINE_TOTAL)
+        # One aggregate call over `orders`: both expressions traverse the same `items` join,
+        # so there is no fan-out between them.
+        order_totals = orders.aggregate(
+            total_revenue=Sum(LINE_TOTAL),
+            total_cogs=Sum(LINE_COGS),
         )
-        cost_query = purchases.aggregate(
-            total_cost=Sum(LINE_TOTAL)
-        )
+        outlays = purchases.aggregate(total=Sum(LINE_TOTAL))['total'] or 0
+        expense_total = expenses.aggregate(total=Sum('amount'))['total'] or 0
+
+        revenue = order_totals['total_revenue'] or 0
+        cogs = order_totals['total_cogs'] or 0
+        gross_profit = revenue - cogs
 
         best_seller_query = products.values('product__name').annotate(
             total_sold=Sum(F('quantity') * F('unit_multiplier'))
         ).order_by('-total_sold')[:5]
 
-        raw_revenue = revenue_query['total_revenue'] or 0
-        raw_cost = cost_query['total_cost'] or 0
-
-        raw_profit = raw_revenue - raw_cost
-
         data = {
-            "total_revenue": f"${raw_revenue:,.2f}",
-            "total_costs": f"${raw_cost:,.2f}",
-            "net_profit": f"${raw_profit:,.2f}",
+            # Profit and loss.
+            "total_revenue": revenue,
+            "total_cogs": cogs,
+            "gross_profit": gross_profit,
+            "total_expenses": expense_total,
+            "net_profit": gross_profit - expense_total,
+            # Cash flow, deliberately outside the P&L above. Stock bought this month is not
+            # a cost of what was sold this month; mixing them makes margin swing with
+            # restocking timing. Named inventory_outlays rather than total_costs so it
+            # cannot be misread as total_cogs.
+            "inventory_outlays": outlays,
             "top_products": best_seller_query,
             # Catalog size, deliberately NOT date-filtered — it's "how many products exist",
             # not "how many were sold in this window". Served here so the dashboard's
@@ -221,48 +248,69 @@ class AnalyticsView(APIView):
         }
 
         if group_by in GROUP_BY_TRUNC:
-            data["series"] = self._build_series(orders, purchases, GROUP_BY_TRUNC[group_by])
+            data["series"] = self._build_series(
+                orders, purchases, expenses, GROUP_BY_TRUNC[group_by],
+            )
 
         return Response(data)
 
-    def _build_series(self, orders, purchases, trunc):
-        revenue_rows = (
-            orders
-            .annotate(period=trunc('placed_at', output_field=DateField()))
-            .values('period')
-            .annotate(total=Sum(LINE_TOTAL))
-        )
-        cost_rows = (
-            purchases
-            .annotate(period=trunc('placed_at', output_field=DateField()))
-            .values('period')
-            .annotate(total=Sum(LINE_TOTAL))
-        )
-
-        revenue_by_period = {row['period']: row['total'] or 0 for row in revenue_rows if row['period']}
-        cost_by_period = {row['period']: row['total'] or 0 for row in cost_rows if row['period']}
-
-        periods = sorted(set(revenue_by_period) | set(cost_by_period))
-
-        return [
-            {
-                "period": period.isoformat(),
-                "total_revenue": revenue_by_period.get(period, 0),
-                "total_costs": cost_by_period.get(period, 0),
+    def _build_series(self, orders, purchases, expenses, trunc):
+        def totals_by_period(queryset, field, **expressions):
+            """
+            One grouped query per queryset. Multiple Sums in a single annotate() is
+            deliberate: revenue and COGS both traverse the `items` join, and splitting them
+            into two annotate() calls on the same queryset makes each multiply the other's
+            row count.
+            """
+            rows = (
+                queryset
+                .annotate(period=trunc(field, output_field=DateField()))
+                .values('period')
+                .annotate(**{name: Sum(expr) for name, expr in expressions.items()})
+            )
+            return {
+                row['period']: {name: row[name] or 0 for name in expressions}
+                for row in rows if row['period']
             }
-            for period in periods
-        ]
+
+        order_rows = totals_by_period(
+            orders, 'placed_at', total_revenue=LINE_TOTAL, total_cogs=LINE_COGS,
+        )
+        purchase_rows = totals_by_period(purchases, 'placed_at', total_costs=LINE_TOTAL)
+        expense_rows = totals_by_period(expenses, 'spent_at', total_expenses='amount')
+
+        periods = sorted(set(order_rows) | set(purchase_rows) | set(expense_rows))
+
+        series = []
+        for period in periods:
+            revenue = order_rows.get(period, {}).get('total_revenue', 0)
+            cogs = order_rows.get(period, {}).get('total_cogs', 0)
+            spent = expense_rows.get(period, {}).get('total_expenses', 0)
+            gross_profit = revenue - cogs
+            series.append({
+                "period": period.isoformat(),
+                "total_revenue": revenue,
+                # The purchases line. Keeps its Phase 3 name: the chart already reads it, and
+                # unlike the summary tile it sits nowhere near a COGS figure.
+                "total_costs": purchase_rows.get(period, {}).get('total_costs', 0),
+                "total_cogs": cogs,
+                "gross_profit": gross_profit,
+                "total_expenses": spent,
+                # Allowed to be negative. A month with rent and no sales is a loss, and that
+                # is the month most worth seeing on a chart.
+                "net_profit": gross_profit - spent,
+            })
+        return series
 
 
      
      
-def _csv_safe(value):
-    if isinstance(value, str) and value.startswith(('=', '+', '-', '@', '\t', '\r')):
-        return "'" + value
-    return value
-
-
 class ExportProductsCSVView(APIView):
+    # Scoped throttle rather than the project default (there is none): these three are
+    # the only endpoints whose cost grows with the account's entire history.
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'exports'
+
     def get(self, request):
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = 'attachment; filename="products_export.csv"'
@@ -314,6 +362,11 @@ class ExportProductsCSVView(APIView):
 
 
 class ExportOrdersCSVView(APIView):
+    # Scoped throttle rather than the project default (there is none): these three are
+    # the only endpoints whose cost grows with the account's entire history.
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'exports'
+
     def get(self, request):
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = 'attachment; filename="orders_detailed_export.csv"'
@@ -324,13 +377,20 @@ class ExportOrdersCSVView(APIView):
             'Customer Name', 
             'Date Placed', 
             'Exchange Rate (LBP)', 
-            'Product Name', 
-            'Quantity', 
-            'Unit Multiplier', 
-            'Sell Price (USD)', 
+            'Product Name',
+            'Barcode',
+            'Quantity',
+            'Unit Multiplier',
+            # The physical count, quantity * unit_multiplier. Quantity alone is meaningless
+            # to sum across lines that use different multipliers.
+            'Total Units',
+            'Sell Price (USD)',
             'Cost Price (USD)',
             'Line Total (USD)',
-            'Total Profit (USD)'
+            # This line's own profit. There is deliberately no per-order profit column: it
+            # repeated the whole order's profit on every one of its lines, so any tool that
+            # summed the column multiplied each order's profit by its line count.
+            'Line Profit (USD)',
         ])
 
         account = get_account(request.user)
@@ -353,43 +413,57 @@ class ExportOrdersCSVView(APIView):
         if order_id:
             items = items.filter(order__id=order_id)
 
-        # `item.order.total_profit` is a Python property that walks order.items.all(). Since
-        # select_related builds a distinct Order instance per row, nothing was cached: every
-        # single CSV line fired its own query for that order's items — a textbook N+1 that
-        # made a 2,000-line export 2,000 queries. One grouped aggregate replaces all of them.
-        profit_by_order = {
-            row['order_id']: row['profit'] or 0
-            for row in items.values('order_id').annotate(
-                profit=Sum(
-                    (F('unit_price') - F('product__cost_price'))
-                    * F('quantity')
-                    * F('unit_multiplier')
-                )
-            )
-        }
+        # Accumulated in the loop that already walks the items rather than re-queried, so the
+        # totals row costs no extra queries — this export's constant-query-count guarantee
+        # predates it and has a test.
+        total_units = 0
+        total_line_value = 0
+        total_line_profit = 0
 
         for item in items:
-            line_total = item.quantity * item.unit_multiplier * item.unit_price
-            cost_price = item.product.cost_price if item.product else 0
+            units = item.quantity * item.unit_multiplier
+            line_total = units * item.unit_price
+            # The snapshot on the line, not product.cost_price: a re-export of last year
+            # must reproduce last year's figures even after a cost correction.
+            cost_price = item.unit_cost_price
+            line_profit = (item.unit_price - cost_price) * units
+
+            total_units += units
+            total_line_value += line_total
+            total_line_profit += line_profit
 
             writer.writerow([
                 item.order.id,
-                item.order.customer.name if item.order.customer else "No Customer",
-                item.order.placed_at.strftime("%Y-%m-%d %H:%M"),
+                _csv_safe(item.order.customer.name if item.order.customer else "No Customer"),
+                _iso(item.order.placed_at),
                 item.order.exchange_rate,
-                item.product.name if item.product else "Unknown Product",
+                _csv_safe(item.product.name if item.product else "Unknown Product"),
+                _csv_safe(item.product.barcode or '' if item.product else ''),
                 item.quantity,
                 item.unit_multiplier,
-                f"${item.unit_price:.2f}",
-                f"${cost_price:.2f}",
-                f"${line_total:.2f}",
-                f"${profit_by_order.get(item.order_id, 0):.2f}"
+                units,
+                _money(item.unit_price),
+                _money(cost_price),
+                _money(line_total),
+                _money(line_profit),
             ])
+
+        # Quantity is deliberately not totalled: summing it across lines with different
+        # unit_multipliers produces a number that means nothing. Total Units is that column.
+        writer.writerow([
+            'TOTALS', '', '', '', '', '', '', '',
+            total_units, '', '', _money(total_line_value), _money(total_line_profit),
+        ])
 
         return response
     
     
 class ExportPurchasesCSVView(APIView):
+    # Scoped throttle rather than the project default (there is none): these three are
+    # the only endpoints whose cost grows with the account's entire history.
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'exports'
+
     def get(self, request):
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = 'attachment; filename="purchases_detailed_export.csv"'
@@ -400,11 +474,13 @@ class ExportPurchasesCSVView(APIView):
             'Supplier Name', 
             'Date Placed', 
             'Exchange Rate (LBP)', 
-            'Product Name', 
-            'Quantity', 
-            'Unit Multiplier', 
-            'Unit Cost Price (USD)', 
-            'Line Total (USD)'
+            'Product Name',
+            'Barcode',
+            'Quantity',
+            'Unit Multiplier',
+            'Total Units',
+            'Unit Cost Price (USD)',
+            'Line Total (USD)',
         ])
 
         # Query PurchaseItems directly for the row-by-row breakdown
@@ -428,19 +504,46 @@ class ExportPurchasesCSVView(APIView):
         if purchase_id:
             items = items.filter(purchase_order__id=purchase_id)
 
+        # See ExportOrdersCSVView: accumulated in the existing loop, not a second query.
+        total_units = 0
+        total_line_value = 0
+
         for item in items:
-            line_total = item.quantity * item.unit_multiplier * item.unit_price
-            
+            units = item.quantity * item.unit_multiplier
+            line_total = units * item.unit_price
+            total_units += units
+            total_line_value += line_total
+
             writer.writerow([
-                item.purchase_order.id, 
-                item.purchase_order.supplier.name if item.purchase_order.supplier else "No Supplier", 
-                item.purchase_order.placed_at.strftime("%Y-%m-%d %H:%M"), 
+                item.purchase_order.id,
+                _csv_safe(
+                    item.purchase_order.supplier.name
+                    if item.purchase_order.supplier else "No Supplier"
+                ),
+                _iso(item.purchase_order.placed_at),
                 item.purchase_order.exchange_rate,
-                item.product.name if item.product else "Unknown Product",
+                _csv_safe(item.product.name if item.product else "Unknown Product"),
+                _csv_safe(item.product.barcode or '' if item.product else ''),
                 item.quantity,
                 item.unit_multiplier,
-                f"${item.unit_price:.2f}",
-                f"${line_total:.2f}"
+                units,
+                _money(item.unit_price),
+                _money(line_total),
             ])
-            
+
+        writer.writerow([
+            'TOTALS', '', '', '', '', '', '', '',
+            total_units, '', _money(total_line_value),
+        ])
+
         return response
+
+class ExpenseViewSet(AccountScopedMixin, ModelViewSet):
+    queryset = Expense.objects.all()
+    serializer_class = ExpenseSerializer
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_class = ExpenseFilter
+    search_fields = ['description']
+    ordering_fields = ['spent_at', 'amount', 'category']
+    ordering = ['-spent_at']
+    pagination_class = DefaultPagination

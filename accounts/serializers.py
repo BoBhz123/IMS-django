@@ -1,6 +1,8 @@
 from datetime import timedelta
 
 from django.contrib.auth.models import User
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.utils import timezone
 from djoser.serializers import UserCreateSerializer, UserSerializer
@@ -93,6 +95,41 @@ class UserCreateWithAccountSerializer(UserCreateSerializer):
 
 class VerifyEmailSerializer(serializers.Serializer):
     code = serializers.CharField(max_length=12, trim_whitespace=True)
+
+
+class PasswordResetConfirmSerializer(serializers.Serializer):
+    """
+    The code and the new password arrive together, deliberately.
+
+    A three-screen flow invites a three-endpoint design where step two verifies the code and
+    step three sets the password on the strength of being authenticated. That makes the code
+    decorative: anyone holding a borrowed session skips to step three. Here the only endpoint
+    that changes anything requires the code in the same request, so the decision is made once.
+
+    `code` is required, so an omitted one is a 400 from the field rather than a reset that
+    quietly succeeds.
+    """
+
+    code = serializers.CharField(max_length=12, trim_whitespace=True)
+    new_password = serializers.CharField(write_only=True, trim_whitespace=False)
+    confirm_password = serializers.CharField(write_only=True, trim_whitespace=False)
+
+    def validate(self, attrs):
+        if attrs['new_password'] != attrs['confirm_password']:
+            raise serializers.ValidationError(
+                {'confirm_password': 'The two passwords do not match.'}
+            )
+        return attrs
+
+    def validate_new_password(self, value):
+        # Django's configured AUTH_PASSWORD_VALIDATORS, not a hand-rolled length check, so
+        # this flow cannot become the one way into the app that accepts '12345'. The user is
+        # passed so the similarity validator can do its job.
+        try:
+            validate_password(value, user=self.context.get('user'))
+        except DjangoValidationError as error:
+            raise serializers.ValidationError(list(error.messages))
+        return value
 
 
 class SubscriptionStatusSerializer(serializers.ModelSerializer):

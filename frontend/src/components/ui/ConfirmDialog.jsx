@@ -12,8 +12,13 @@ export function ConfirmDialog({ open, onClose, onConfirm, title, description, co
     try {
       await onConfirm()
       onClose()
-    } catch {
-      setError("Couldn't delete this — it may still be referenced by products, orders, or purchases.")
+    } catch (error) {
+      // Prefer the server's explanation. A PROTECT foreign key now comes back as a 409 that
+      // names what is blocking the delete and what to do about it, which beats the guess below.
+      setError(
+        error?.response?.data?.detail ??
+          "Couldn't delete this — it may still be referenced by products, orders, or purchases.",
+      )
     } finally {
       setBusy(false)
     }

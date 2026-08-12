@@ -3,6 +3,7 @@ from datetime import timedelta
 
 import dj_database_url
 import sentry_sdk
+from django.core.exceptions import ImproperlyConfigured
 from sentry_sdk.integrations.django import DjangoIntegration
 
 # Initialized as early as possible (before most other settings/imports run), per Sentry's
@@ -59,6 +60,18 @@ SECRET_KEY = os.environ.get(
 # not just the literal string 'False', since env vars are always strings.
 DEBUG = os.environ.get('DJANGO_DEBUG', 'True').strip().lower() not in ('false', '0', 'no')
 
+# Fail loudly rather than open. Without this, a deploy that forgets DJANGO_SECRET_KEY runs on
+# the key committed above — and since SIMPLE_JWT has no separate SIGNING_KEY, that key signs
+# every JWT, so anyone reading this repository could mint a token for any user. A silent
+# insecure boot is worse than a refused one: nothing surfaces until the forged tokens do.
+# Scoped to `not DEBUG` so local development is untouched.
+if not DEBUG and SECRET_KEY.startswith('django-insecure-'):
+    raise ImproperlyConfigured(
+        'DJANGO_SECRET_KEY is unset, so SECRET_KEY is still the insecure default committed '
+        'in ims/settings.py. It signs every JWT. Set DJANGO_SECRET_KEY to a long random '
+        'value, or set DJANGO_DEBUG=True if this is local development.'
+    )
+
 # Comma-separated list via ALLOWED_HOSTS env var (e.g. "client.myimsapp.com,testlab.myimsapp.com").
 # Falls back to '*' (unchanged local-dev/current-prod behavior) when unset. '.myimsapp.com' as a
 # leading-dot entry matches that domain and all its subdomains, per Django's ALLOWED_HOSTS docs.
@@ -95,8 +108,6 @@ INSTALLED_APPS = [
     #local apps
     'accounts',
     'inventory',
-    #dev apps
-    'playground',
 ]
 
 # Debug toolbar is a development profiler — it should never be loaded in production, where
@@ -114,6 +125,10 @@ AUTHENTICATION_BACKENDS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    # CSP and Referrer-Policy — Django's SecurityMiddleware has no CSP setting at all.
+    # Verified against the Django 6 admin, which emits no inline <script> blocks and no
+    # inline event handlers, so script-src 'self' does not break it.
+    'ims.security_headers.SecurityHeadersMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -169,13 +184,20 @@ _database_url_config = dj_database_url.config()
 if _database_url_config:
     DATABASES['default'] = _database_url_config
 
-CORS_ALLOW_ALL_ORIGINS = True
+# Tied to DEBUG rather than left on. A wildcard lets any site on the internet make
+# credentialed cross-origin calls with a victim's browser; it was a dev convenience carried
+# from before this app had accounts, and it is a real exposure the moment auth moves to
+# cookies or a same-site scheme. Local dev is unchanged because DEBUG is True there.
+CORS_ALLOW_ALL_ORIGINS = DEBUG
 
-# Explicit allowlist, kept alongside the wildcard above for when CORS_ALLOW_ALL_ORIGINS
-# is eventually turned off (that flag takes precedence over this list while it's True).
-# Covers the Vite dev server both un-tenanted and via the tenant1 subdomain used for
-# local multi-tenant testing.
+# The production contract. Read from the environment so adding a domain is a config change
+# rather than a code deploy; the literals are the local dev fallback — the Vite dev server
+# both un-tenanted and via the subdomain used for local testing.
 CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',')
+    if origin.strip()
+] or [
     'http://localhost:5173',
     'http://tenant1.localhost:5173',
 ]
@@ -245,6 +267,16 @@ REST_FRAMEWORK = {
         'verify_email': '30/hour',
         'resend_code': '10/hour',
         'redeem_key': '20/hour',
+        # Must stay comfortably above verification.MAX_ATTEMPTS (5), or a user who mistypes
+        # gets a 429 where they should get "request a new code". The verify scope covers the
+        # check and the confirm endpoint together, since both take the same code.
+        'password_reset_request': '10/hour',
+        'password_reset_verify': '30/hour',
+        # The CSV exports walk every line item an account has ever recorded — the most
+        # expensive request an authenticated caller can make, and the cheapest to repeat in
+        # a loop. 30/hour is far above any real use (the SPA exports on a button press) and
+        # far below what it takes to tie up the database.
+        'exports': '30/hour',
     },
 }
 
@@ -290,6 +322,66 @@ AXES_LOCKOUT_PARAMETERS = ['username', 'ip_address']
 # exactly one proxy hop and reading X-Forwarded-For recovers the real client IP.
 AXES_IPWARE_PROXY_COUNT = 1
 AXES_IPWARE_META_PRECEDENCE_ORDER = ('HTTP_X_FORWARDED_FOR', 'REMOTE_ADDR')
+
+# Roll a policy change out in report-only mode first when touching ims/security_headers.py
+# against a live deployment: the browser reports violations without blocking anything.
+CSP_REPORT_ONLY = os.environ.get('CSP_REPORT_ONLY', '').strip().lower() in ('1', 'true', 'yes')
+# Extra image hosts, comma-separated, for a deployment serving media from somewhere the
+# AWS_S3_CUSTOM_DOMAIN setting does not already cover.
+CSP_EXTRA_IMG_SRC = [
+    origin.strip()
+    for origin in os.environ.get('CSP_EXTRA_IMG_SRC', '').split(',')
+    if origin.strip()
+]
+# The browser Sentry SDK uses VITE_SENTRY_DSN, whose ingest host can differ from the Django
+# one; without listing it here, connect-src blocks frontend error reporting silently.
+CSP_EXTRA_CONNECT_SRC = [
+    origin.strip()
+    for origin in os.environ.get('CSP_EXTRA_CONNECT_SRC', '').split(',')
+    if origin.strip()
+]
+
+# Security audit trail. To stdout, which Heroku captures and Sentry's logging integration
+# forwards from WARNING up — no log-shipping dependency and no table to prune. This is an
+# audit *trail*, not tamper-evident audit *storage*: anyone with dyno access can write to
+# stdout. Right level for a single-operator business tool, wrong level for a compliance
+# obligation, and stated plainly so nobody assumes otherwise.
+#
+# django.security.* is Django's own channel for suspicious operations (bad Host headers,
+# tampered signatures). axes logs every failed and locked-out login. ims.security is ours.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'security': {
+            'format': '[{asctime}] {levelname} {name} {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'security_console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'security',
+        },
+    },
+    'loggers': {
+        'ims.security': {
+            'handlers': ['security_console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'django.security': {
+            'handlers': ['security_console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'axes': {
+            'handlers': ['security_console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+    },
+}
 
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = 'DENY'

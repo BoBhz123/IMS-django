@@ -3,7 +3,7 @@ from collections import defaultdict
 from rest_framework import serializers
 from django.db import transaction
 from django.db.models import F
-from .models import Product , Category,Purchase,PurchaseItem,Order,OrderItem,Supplier,ProductImage,Customer
+from .models import Product , Category,Purchase,PurchaseItem,Order,OrderItem,Supplier,ProductImage,Customer,Expense
 import uuid
 
 
@@ -37,6 +37,36 @@ class AccountScopedSerializerMixin:
                 model.objects.for_account(account) if account else model.objects.none()
             )
         return fields
+
+
+class AccountUniqueNameMixin:
+    """
+    Validates a per-account unique name in the serializer instead of at the database.
+
+    The models carry `UniqueConstraint(fields=['account', 'name'])`, but DRF cannot generate a
+    validator for it: `account` is not a serializer field — it is stamped in `perform_create` —
+    so DRF sees only `name` and considers it unconstrained. The constraint then fires in the
+    database as an `IntegrityError`, which reaches the client as an uncaught 500 rather than a
+    400 naming the field. Typing a name that already exists is an everyday user action, not an
+    exceptional one.
+    """
+
+    #: model whose (account, name) pair must stay unique.
+    unique_name_model = None
+    unique_name_message = 'You already have one with this name.'
+
+    def validate_name(self, value):
+        name = value.strip()
+        account = self.context.get('account')
+        if account is None or self.unique_name_model is None:
+            return name
+
+        clashes = self.unique_name_model.objects.filter(account=account, name__iexact=name)
+        if self.instance is not None:
+            clashes = clashes.exclude(pk=self.instance.pk)
+        if clashes.exists():
+            raise serializers.ValidationError(self.unique_name_message)
+        return name
 
 
 def _units_by_product_id(items_data):
@@ -78,19 +108,64 @@ class ProductSerializer(AccountScopedSerializerMixin, serializers.ModelSerialize
     account_scoped_fields = {'category': Category, 'supplier': Supplier}
 
     images = ProductImageSerializer(many=True, read_only=True)
+
+    def validate_barcode(self, value):
+        """
+        One code, one product — checked here as well as in the database.
+
+        Same reasoning as AccountUniqueNameMixin: `account` is stamped in perform_create and
+        is not a serializer field, so DRF sees `barcode` as unconstrained and the
+        UniqueConstraint would surface as an uncaught IntegrityError 500. Scanning the wrong
+        box is an everyday mistake and deserves a field error.
+
+        Stripped before comparing because Product.save() strips before storing — otherwise a
+        trailing space walks past this check and hits the constraint anyway.
+        """
+        barcode = (value or '').strip()
+        account = self.context.get('account')
+        if not barcode or account is None:
+            return barcode
+
+        clashes = Product.objects.filter(account=account, barcode=barcode)
+        if self.instance is not None:
+            clashes = clashes.exclude(pk=self.instance.pk)
+        if clashes.exists():
+            raise serializers.ValidationError(
+                'Another product already uses this barcode.'
+            )
+        return barcode
+
     class Meta():
         model = Product
-        fields = ['id','name','category','supplier','description','cost_price','default_sell_price','profit','stock_quantity','images']
+        # allow_blank so the SPA can clear the field by sending '' — Product.save()
+        # normalizes that to NULL rather than storing an empty string.
+        extra_kwargs = {'barcode': {'allow_blank': True}}
+        fields = ['id','name','category','supplier','description','cost_price','default_sell_price','profit','stock_quantity','barcode','images']
         
 class SimpleProductSerializer(serializers.ModelSerializer):
     class Meta:
         model = Product
         fields = ['id', 'name', 'default_sell_price']    
         
-class CategorySerializer(serializers.ModelSerializer):
+class CategorySerializer(AccountUniqueNameMixin, serializers.ModelSerializer):
+    # iexact, so "Drinks" and "drinks" cannot coexist. Deliberately stricter than the database
+    # constraint, which is case-sensitive: two categories differing only in case are
+    # indistinguishable in a dropdown.
+    unique_name_model = Category
+    unique_name_message = 'You already have a category with this name.'
+
+    product_count = serializers.SerializerMethodField()
+
     class Meta():
         model = Category
-        fields = ['id','name']
+        fields = ['id','name','product_count']
+
+    def get_product_count(self, category):
+        # Annotated by CategoryViewSet for list/retrieve. A category that has just been created
+        # or renamed comes back off serializer.save() with no annotation, so fall back rather
+        # than raise — 0 is the right answer for a new one anyway.
+        count = getattr(category, 'product_count', None)
+        return category.products.count() if count is None else count
         
         
 class CreatePurchaseItemSerializer(AccountScopedSerializerMixin, serializers.ModelSerializer):
@@ -216,10 +291,20 @@ class CreateOrderSerializer(AccountScopedSerializerMixin, serializers.ModelSeria
         if errors:
             raise serializers.ValidationError({'items': errors})
 
+        # bulk_create bypasses OrderItem.save(), so the snapshot is taken here. Read off the
+        # rows already locked above rather than re-querying: that is the cost as it stood at
+        # the instant this sale was committed.
+        cost_by_product_id = {product.id: product.cost_price for product in locked}
+
         order = Order.objects.create(**validated_data)
-        OrderItem.objects.bulk_create(
-            [OrderItem(order=order, **item_data) for item_data in items_data]
-        )
+        OrderItem.objects.bulk_create([
+            OrderItem(
+                order=order,
+                unit_cost_price=cost_by_product_id[item_data['product'].id],
+                **item_data,
+            )
+            for item_data in items_data
+        ])
 
         # One UPDATE per product, computed in the database, rather than a save() per line.
         for product_id, units in units_by_id.items():
@@ -238,3 +323,20 @@ class OrderSerializer(serializers.ModelSerializer):
     class Meta():
         model = Order
         fields = ['id','customer','placed_at','exchange_rate','items','total_price','total_profit']  
+
+class ExpenseSerializer(serializers.ModelSerializer):
+    """
+    No AccountScopedSerializerMixin here, and that is not an omission: Expense has no
+    relational field other than `account`, so there is nothing to narrow. The account is
+    stamped by AccountScopedMixin on the viewset and is not writable.
+    """
+
+    category_display = serializers.CharField(source='get_category_display', read_only=True)
+
+    class Meta:
+        model = Expense
+        fields = [
+            'id', 'description', 'amount', 'category', 'category_display',
+            'spent_at', 'created_at',
+        ]
+        read_only_fields = ['id', 'created_at']

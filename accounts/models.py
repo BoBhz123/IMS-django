@@ -190,8 +190,23 @@ class EmailVerification(models.Model):
     without SECRET_KEY. The real defence is `attempts` plus `expires_at`.
     """
 
+    EMAIL_VERIFICATION = 'email_verification'
+    PASSWORD_RESET = 'password_reset'
+    PURPOSE_CHOICES = [
+        (EMAIL_VERIFICATION, 'Email verification'),
+        (PASSWORD_RESET, 'Password reset'),
+    ]
+
     user = models.ForeignKey(
         User, on_delete=models.CASCADE, related_name='email_verifications',
+    )
+    # What the code was issued for. Every query in accounts.verification filters on it, so a
+    # signup code cannot be replayed at the password-reset endpoint, requesting a reset does
+    # not expire an outstanding signup code, and the two flows do not share one hourly send
+    # budget. Defaulting to EMAIL_VERIFICATION is what makes the backfill correct: every row
+    # predating this field was issued by the signup flow.
+    purpose = models.CharField(
+        max_length=32, choices=PURPOSE_CHOICES, default=EMAIL_VERIFICATION, db_index=True,
     )
     code_hash = models.CharField(max_length=64)
     attempts = models.PositiveSmallIntegerField(default=0)
@@ -205,10 +220,17 @@ class EmailVerification(models.Model):
         ordering = ['-created_at']
         indexes = [
             models.Index(fields=['user', '-created_at'], name='emailverif_user_created_idx'),
+            models.Index(
+                fields=['user', 'purpose', '-created_at'],
+                name='emailverif_user_purpose_idx',
+            ),
         ]
 
     def __str__(self):
-        return f'code for {self.user.username} ({self.created_at:%Y-%m-%d %H:%M})'
+        return (
+            f'{self.get_purpose_display().lower()} code for {self.user.username} '
+            f'({self.created_at:%Y-%m-%d %H:%M})'
+        )
 
 
 class DiscountKey(models.Model):

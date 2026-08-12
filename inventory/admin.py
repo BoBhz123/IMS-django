@@ -1,5 +1,6 @@
 from django.contrib import admin,messages
 from . import models
+from .csv_format import iso as _iso, money as _money, text as _csv_safe
 from django.db.models.aggregates import Count
 from django.db.models import Sum, F
 from django.http import HttpResponse
@@ -29,10 +30,10 @@ class ProductImageInline(admin.TabularInline):
 @admin.register(models.Product)
 class ProductAdmin(admin.ModelAdmin):
     actions = ['clear_stock']
-    list_display = ['name','category','description','stock_quantity','default_sell_price']
+    list_display = ['name','category','description','stock_quantity','default_sell_price','barcode']
     list_per_page= 10
     list_editable= ['default_sell_price']
-    search_fields = ['name']
+    search_fields = ['name','barcode']
     list_filter=['category']
     autocomplete_fields = ['category','supplier']
     inlines = [ProductImageInline]
@@ -105,17 +106,28 @@ def export_orders_to_csv(modeladmin, request, queryset):
         total_value=Sum(models.LINE_TOTAL)
     )
 
+    # This action has no cost or profit column, so its totals row is a plain sum of the one
+    # value column — unlike ExportOrdersCSVView, whose repeated per-order profit column is
+    # the reason that export needed a per-line column to total. Accumulated in the loop.
+    grand_total = 0
+
     for order in annotated_queryset:
         calculated_total = order.total_value if order.total_value is not None else 0
+        grand_total += calculated_total
         writer.writerow([
-            order.id, 
-            order.customer.name if order.customer else "No Customer", 
-            order.placed_at.strftime("%Y-%m-%d %H:%M"), 
+            order.id,
+            # Escaped because these rows span every account and this file is opened by
+            # the platform superadmin — a subscriber naming a customer '=HYPERLINK(...)'
+            # would otherwise be attacking them.
+            _csv_safe(order.customer.name if order.customer else "No Customer"),
+            _iso(order.placed_at),
             order.exchange_rate,
-            f"${calculated_total:.2f}" # Added the formatted total
+            _money(calculated_total),
         ])
 
-    return response    
+    writer.writerow(['TOTALS', '', '', '', _money(grand_total)])
+
+    return response
     
 @admin.action(description='Export selected purchases to CSV')
 def export_purchases_to_csv(modeladmin, request, queryset):
@@ -129,14 +141,19 @@ def export_purchases_to_csv(modeladmin, request, queryset):
         total_cost=Sum(models.LINE_TOTAL)
     )
 
+    grand_total = 0
+
     for purchase in annotated_queryset:
         calculated_total = purchase.total_cost if purchase.total_cost is not None else 0
+        grand_total += calculated_total
         writer.writerow([
             purchase.id,
-            purchase.supplier.name if purchase.supplier else "No Supplier",
-            purchase.placed_at.strftime("%Y-%m-%d %H:%M"),
-            f"${calculated_total:.2f}"
+            _csv_safe(purchase.supplier.name if purchase.supplier else "No Supplier"),
+            _iso(purchase.placed_at),
+            _money(calculated_total),
         ])
+
+    writer.writerow(['TOTALS', '', '', _money(grand_total)])
 
     # Was missing: without this the action returns None, so the admin just redirects back to
     # the changelist and no file is ever downloaded. export_orders_to_csv above returns its
@@ -235,3 +252,11 @@ class CustomerAdmin(admin.ModelAdmin):
     
     
     
+
+
+@admin.register(models.Expense)
+class ExpenseAdmin(admin.ModelAdmin):
+    list_display = ['description', 'category', 'amount', 'spent_at', 'account']
+    list_filter = ['category', 'account']
+    search_fields = ['description']
+    date_hierarchy = 'spent_at'

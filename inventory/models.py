@@ -1,6 +1,7 @@
 from django.db import models
 import uuid
 from django.core.validators import MinValueValidator
+from django.utils import timezone
 
 from accounts.managers import AccountScopedManager
 from accounts.models import Account
@@ -41,6 +42,23 @@ LINE_TOTAL = (
 def items_total(items):
     """Python-side equivalent of Sum(LINE_TOTAL), for already-loaded (prefetched) items."""
     return sum(item.quantity * item.unit_multiplier * item.unit_price for item in items)
+
+
+# The cost half of LINE_TOTAL. Reads the snapshot on the line, never product.cost_price —
+# joining out to the product would make every historical figure move the next time somebody
+# corrects a cost.
+LINE_COGS = (
+    models.F('items__quantity')
+    * models.F('items__unit_multiplier')
+    * models.F('items__unit_cost_price')
+)
+
+
+def items_cogs(items):
+    """Python-side equivalent of Sum(LINE_COGS), for already-loaded (prefetched) items."""
+    return sum(
+        item.quantity * item.unit_multiplier * item.unit_cost_price for item in items
+    )
 
 
 class Supplier(models.Model):
@@ -100,8 +118,21 @@ class Product(models.Model):
     stock_quantity = models.IntegerField(default=1,blank=False)
     supplier = models.ForeignKey(Supplier,on_delete=models.PROTECT,blank=True,null=True)
     category= models.ForeignKey(Category,on_delete=models.PROTECT,related_name='products')
+    # Optional, but unique within the account when present: one code identifies one product.
+    # Stored as NULL when absent, never '' — see save() below. That normalization is what
+    # makes the constraint workable: NULLs do not collide in a unique index, but a second
+    # '' row would, and being told an empty barcode is "already taken" is unexplainable.
+    barcode = models.CharField(max_length=64, blank=True, null=True, db_index=True)
 
     objects = AccountScopedManager()
+
+    def save(self, *args, **kwargs):
+        # '' and NULL would both mean "no barcode", so every lookup would have to test for
+        # two things and any future unique constraint would collide on the second '' row.
+        # Stripping matters because scanners and copy-paste both append whitespace, and
+        # ' 5901234' never matches a search for '5901234'.
+        self.barcode = (self.barcode or '').strip() or None
+        super().save(*args, **kwargs)
 
     def __str__(self):
             return self.name
@@ -116,6 +147,12 @@ class Product(models.Model):
         ]
         constraints = [
             models.UniqueConstraint(fields=['account', 'name'], name='uniq_product_account_name'),
+            # Per account, never global: an EAN identifies a real-world product, so a global
+            # constraint would let the first shop to record one block every other shop from
+            # recording the same item. Rows with no barcode hold NULL and never collide.
+            models.UniqueConstraint(
+                fields=['account', 'barcode'], name='uniq_product_account_barcode',
+            ),
         ]
 
 
@@ -215,10 +252,83 @@ class OrderItem(models.Model):
      quantity = models.PositiveSmallIntegerField(default=1)
      unit_price = models.DecimalField(max_digits=9, decimal_places=2, validators=[MinValueValidator(0)])
      unit_multiplier = models.PositiveSmallIntegerField(default=1)
+     # What this item cost us at the moment it was sold. Snapshotted, not derived: the
+     # product's cost_price is a current figure that gets corrected, and profit computed
+     # from it restates history every time it moves.
+     unit_cost_price = models.DecimalField(
+         max_digits=9, decimal_places=2, validators=[MinValueValidator(0)],
+     )
+
+     def save(self, *args, **kwargs):
+         # Covers the admin inline and seed_data, which build rows directly. It does NOT
+         # cover CreateOrderSerializer — bulk_create bypasses save() — which is why that
+         # serializer stamps the cost itself.
+         if self.unit_cost_price is None and self.product_id:
+             # to_python rather than a bare assignment: an unsaved Product still holds
+             # whatever was assigned to it, which may be a str from a fixture or a form
+             # rather than a Decimal — and .profit does arithmetic on this value.
+             self.unit_cost_price = self._meta.get_field('unit_cost_price').to_python(
+                 self.product.cost_price
+             )
+         super().save(*args, **kwargs)
+
      @property
      def profit(self):
-         if not self.product_id:
-             return None
-         return (self.unit_price - self.product.cost_price) * self.quantity * self.unit_multiplier
+         return (self.unit_price - self.unit_cost_price) * self.quantity * self.unit_multiplier
 
 
+
+
+class ExpenseCategory(models.TextChoices):
+    """
+    A fixed list rather than free text. Free text fragments 'Rent', 'rent' and 'Rent ' into
+    separate rows in any per-category breakdown, which is the main reason to record a
+    category at all. Adding one later is an edit here, not a migration.
+    """
+
+    RENT = 'rent', 'Rent'
+    UTILITIES = 'utilities', 'Utilities'
+    SALARIES = 'salaries', 'Salaries'
+    MARKETING = 'marketing', 'Marketing'
+    SOFTWARE = 'software', 'Software'
+    TRANSPORT = 'transport', 'Transport'
+    MAINTENANCE = 'maintenance', 'Maintenance'
+    TAXES_FEES = 'taxes_fees', 'Taxes & Fees'
+    OTHER = 'other', 'Other'
+
+
+class Expense(models.Model):
+    """
+    Operational overhead — rent, salaries, software. Deliberately not inventory: stock
+    spend is a cash movement recorded by Purchase, and folding it in here would corrupt the
+    margin that gross profit is supposed to measure.
+
+    Amounts are USD, like every other price in this app. LBP is a display toggle.
+    """
+
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name='expenses')
+    description = models.CharField(max_length=255)
+    amount = models.DecimalField(
+        max_digits=10, decimal_places=2, validators=[MinValueValidator(0)],
+    )
+    category = models.CharField(
+        max_length=32, choices=ExpenseCategory.choices, default=ExpenseCategory.OTHER,
+        db_index=True,
+    )
+    # When the money was spent, which is not when the row was made. default=timezone.now and
+    # never auto_now_add: auto_now_add ignores assignment, so a receipt entered on Friday for
+    # a Tuesday spend would land in the wrong month and misstate that month's net profit.
+    spent_at = models.DateTimeField(default=timezone.now, db_index=True)
+    # When it was entered. An audit trail worth keeping on a money record.
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = AccountScopedManager()
+
+    class Meta:
+        ordering = ['-spent_at']
+        indexes = [
+            models.Index(fields=['account', '-spent_at'], name='expense_account_date_idx'),
+        ]
+
+    def __str__(self):
+        return f'{self.description} (${self.amount})'

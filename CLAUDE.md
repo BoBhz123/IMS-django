@@ -43,19 +43,46 @@ frontend work done — the build catches import errors that neither the tests no
 **Do not use browser automation / Claude-in-Chrome for verification.** Verify through the Django test
 runner, Vitest unit and component tests, or direct API response checks — never by driving a browser.
 
-**Tests live in `inventory/tests.py` (69) and `accounts/tests.py` (22)**, all plain
-`TestCase`/`APIClient`. `playground/tests.py` is still the Django-generated stub. Coverage is real but
-not total — it is strongest on stock arithmetic, account isolation, and subscription gating.
+**Tests live in `inventory/tests.py` and `accounts/tests.py`**, all plain `TestCase`/`APIClient`.
+Coverage is real but not total — it is strongest on stock arithmetic, account isolation, subscription
+gating, and the security controls added in Phase 8 and the OWASP pass.
 
 **Settings are env-var driven** in `ims/settings.py`: `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`,
 `ALLOWED_HOSTS`, `DATABASE_URL`, `SENTRY_DSN`, and the `AWS_*` block (Cloudflare R2) all fall back to
 local-dev defaults when unset. The local DB is Postgres (`inventory` on localhost:5432, user
-`postgres`). `CORS_ALLOW_ALL_ORIGINS = True` is still on — dev-only, flag it rather than fixing it as a
-drive-by change.
+`postgres`). `CORS_ALLOW_ALL_ORIGINS` follows `DEBUG` since Phase 8, and `CORS_ALLOWED_ORIGINS` is
+read from the environment (comma-separated) with the Vite dev origins as the fallback — so adding a
+production domain is a config change, not a deploy.
+
+`DJANGO_SECRET_KEY` and `DJANGO_DEBUG` still *default* to their unsafe values for local dev, but
+**the app now refuses to boot when `DEBUG` is off and `SECRET_KEY` is still the committed default**
+(F-06, closed 2026-08-10 once the owner confirmed the variable is set on Heroku). `SIMPLE_JWT` has no
+separate `SIGNING_KEY`, so that key signs every token — a silent insecure boot meant anyone who could
+read this repo could mint a token for any user.
+
+Security headers live in `ims/security_headers.py` (CSP + Referrer-Policy), hand-rolled rather than
+`django-csp` to avoid a lockfile relock. `CSP_REPORT_ONLY=1` rolls a policy change out without
+blocking; `CSP_EXTRA_IMG_SRC` / `CSP_EXTRA_CONNECT_SRC` add origins without a code change.
 
 **This app is deployed** (Heroku, with WhiteNoise serving the built React app and R2 for media).
 Deployment steps are not in scope for routine work — never run migrations, resets, or config changes
 against production without explicit authorization.
+
+### ⚠️ Pre-deploy checklist — dev-only relaxations to revert
+
+Things loosened deliberately for local development. Check each before a production deploy.
+
+1. **`frontend/vite.config.js` → `server.allowedHosts`** is set to `['.trycloudflare.com',
+   '.loca.lt']` so tunnel URLs can reach the dev server — the only way to test the camera barcode
+   scanner, since `getUserMedia` needs a secure context and a phone on the LAN has none. Revert it
+   to the default (remove the key) once phone testing is done.
+
+   *This one cannot reach production by itself:* `server.*` configures the Vite dev server only,
+   and `vite build` ignores it, so nothing in `dist/` is affected. The exposure is the local
+   machine while a tunnel is actually running — treat the tunnel as public, because it is.
+2. ~~**`CORS_ALLOW_ALL_ORIGINS = True`**~~ — fixed in Phase 8; it now follows `DEBUG`.
+3. **`BILLING_PRICE_MONTHLY_USD` / `BILLING_PRICE_ONE_TIME_USD`** — the committed `15` / `299` are
+   display-only placeholders, not agreed pricing. See the Phase 2.5 section.
 
 ## Architecture
 
@@ -67,8 +94,6 @@ Django apps under a single `ims` project, plus a React frontend:
 - **`accounts/`** — `Account` + `Membership`: who owns data, and subscription state. Also holds
   `permissions.py` (`HasActiveSubscription`), `mixins.py` (`AccountScopedMixin`), and the signup
   serializer that provisions an account.
-- **`playground/`** — scratch/dev-only app (`say_hello` view rendering `hello.html`), not part of the
-  real API surface. Don't extend it as if it were production code.
 - **`frontend/`** — React + Vite + Tailwind SPA. Built to `frontend/dist/` and served by WhiteNoise
   via `ims/views.py::spa_index`, which is the catch-all route in `ims/urls.py`.
 
@@ -164,7 +189,11 @@ code with the API export views, so a formula/format fix usually needs to happen 
 **Full design:** `docs/superpowers/specs/2026-08-07-saas-single-db-migration-design.md`
 **Completed work log:** `HISTORY.md` — read it at session start.
 
-**Status:** Phases 1–2 complete. Phase 2.5 in progress.
+**Status:** Phases 1–8 complete. One item from Phase 8 is deliberately open and needs an owner
+decision — F-06, the `DJANGO_SECRET_KEY` boot guard; see the Settings note above and the findings
+report.
+**Phase 2.5b-2/-3/-4** are done. What still needs a human is real Paddle credentials and the three
+USD prices in the catalog — not code; see "what shipped, and what still needs a human" below.
 
 Phases are a dependency chain. 3–5 all touch models that Phase 2 restructures, so running them out of
 order means writing migrations twice. Finish each phase (including its tests) before starting the next.
@@ -191,7 +220,7 @@ dashboard or hand every subscriber the platform. Drop the global `unique=True` o
 `Category`/`Customer` `.name` for per-account uniqueness, or the first account to name a product blocks
 every other account.
 
-### Phase 2.5 — Secure onboarding & payment gateway — **done (2.5a, 2.5b-1, 2.5b-2)**
+### Phase 2.5 — Secure onboarding & payment gateway — **done (2.5a, 2.5b-1 … 2.5b-4)**
 **Design:** `docs/superpowers/specs/2026-08-08-secure-onboarding-payment-gateway-design.md`
 
 Signup takes email + password + phone, emails a 6-digit code, and starts a **cardless 14-day trial**
@@ -290,22 +319,73 @@ What the obvious implementation gets wrong:
 - **v1 honours 100%-off keys only** — a partial discount needs a second gateway integration. The
   `percent_off` column exists so it is additive later.
 
-### Phase 3 — Expenses
-`Expense` model + account-scoped CRUD. `net_profit = order profit − expenses`, with the *same* date
-window applied to both sides — extract the window logic into one helper rather than duplicating it.
-`created_at` uses `default=timezone.now`, not `auto_now_add`, so a receipt entered Friday for a Tuesday
-purchase lands in the right month.
+### Phase 3 — Expenses — **done**
+**Design:** `docs/superpowers/specs/2026-08-08-expense-tracking-design.md` ·
+**Plan:** `docs/superpowers/plans/2026-08-08-phase-3-expense-tracking.md` · see `HISTORY.md`
 
-### Phase 4 — Barcodes
-Optional indexed `Product.barcode`; add it to `ProductViewSet.search_fields` so `?search=` covers it.
-Frontend input + list tag. Camera scanning is a later phase.
+`Expense` model + account-scoped CRUD at `/inventory/expenses/`, an Expenses page in the SPA, and a
+financial reporting model with one honest definition of profit: `total_revenue`, `total_cogs`,
+`gross_profit`, `total_expenses`, `net_profit`, with `inventory_outlays` (formerly `total_costs`) kept
+outside the P&L as cash flow. COGS is snapshotted onto `OrderItem.unit_cost_price` at sale time, and
+the date window is one shared `inventory/reporting.py::DateWindow` applied to every reporting
+queryset. `spent_at` uses `default=timezone.now`, not `auto_now_add`, so a receipt entered Friday for
+a Tuesday purchase lands in the right month.
 
-### Phase 5 — CSV export totals row
-Append a TOTALS row to `ExportOrdersCSVView` (the API view the frontend calls — *not* the similarly
-named `export_orders_to_csv` admin action, which has no cost/profit columns; that one gets a matching
-row for its single Total Value column). The existing "Total Profit" column repeats the whole order's
-profit on every line of that order, so summing that column multiplies each order's profit by its line
-count. Sum per-line profit instead.
+### Phase 6 — Dashboard profit series — **done**
+The analytics `series` carries `total_cogs`, `gross_profit` and `net_profit` per period, and the
+Gross profit / Net profit tiles draw sparklines from them. See `HISTORY.md`. Tile sparklines all use
+the fixed last-7-days daily window by decision — making them follow the period selector would mean
+restructuring Dashboard's two data-loading effects.
+
+### Phase 7 — Camera barcode scanning — **done**
+Plan: `PLAN.md` · see `HISTORY.md`. `@zxing/library` behind a dynamic import, one
+`BarcodeScannerModal`, and three call sites (product form, order flow, purchase flow). Manual
+verification on a physical phone is the owner's; automated coverage mocks the decoder, since browser
+automation is forbidden here.
+
+Scanned lookups resolve through `lookupByBarcode` (`frontend/src/hooks/useBarcodeLookup.js`), which
+returns `found | ambiguous | not_found | error`. Since 2026-08-10 barcodes are unique per account, so
+`ambiguous` should not occur; it is kept as the safe response to the database saying otherwise (a bulk
+import, or the constraint dropped) rather than silently taking the first match. Order scans increment
+through `maxQuantityFor` so Phase 1's stock cap still holds; purchase scans are uncapped, because a
+purchase adds stock.
+
+### Phase 8 — Security audit — **done**
+Findings: `docs/superpowers/specs/2026-08-09-phase-8-security-audit-findings.md`. See `HISTORY.md`.
+
+Fixed: an unscoped nested product-image route (**cross-account read and write** — the most serious
+bug found in the project, and no scanner saw it; the isolation matrix did), CSV formula injection in
+4 of the 5 exporters, CORS wide open outside `DEBUG`, and unthrottled CSV exports.
+
+Open by design: **F-06**, the `SECRET_KEY`/`DEBUG` fail-open default. Needs confirmation that
+`DJANGO_SECRET_KEY` is set on Heroku before a boot guard can be added safely.
+
+### Phase 4 — Barcodes — **done**
+Optional indexed `Product.barcode` in `ProductViewSet.search_fields`, so `?search=` covers it. Form
+input, list tag, admin search, seeded data. See `HISTORY.md`. Camera scanning is still a later phase.
+
+**Superseded (2026-08-10): barcodes are unique per account.** Phase 4 shipped the field indexed but
+not unique, on the reasoning that a shop reuses one code across loose goods. Reversed at the owner's
+direction — one code, one product. `UniqueConstraint(['account', 'barcode'])`, never global: an EAN
+identifies a real-world product, so a global constraint would let the first account to record one
+block every other account from recording the same item. See `HISTORY.md`.
+
+The `'' → NULL` normalization in `Product.save()` is load-bearing for it — NULLs do not collide in a
+unique index but two `''` rows do, so without it the second product entered with no barcode is
+rejected. A duplicate is a 400 from `ProductSerializer.validate_barcode`, not an `IntegrityError`
+500, for the same reason `AccountUniqueNameMixin` exists: `account` is not a serializer field, so DRF
+generates no validator for the constraint.
+
+### Phase 5 — CSV export totals row — **done**
+All four transaction exports end in a TOTALS row — both API views and both admin actions. The
+products catalogue export is deliberately excluded. See `HISTORY.md`.
+
+`ExportOrdersCSVView` gained a `Line Profit (USD)` column, which is what the profit total sums.
+
+**Superseded by the export redesign (same day):** the repeating `Total Profit (USD)` column was
+initially kept for saved formulas, then removed outright at the owner's direction — BI tools summing
+it was judged the larger risk. That redesign also made all money numeric, added `Barcode` and
+`Total Units`, and moved dates to ISO 8601. See `HISTORY.md`.
 
 ---
 
@@ -313,6 +393,17 @@ count. Sum per-line profit instead.
 
 Append here when something bites. Do not repeat these.
 
+- **`EmailVerification` rows are scoped by `purpose`.** Any new query against that table must filter
+  on it, or a code issued for one flow becomes spendable in another and the two flows start expiring
+  each other's outstanding codes and sharing one hourly send budget. `issue_code`/`verify_code` both
+  take `purpose`; the default is `email_verification` only because that flow predates the field.
+- **A multi-step OTP flow must not spread its decision across steps.** If the endpoint that changes
+  something trusts an earlier "verify" call, being authenticated is enough to skip the code entirely
+  and the extra screens are theatre. `PasswordResetConfirmView` takes the code and the new password in
+  one request; `PasswordResetVerifyView` uses `consume=False` and grants nothing. Keep it that way.
+- **Changing a password must blacklist outstanding refresh tokens.** The SPA holds JWTs, so Django's
+  session invalidation does nothing here, and a refresh token issued before the change stays valid for
+  30 days. `accounts/views.py::_revoke_refresh_tokens`.
 - **`CLAUDE.md` was badly stale** (2026-08-07): described MySQL, no frontend, no multi-tenancy, and a
   Pipfile missing `djoser`. All four were wrong. Verify this file against the code before trusting it,
   and update it when the architecture moves.
@@ -412,3 +503,113 @@ Append here when something bites. Do not repeat these.
   `/billing/redeem-key/`.
 - **`react-router-dom` has 2 open high-severity advisories** (`npm audit`). `npm audit fix --force`
   downgrades to 7.11.0, a breaking change — left alone deliberately; raise it as its own decision.
+- **`OrderItem.unit_cost_price` is the only correct source of COGS.** `product.cost_price` is a
+  *current* figure that gets corrected; reading it for any historical calculation restates the past.
+  The snapshot is what `OrderItem.profit`, `LINE_COGS`/`items_cogs`, `AnalyticsView` and
+  `ExportOrdersCSVView` all read.
+- **`bulk_create` bypasses `OrderItem.save()`**, so any new bulk creation path must stamp
+  `unit_cost_price` itself. `save()` only covers the row-at-a-time callers (admin inline, `seed_data`);
+  `CreateOrderSerializer` stamps it explicitly from the products it has already locked.
+- **`AnalyticsView` returns money as raw numbers, not `"$..."` strings**, and the summary key for
+  purchases is `inventory_outlays` — but `series` rows still use `total_costs`. That difference is
+  deliberate, not a bug: the tile sits next to `total_cogs` and the series does not.
+- **Every reporting queryset must be filtered through `inventory/reporting.py::DateWindow`.** A window
+  applied to one side of a profit calculation and not the other misstates it silently — no exception,
+  no error, just a wrong number.
+- **`fillSeriesGaps` (`frontend/src/lib/format.js`) drops any key it does not name.** Adding a field
+  to the analytics `series` requires adding it there too, or the chart reads `undefined`, `Math.max`
+  returns `NaN`, and the sparkline renders invisible with no error. The exact-match test on the
+  filled row shape is the guard — extend it, never loosen it.
+- **Series money keys and summary money keys differ on purpose.** `series` rows use `total_costs` for
+  purchases; the summary uses `inventory_outlays`. Both are correct in place, and the series has no
+  equivalent of the summary's `total_cogs` naming hazard.
+- **Per-period revenue and COGS must be summed in one `annotate()`.** Both traverse the `items` join;
+  two calls on the same queryset fan out and multiply each other's row counts.
+- **CSV money is written bare — no `$`, no thousands separators — via `inventory/csv_format.py`.**
+  A `$` makes a spreadsheet treat the column as text and refuse to sum it; a thousands comma inside
+  an unquoted cell splits it in two and shifts every column after it. Both exporters and both admin
+  actions import `money()`/`iso()` from there, so formatting cannot drift between the four.
+- **The orders CSV has no per-order profit column.** It used to, and it repeated each order's whole
+  profit on every one of its lines, so any tool summing it inflated profit by the line count (3.1x on
+  the demo data). `Line Profit (USD)` is per-line and is what the TOTALS row sums. Don't reintroduce
+  an order-level column into a line-level export.
+- **CSV totals are accumulated in the row loop, never a second aggregate query.** `ExportOrdersCSVView`
+  has a test pinning its query count constant as rows grow; a totals aggregate would break it.
+- **`Quantity` is deliberately not totalled in the CSV footer** — summing it across lines with
+  different `unit_multiplier`s is meaningless. `Total Units` (`quantity * unit_multiplier`) is the
+  column that carries a real physical count, and it is the one totalled.
+- **`Product.barcode` is normalized in `Product.save()`** — `''` becomes `NULL` and surrounding
+  whitespace is stripped. Query by the stripped value; do not assume `''` is ever stored. This is
+  load-bearing for the per-account unique constraint added on 2026-08-10: NULLs do not collide, two
+  `''` rows do. Any new write path that skips `save()` (`bulk_create`, `update()`, raw SQL) must
+  normalize for itself or it will either store `''` or trip the constraint.
+- **A per-account unique constraint needs a serializer validator too.** `account` is stamped in
+  `perform_create`, so DRF never sees it as a serializer field and generates no `UniqueTogether`
+  validator — the constraint then surfaces as an uncaught `IntegrityError` 500 instead of a 400. See
+  `AccountUniqueNameMixin` and `ProductSerializer.validate_barcode`. Both strip before comparing,
+  because the model strips before storing.
+- **The security audit trail is `accounts/audit.py`, logged to `ims.security`.** Deletions are
+  hooked in `AccountScopedMixin.perform_destroy`, so any new account-scoped viewset is audited for
+  free — but capture the pk *before* `super().perform_destroy()` and log *after* it: Django's
+  collector nulls `instance.pk`, and logging first records deletions that a PROTECT foreign key then
+  prevented. Never put a code, token or password in the trail.
+- **CSP is enforced (`ims/security_headers.py`), so no inline `<script>` may ever be added** to the
+  SPA's `index.html` or to a Django template — `script-src` is `'self'` with no nonce. Check
+  `npm run build` output if a build tool starts inlining. `'unsafe-inline'` in `style-src` is
+  load-bearing for framer-motion and cannot be removed without replacing the animation library.
+- **JWTs live in `localStorage`, so any XSS is a full account takeover.** This is a recorded,
+  accepted risk — `HttpOnly` cookies are the structural fix and a much larger change. Treat any new
+  HTML-rendering or `dangerouslySetInnerHTML` path as security-critical.
+- **There is no scratch app.** `playground/` was deleted on 2026-08-10: its `say_hello` view read
+  every account's orders with no auth and no scoping, and although it was never routed it sat one
+  line of `urls.py` away from being a cross-tenant leak.
+  `test_a05_every_routed_inventory_view_requires_authentication` is the generalised guard that
+  replaced it — it fails if any view routed under `/inventory/` does not demand an authenticated
+  caller. Don't add a scratch app back; use a test or the shell.
+- **Scanners do not find authorization bugs.** Phase 8's worst finding — an unscoped nested route
+  allowing cross-account read *and* write — was invisible to semgrep, bandit and pip-audit, because
+  it looks like ordinary ORM code. It took a test that crossed the tenant boundary. Run the matrix
+  (`inventory.tests.TenantIsolationMatrixTests`), and add any new scoped collection to its
+  `RESOURCES` list.
+- **Overriding `get_queryset()` on a scoped viewset silently opts out of `AccountScopedMixin`.**
+  Always chain through `super().get_queryset()`. `ProductImageViewSet` declared
+  `account_lookup = 'product__account'` and never reached it for four phases, which made the viewset
+  *look* scoped. A nested route also needs the parent checked in `perform_create` — queryset scoping
+  governs reads only, and the parent id comes off the URL.
+- **`csv_format.text()` escapes formula-leading cells; never apply it to `money()` output.** `-`
+  leads a formula and also leads a negative line profit, so escaping money emits `'-6.00` and turns
+  the numeric columns back into text — undoing the redesign that made them summable.
+- **DRF caches throttle rates in a class attribute.** `override_settings(REST_FRAMEWORK=…)` does not
+  change them: `SimpleRateThrottle.THROTTLE_RATES` is bound at import and `api_settings` rebuilds a
+  different dict. Patch `ScopedRateThrottle.THROTTLE_RATES` in place instead.
+- **`settings.DEBUG` is forced to `False` by the test runner**, *after* `ims/settings.py` has been
+  imported. Anything derived from `DEBUG` at import time therefore cannot be asserted in-process —
+  check it in a subprocess, or the test proves nothing about production.
+- **`@zxing/library` must stay behind `await import()`.** A top-level import puts ~450 kB into every
+  page load of a bundle already past Vite's size warning. Measured: the entry chunk grows ~5 kB and
+  the library gets its own chunk. Check `npm run build` output after touching a scanner call site.
+- **zxing fires the decode callback with `NotFoundException` on every frame without a barcode** —
+  nearly all of them. Treating it as an error puts the modal in a permanent failure state one frame
+  after opening. `BarcodeScannerModal` filters it by `name`.
+- **One physical scan decodes across many frames.** `BarcodeScannerModal`'s `handledRef` is what
+  stops a single barcode from incrementing an order line five times. Do not remove it when
+  refactoring the callback.
+- **Scanned lookups use `?barcode=` (exact), never `?search=`.** `?search=` is `icontains` over name,
+  description *and* barcode, so it resolves to the wrong product with nothing on screen to reveal it
+  — and the scan flows add order lines without confirming each one.
+- **Camera scanning cannot be verified in this project** — browser automation is forbidden. Tests
+  mock the `@zxing/library` module id (which is what the dynamic import resolves) and drive the
+  decode callback by hand. `getUserMedia` also needs a secure context, so the LAN dev URL a phone
+  uses is camera-less by platform rule, not by bug.
+- **`beforeEach(() => mock.mockReset())` — the concise arrow is a trap.** `mockReset()` returns the
+  mock, and Vitest treats a function returned from a hook as a *teardown callback*: it calls the mock
+  after every test. With a rejecting implementation set, that surfaces as an unhandled rejection
+  attributed to a test that is otherwise passing. Use braces.
+- **`CurrencyInput` deliberately does not mirror `valueUsd` on every change.** It re-syncs only when
+  the text does not already parse back to `valueUsd`, so a part-typed `6.` or `6.50` survives and an
+  emptied field is not refilled with the `0` that emptying it reported. Widening that effect makes
+  the field fight the user mid-keystroke; narrowing it back to mount-only reintroduces the bug where
+  picking or scanning a product left the price showing `0` beside a correct total.
+- **`ProductPicker` only learns a product's name by being clicked.** Any code path that sets a line's
+  `product` id some other way must also pass `selectedName`, or the picker reads "Select product"
+  while holding a real id.
