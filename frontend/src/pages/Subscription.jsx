@@ -1,6 +1,14 @@
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { Check, CreditCard, KeyRound, MessageCircle, Send, Sparkles } from 'lucide-react'
+import { Link, useNavigate } from 'react-router-dom'
+import {
+  ArrowLeft,
+  Check,
+  CreditCard,
+  KeyRound,
+  MessageCircle,
+  Send,
+  Sparkles,
+} from 'lucide-react'
 import { api } from '@/lib/api'
 import { useAuth } from '@/context/AuthContext'
 import { GlassCard } from '@/components/ui/GlassCard'
@@ -244,6 +252,20 @@ export function Subscription() {
             {submitting ? 'Activating…' : 'Activate account'}
           </button>
         </form>
+        )}
+
+        {/* Only for a live subscriber, who arrived here from Settings and needs the way
+            back. Someone locked out did not come from there and cannot use the app anyway —
+            for them the sign-out button below is the escape hatch, and a link into a second
+            screen they can barely use is noise. */}
+        {live && (
+          <Link
+            to="/settings"
+            className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-xl border border-hairline py-2.5 text-[14px] font-medium text-text-secondary transition-colors hover:text-text-primary"
+          >
+            <ArrowLeft size={15} />
+            Back to Settings
+          </Link>
         )}
 
         <button

@@ -11,7 +11,7 @@ from rest_framework_simplejwt.exceptions import TokenError
 
 from . import verification
 from .audit import log_auth_event
-from .billing.activation import start_trial
+from .billing.activation import TrialAlreadyUsed, start_trial
 from .emails import send_password_reset_code, send_verification_code
 from .models import Account, get_account
 # subscription_payload replaces the direct SubscriptionStatusSerializer use that used to be
@@ -79,7 +79,15 @@ class VerifyEmailView(APIView):
             # trial_ends_at from now rather than honouring the value written at signup, so a
             # customer who took three days to find the email still gets a full 14 — the
             # signup value only exists so the column is never null.
-            start_trial(account)
+            #
+            # An account can be back at pending_verification with its trial already spent —
+            # an admin resetting the status, or a re-verification after a support fix. That
+            # must land on the paywall, not 500 and not hand out a second free fortnight.
+            try:
+                start_trial(account)
+            except TrialAlreadyUsed:
+                account.subscription_status = Account.PENDING_PAYMENT
+                account.save(update_fields=['subscription_status'])
 
         log_auth_event('email_verified', request.user, account=getattr(account, 'pk', None))
         # `subscription_status`, matching the name every other endpoint uses for this column.

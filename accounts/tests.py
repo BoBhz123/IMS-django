@@ -14,9 +14,12 @@ from django.utils import timezone
 
 from accounts import emails, verification
 from accounts.billing import get_provider
-from accounts.billing.activation import activate_account, add_months, start_trial
+from accounts.billing.activation import (
+    TrialAlreadyUsed, activate_account, add_months, start_trial,
+)
 from accounts.billing.base import PLAN_KEYS, ProviderUnavailable, UnknownPlan
 from accounts.admin import status_badge
+from accounts.crypto import UNREADABLE, encrypt_text
 from accounts.billing.keys import (
     ALPHABET, KEY_LENGTH, format_key, generate_code, normalize_key,
 )
@@ -24,8 +27,9 @@ from accounts.billing.paddle import plan_for_price_id, verify_signature
 from accounts.billing.webhooks import trial_expiry_sweep
 from accounts.models import (
     Account, DiscountKey, DiscountKeyRedemption, EmailVerification, Membership,
-    ProcessedWebhookEvent, get_account,
+    ProcessedWebhookEvent, UserPaymentRecord, get_account,
 )
+from cryptography.fernet import Fernet
 
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -2457,3 +2461,346 @@ class PasswordResetEmailTests(TestCase):
         self.user.email = ''
         self.user.save(update_fields=['email'])
         self.assertFalse(emails.send_password_reset_code(self.user, '123456'))
+
+
+class SingleTrialPolicyTests(TestCase):
+    """One free trial per account, latched on `has_used_trial`."""
+
+    def setUp(self):
+        self.account = Account.objects.create(
+            name='Acme', subscription_status=Account.PENDING_VERIFICATION,
+        )
+
+    def test_the_first_trial_latches_the_flag(self):
+        self.assertFalse(self.account.has_used_trial)
+        start_trial(self.account)
+        self.account.refresh_from_db()
+        self.assertTrue(self.account.has_used_trial)
+
+    def test_a_second_trial_is_refused(self):
+        start_trial(self.account)
+        with self.assertRaises(TrialAlreadyUsed):
+            start_trial(self.account)
+
+    def test_a_refused_trial_changes_nothing(self):
+        start_trial(self.account)
+        activate_account(self.account, plan_type=Account.MONTHLY)
+        before = self.account.trial_ends_at
+
+        with self.assertRaises(TrialAlreadyUsed):
+            start_trial(self.account)
+
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.subscription_status, Account.ACTIVE)
+        self.assertEqual(self.account.trial_ends_at, before)
+
+    def test_revoking_does_not_hand_back_a_trial(self):
+        # revoke_subscription clears trial_ends_at, so the flag is the only thing standing
+        # between a revoked account and a fresh fortnight.
+        start_trial(self.account)
+        Account.objects.filter(pk=self.account.pk).update(
+            subscription_status=Account.CANCELED, expires_at=None, trial_ends_at=None,
+        )
+        self.account.refresh_from_db()
+
+        self.assertTrue(self.account.has_used_trial)
+        with self.assertRaises(TrialAlreadyUsed):
+            start_trial(self.account)
+
+    def test_force_is_the_deliberate_override(self):
+        start_trial(self.account)
+        start_trial(self.account, force=True)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.subscription_status, Account.TRIALING)
+        self.assertTrue(self.account.has_active_subscription)
+
+
+class SingleTrialOnboardingTests(TestCase):
+    """The policy as the signup and verification flow sees it."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='owner@example.com', email='owner@example.com', password='pw-12345',
+        )
+        self.account = Account.objects.create(
+            name='Acme', subscription_status=Account.PENDING_VERIFICATION,
+        )
+        Membership.objects.create(user=self.user, account=self.account, is_owner=True)
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def test_verifying_starts_the_one_trial(self):
+        _, code = verification.issue_code(self.user)
+        response = self.client.post('/accounts/verify-email/', {'code': code}, format='json')
+        self.assertEqual(response.data['subscription_status'], Account.TRIALING)
+        self.account.refresh_from_db()
+        self.assertTrue(self.account.has_used_trial)
+
+    def test_re_verifying_a_spent_trial_lands_on_the_paywall_not_a_500(self):
+        # An admin can put an account back to pending_verification. That must not 500, and
+        # must not hand out a second free fortnight.
+        self.account.has_used_trial = True
+        self.account.save(update_fields=['has_used_trial'])
+
+        _, code = verification.issue_code(self.user)
+        response = self.client.post('/accounts/verify-email/', {'code': code}, format='json')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['subscription_status'], Account.PENDING_PAYMENT)
+        self.account.refresh_from_db()
+        self.assertFalse(self.account.has_active_subscription)
+
+    def test_signup_leaves_the_flag_clear_until_verification(self):
+        # The clock is stamped at signup but the trial has not been *taken* yet — latching
+        # here would deny the trial to anyone who verified a day later.
+        response = APIClient().post('/auth/users/', {
+            'email': 'new@example.com', 'password': 'sup3r-s3cret-pw',
+            'phone': '+961 70 111 222', 'business_name': 'New Co',
+        }, format='json')
+        self.assertEqual(response.status_code, 201, response.data)
+
+        account = Account.objects.get(name='New Co')
+        self.assertFalse(account.has_used_trial)
+        self.assertIsNotNone(account.trial_ends_at)
+
+
+# Django forces DEBUG=False under the test runner, and crypto.get_fernet() refuses to fall
+# back to a SECRET_KEY-derived key in that case — deliberately, so production cannot store
+# records under a key that vanishes when SECRET_KEY rotates. Tests therefore supply their own.
+TEST_FERNET_KEY = Fernet.generate_key().decode()
+
+
+@override_settings(PAYMENT_ENCRYPTION_KEY=TEST_FERNET_KEY)
+class PaymentRecordEncryptionTests(TestCase):
+    """Fernet field encryption for UserPaymentRecord."""
+
+    def setUp(self):
+        self.account = Account.objects.create(name='Acme')
+
+    def test_details_round_trip(self):
+        record = UserPaymentRecord.objects.create(
+            account=self.account, method=UserPaymentRecord.WHISH, amount_usd=15,
+        )
+        record.details = 'Whish ref 88213, paid in the shop'
+        record.save()
+
+        reloaded = UserPaymentRecord.objects.get(pk=record.pk)
+        self.assertEqual(reloaded.details, 'Whish ref 88213, paid in the shop')
+
+    def test_the_plaintext_is_not_in_the_column(self):
+        record = UserPaymentRecord.objects.create(account=self.account)
+        record.details = 'Whish ref 88213'
+        record.save()
+
+        raw = bytes(UserPaymentRecord.objects.get(pk=record.pk).encrypted_details)
+        self.assertNotIn(b'88213', raw)
+        self.assertNotIn(b'Whish', raw)
+        self.assertTrue(raw.startswith(b'gAAAAA'))  # Fernet's version byte, base64-encoded
+
+    def test_empty_details_stay_empty_rather_than_encrypting_nothing(self):
+        record = UserPaymentRecord.objects.create(account=self.account)
+        record.details = ''
+        record.save()
+        self.assertEqual(bytes(record.encrypted_details), b'')
+        self.assertEqual(UserPaymentRecord.objects.get(pk=record.pk).details, '')
+
+    def test_two_writes_of_the_same_text_differ(self):
+        # Fernet includes a random IV, so identical notes must not produce identical
+        # ciphertext — otherwise the column leaks which accounts paid the same way.
+        first = UserPaymentRecord.objects.create(account=self.account)
+        first.details = 'cash'
+        first.save()
+        second = UserPaymentRecord.objects.create(account=self.account)
+        second.details = 'cash'
+        second.save()
+        self.assertNotEqual(bytes(first.encrypted_details), bytes(second.encrypted_details))
+
+    def test_a_wrong_key_reports_rather_than_raising(self):
+        # One unreadable row must not 500 a changelist showing fifty.
+        record = UserPaymentRecord.objects.create(account=self.account)
+        record.details = 'secret'
+        record.save()
+
+        other_key = Fernet.generate_key().decode()
+        with override_settings(PAYMENT_ENCRYPTION_KEY=other_key):
+            self.assertEqual(
+                UserPaymentRecord.objects.get(pk=record.pk).details, UNREADABLE,
+            )
+
+    def test_a_configured_key_is_used_over_the_debug_fallback(self):
+        key = Fernet.generate_key().decode()
+        with override_settings(PAYMENT_ENCRYPTION_KEY=key):
+            token = encrypt_text('hello')
+        self.assertEqual(Fernet(key.encode()).decrypt(token).decode(), 'hello')
+
+    @override_settings(PAYMENT_ENCRYPTION_KEY='not-a-valid-fernet-key')
+    def test_a_malformed_key_fails_loudly(self):
+        with self.assertRaises(ImproperlyConfigured):
+            encrypt_text('hello')
+
+    @override_settings(PAYMENT_ENCRYPTION_KEY='', DEBUG=False)
+    def test_production_refuses_to_store_without_a_key(self):
+        # Never silently fall back to a SECRET_KEY-derived key in production: rotating
+        # SECRET_KEY would then destroy every record at once with no error to trace it to.
+        with self.assertRaises(ImproperlyConfigured):
+            encrypt_text('hello')
+
+
+@override_settings(PAYMENT_ENCRYPTION_KEY=TEST_FERNET_KEY)
+class PaymentRecordAdminTests(TestCase):
+    """Only superusers may read the payment log."""
+
+    def setUp(self):
+        self.superuser = User.objects.create_superuser(
+            username='root', email='root@example.com', password='pw-12345',
+        )
+        self.staff = User.objects.create_user(
+            username='staff', email='staff@example.com', password='pw-12345', is_staff=True,
+        )
+        self.staff.user_permissions.set(Permission.objects.all())
+        self.account = Account.objects.create(name='Acme')
+        self.record = UserPaymentRecord.objects.create(account=self.account)
+        self.record.details = 'Whish ref 88213'
+        self.record.save()
+
+    def client_for(self, user):
+        client = Client()
+        client.force_login(user)
+        return client
+
+    def test_a_superuser_can_reach_the_payment_log(self):
+        client = self.client_for(self.superuser)
+        self.assertEqual(client.get('/admin/accounts/userpaymentrecord/').status_code, 200)
+        self.assertEqual(
+            client.get(f'/admin/accounts/userpaymentrecord/{self.record.pk}/change/')
+            .status_code,
+            200,
+        )
+
+    def test_staff_cannot_reach_it_even_with_every_permission(self):
+        client = self.client_for(self.staff)
+        for path in (
+            '/admin/accounts/userpaymentrecord/',
+            f'/admin/accounts/userpaymentrecord/{self.record.pk}/change/',
+            '/admin/accounts/userpaymentrecord/add/',
+        ):
+            self.assertIn(client.get(path).status_code, (302, 403), path)
+
+    def test_the_changelist_does_not_print_the_decrypted_note(self):
+        # A list view is what gets left open on a shared screen.
+        body = self.client_for(self.superuser).get(
+            '/admin/accounts/userpaymentrecord/',
+        ).content.decode()
+        self.assertNotIn('88213', body)
+        self.assertIn('Encrypted', body)
+
+    def test_the_change_form_shows_the_decrypted_note(self):
+        body = self.client_for(self.superuser).get(
+            f'/admin/accounts/userpaymentrecord/{self.record.pk}/change/',
+        ).content.decode()
+        self.assertIn('88213', body)
+
+    def test_saving_through_the_admin_form_encrypts(self):
+        self.client_for(self.superuser).post(
+            f'/admin/accounts/userpaymentrecord/{self.record.pk}/change/',
+            {
+                'account': str(self.account.pk),
+                'method': UserPaymentRecord.CASH,
+                'amount_usd': '20.00',
+                'reference': 'R-1',
+                'details': 'cash handed over at the counter',
+            },
+            follow=True,
+        )
+        self.record.refresh_from_db()
+        self.assertEqual(self.record.details, 'cash handed over at the counter')
+        self.assertNotIn(b'counter', bytes(self.record.encrypted_details))
+
+
+class UserAdminPasswordTests(TestCase):
+    """Superadmins can set a user's password; staff cannot."""
+
+    def setUp(self):
+        self.superuser = User.objects.create_superuser(
+            username='root', email='root@example.com', password='pw-12345',
+        )
+        self.staff = User.objects.create_user(
+            username='staff', email='staff@example.com', password='pw-12345', is_staff=True,
+        )
+        self.staff.user_permissions.set(Permission.objects.all())
+        self.target = User.objects.create_user(
+            username='owner@example.com', email='owner@example.com', password='old-pw-12345',
+        )
+
+    def client_for(self, user):
+        client = Client()
+        client.force_login(user)
+        return client
+
+    def test_a_superuser_can_set_a_password(self):
+        client = self.client_for(self.superuser)
+        url = f'/admin/auth/user/{self.target.pk}/password/'
+        self.assertEqual(client.get(url).status_code, 200)
+
+        client.post(
+            url, {'password1': 'brand-new-pw-99', 'password2': 'brand-new-pw-99'}, follow=True,
+        )
+        self.target.refresh_from_db()
+        self.assertTrue(self.target.check_password('brand-new-pw-99'))
+
+    def test_staff_cannot_set_another_users_password(self):
+        # Setting a password is a full account takeover, so it is superuser-only regardless
+        # of what model permissions a group hands out.
+        client = self.client_for(self.staff)
+        response = client.post(
+            f'/admin/auth/user/{self.target.pk}/password/',
+            {'password1': 'attacker-pw-99', 'password2': 'attacker-pw-99'},
+            follow=True,
+        )
+        self.assertIn(response.status_code, (200, 302, 403))
+        self.target.refresh_from_db()
+        self.assertTrue(self.target.check_password('old-pw-12345'))
+
+    def test_the_user_page_shows_which_account_they_belong_to(self):
+        account = Account.objects.create(name='Corner Shop')
+        Membership.objects.create(user=self.target, account=account, is_owner=True)
+        body = self.client_for(self.superuser).get('/admin/auth/user/').content.decode()
+        self.assertIn('Corner Shop', body)
+
+
+class EmailConfigTests(TestCase):
+    """The settings-level bug that stopped verification codes from sending."""
+
+    def test_use_tls_accepts_the_spellings_people_actually_write(self):
+        # `os.environ.get(...) == 'True'` read every one of these as False, which attempts
+        # port 587 in the clear and fails every send with nothing in the UI to say so.
+        from ims.settings import _env_flag
+
+        for value in ('true', 'True', 'TRUE', '1', 'yes', 'on', ' true '):
+            with patch.dict('os.environ', {'EMAIL_USE_TLS': value}):
+                self.assertTrue(_env_flag('EMAIL_USE_TLS'), value)
+
+    def test_falsey_spellings_stay_false(self):
+        from ims.settings import _env_flag
+
+        for value in ('false', 'False', '0', 'no', 'off', ''):
+            with patch.dict('os.environ', {'EMAIL_USE_TLS': value}):
+                self.assertFalse(_env_flag('EMAIL_USE_TLS'), value)
+
+    def test_a_send_timeout_is_configured(self):
+        # The send runs inline on the request thread; without a timeout a wedged SMTP server
+        # holds signup open until the dyno kills it.
+        from django.conf import settings as django_settings
+
+        self.assertTrue(getattr(django_settings, 'EMAIL_TIMEOUT', None))
+
+    def test_a_failed_send_is_logged_and_reported_not_swallowed(self):
+        user = User.objects.create_user(
+            username='owner@example.com', email='owner@example.com', password='pw-12345',
+        )
+        with patch('accounts.emails.send_mail', side_effect=SMTPException('boom')):
+            with self.assertLogs('accounts.emails', level='ERROR') as captured:
+                sent = emails.send_verification_code(user, '123456')
+
+        self.assertFalse(sent)
+        self.assertTrue(any('Failed to send' in line for line in captured.output))

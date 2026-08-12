@@ -8,6 +8,67 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-12 — One trial per account, an encrypted payment log, and the email-config fix
+
+**`has_used_trial` latches on the first trial.** A null `trial_ends_at` could not stand in for
+it: the revoke action clears that column, so a revoked account would have read as "never
+trialed" and collected a second free fortnight. `start_trial` raises `TrialAlreadyUsed` rather
+than returning quietly — a caller that thinks it granted a trial and did not is worse than a
+loud failure. The admin's reset action passes `force=True`, which is the one sanctioned way
+past the latch, and says so in a warning message.
+
+Migration `0009` backfills the flag for every account with a `trial_ends_at`. Without it the
+policy would only apply to signups from today. Accounts revoked *before* the backfill read as
+never-trialed and stay False — the safe direction to be wrong in, since it grants a trial to
+someone whose subscription was cancelled by hand rather than denying one to a real signup.
+
+`VerifyEmailView` catches `TrialAlreadyUsed` and lands on `pending_payment`. An admin can put
+an account back to `pending_verification`, and that path must not 500.
+
+**The email bug was in settings, not in `emails.py`.** That module already caught, logged and
+reported failures correctly. `EMAIL_USE_TLS` was parsed as `os.environ.get(...) == 'True'`,
+which reads `true`, `TRUE`, `1` and `yes` as False — the connection is then attempted in the
+clear, Resend rejects it on port 587, and every verification code fails to send with nothing
+in the UI to say so. Now parsed by `_env_flag`, the same way `DEBUG` already was in the same
+file. Also added: `EMAIL_TIMEOUT` (the send is inline on the request thread, so a wedged SMTP
+server otherwise holds signup open until the dyno kills it) and a boot-time error when TLS and
+SSL are both set, because Django's own message points at the backend rather than the
+environment that caused it.
+
+**`UserPaymentRecord` is not a card vault and must never become one.** Paddle is the merchant
+of record and this app never sees a PAN; what lands here is the detail a cash or Whish sale
+leaves behind. Fernet encrypts it at rest via `accounts/crypto.py`. The threat model is stated
+in that module rather than implied: this defends against a leaked dump, a stray backup, or a
+support user reading the table — not against a compromised server, since the key is in the
+process environment. `method` and `amount_usd` stay in the clear because reporting groups by
+them and "this was a cash sale" is not sensitive.
+
+`get_fernet()` refuses to fall back to a SECRET_KEY-derived key when DEBUG is off. The
+fallback would work perfectly until somebody rotated SECRET_KEY for unrelated reasons, and
+then every record would be unreadable at once with no error to trace it to. Tests supply their
+own key for the same reason — Django forces DEBUG=False under the runner. Decryption failure
+returns a marker instead of raising, so one bad row cannot 500 a changelist showing fifty.
+
+The admin changelist shows a masked length hint, not the note: a list view is what gets left
+open on a shared screen, and answering "did this account pay?" does not require decrypting
+fifty rows.
+
+**`UserAdmin` is re-registered explicitly.** Django already ships the password-change form, so
+this changes little functionally — but it pins the capability against a stray unregister,
+surfaces which account a user belongs to (where support actually starts), and adds the check
+that matters: a staff user cannot change another user's password, because that is a full
+account takeover and no model permission should grant it.
+
+`Settings` is out of `NAV_ITEMS`. It stays reachable everywhere because the account dropdown
+is rendered twice — in the Dock (`sm:flex`) and in `WindowChrome` (`sm:hidden`) — which is
+what makes removing the rail item safe on phones. "Back to Settings" on `/subscription` shows
+only for a live subscriber: someone locked out did not arrive from Settings and cannot use the
+app, so sign-out remains their exit.
+
+Verified: `manage.py test` 500 passed; `npm test` 256 passed; lint and build clean.
+
+---
+
 ## 2026-08-12 — Merge: Phases 3-8 join the Phase 2.5 billing work
 
 `phase-3-expenses` (39 commits — expenses, barcodes, the dashboard profit series, CSV totals,

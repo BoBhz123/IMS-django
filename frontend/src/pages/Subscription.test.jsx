@@ -424,4 +424,25 @@ describe('Subscription', () => {
     await waitFor(() => expect(refreshAccount).toHaveBeenCalled())
     expect(navigate).not.toHaveBeenCalled()
   })
+
+  // --- back to settings -------------------------------------------------------------------
+
+  it('offers a way back to settings for a live subscriber', async () => {
+    account = liveAccount
+    renderPage()
+    await screen.findByText(/current active subscription/i)
+    expect(screen.getByRole('link', { name: /back to settings/i })).toHaveAttribute(
+      'href',
+      '/settings',
+    )
+  })
+
+  it('does not offer it to someone who is locked out', async () => {
+    // They did not arrive from Settings and cannot use the app; sign out is their exit.
+    account = { ...liveAccount, subscription_status: 'canceled', subscription_live: false }
+    renderPage()
+    await screen.findByRole('alert')
+    expect(screen.queryByRole('link', { name: /back to settings/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /sign out/i })).toBeInTheDocument()
+  })
 })

@@ -38,19 +38,40 @@ PLAN_MONTHS = {
 }
 
 
-def start_trial(account, *, days=None, save=True):
+class TrialAlreadyUsed(Exception):
+    """This account has had its one free trial."""
+
+
+def start_trial(account, *, days=None, save=True, force=False):
     """
     Put an account onto a cardless trial, starting now.
 
     Always restamps trial_ends_at from now rather than extending it: this is called when the
     trial *begins*, and extending an existing value would let a repeat caller stack trials.
     The admin's extend action is the deliberate exception and does its own arithmetic.
+
+    One trial per account, latched on `has_used_trial`. Raises TrialAlreadyUsed on a second
+    attempt rather than returning quietly — a caller that thinks it granted a trial and did
+    not is worse than a loud failure, and every caller here is server-side code that knows
+    whether it is re-onboarding or not.
+
+    `force` is the superuser's override for the admin's reset action. It exists because
+    support goodwill is a real requirement and the alternative is editing the column by hand,
+    which is the same act with less of a record.
     """
+    if account.has_used_trial and not force:
+        raise TrialAlreadyUsed(
+            f'Account {account.pk} has already used its free trial.'
+        )
+
     days = Account.TRIAL_DAYS if days is None else days
     account.subscription_status = Account.TRIALING
     account.trial_ends_at = timezone.now() + timedelta(days=days)
+    account.has_used_trial = True
     if save:
-        account.save(update_fields=['subscription_status', 'trial_ends_at'])
+        account.save(
+            update_fields=['subscription_status', 'trial_ends_at', 'has_used_trial'],
+        )
     return account
 
 

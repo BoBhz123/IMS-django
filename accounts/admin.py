@@ -2,14 +2,19 @@ from datetime import timedelta
 
 from django import forms
 from django.contrib import admin, messages
+from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
+from django.contrib.auth.forms import AdminPasswordChangeForm
+from django.contrib.auth.models import User
 from django.utils import timezone
 from django.utils.html import format_html
 
 from .billing.activation import activate_account, start_trial
 from .billing.keys import generate_code, normalize_key
 from .billing.webhooks import trial_expiry_sweep
+from .crypto import UNREADABLE
 from .models import (
     Account, DiscountKey, DiscountKeyRedemption, Membership, ProcessedWebhookEvent,
+    UserPaymentRecord,
 )
 
 
@@ -132,19 +137,34 @@ def extend_trial(modeladmin, request, queryset):
         base = max(now, account.trial_ends_at) if account.trial_ends_at else now
         account.trial_ends_at = base + timedelta(days=Account.TRIAL_DAYS)
         account.subscription_status = Account.TRIALING
-        account.save(update_fields=['trial_ends_at', 'subscription_status'])
+        # Latched here too: this path sets TRIALING without going through start_trial, and a
+        # trial that does not mark itself used is a trial that can be had twice.
+        account.has_used_trial = True
+        account.save(
+            update_fields=['trial_ends_at', 'subscription_status', 'has_used_trial'],
+        )
         count += 1
     messages.success(request, f'Extended the trial on {count} account(s).')
 
 
-@admin.action(description='Reset trial to a fresh 14 days')
+@admin.action(description='Reset trial to a fresh 14 days (overrides one-trial policy)')
 def reset_trial(modeladmin, request, queryset):
-    """Restarts the clock from now, discarding whatever was left. For support goodwill."""
+    """
+    Restarts the clock from now, discarding whatever was left. For support goodwill.
+
+    Passes force=True: this is the one sanctioned way past `has_used_trial`, and it is
+    superuser-only. The alternative is an admin editing the column by hand, which is the same
+    act with less of a record.
+    """
     count = 0
     for account in queryset:
-        start_trial(account)
+        start_trial(account, force=True)
         count += 1
-    messages.success(request, f'Reset the trial on {count} account(s).')
+    messages.warning(
+        request,
+        f'Reset the trial on {count} account(s) — this overrode the one-trial-per-account '
+        f'policy.',
+    )
 
 
 @admin.action(description='Revoke subscription (locks the account out immediately)')
@@ -200,16 +220,24 @@ class AccountAdmin(admin.ModelAdmin):
 
     list_display = [
         'name', 'phone', 'status_badge', 'plan_badge', 'live_badge', 'expires_at',
-        'trial_ends_at', 'created_at',
+        'trial_ends_at', 'has_used_trial', 'created_at',
     ]
-    list_filter = ['subscription_status', 'plan_type']
+    list_filter = ['subscription_status', 'plan_type', 'has_used_trial']
     search_fields = ['name', 'phone', 'paddle_customer_id', 'paddle_subscription_id']
     inlines = [MembershipInline]
     actions = SUBSCRIPTION_ACTION_FUNCS
+    # Read-only for everyone, superusers included. This is a latch, not a setting: the only
+    # sanctioned way to give an account a second trial is the reset action, which forces it
+    # deliberately and says so in the message. A hand-editable checkbox is the same power
+    # with none of that signal.
+    readonly_fields = ['has_used_trial']
     fieldsets = [
         (None, {'fields': ['name', 'phone']}),
         ('Subscription', {
-            'fields': ['subscription_status', 'plan_type', 'expires_at', 'trial_ends_at'],
+            'fields': [
+                'subscription_status', 'plan_type', 'expires_at', 'trial_ends_at',
+                'has_used_trial',
+            ],
             'description': (
                 'expires_at and trial_ends_at are directly editable by superusers so a cash '
                 'or Whish sale can be dated by hand. Access is computed from these two '
@@ -366,3 +394,110 @@ class DiscountKeyRedemptionAdmin(SuperuserOnlyAdmin):
 
     def has_change_permission(self, request, obj=None):
         return False
+
+
+class UserPaymentRecordForm(forms.ModelForm):
+    """
+    Exposes the encrypted note as an ordinary textarea.
+
+    `encrypted_details` is a BinaryField; without this the admin would render raw ciphertext
+    in a text box and save whatever was typed straight into the column unencrypted, which is
+    exactly the failure the model exists to prevent.
+    """
+
+    details = forms.CharField(
+        widget=forms.Textarea(attrs={'rows': 3}),
+        required=False,
+        label='Details (encrypted at rest)',
+        help_text=(
+            'Free text — how the customer paid, a Whish reference, who took the cash. '
+            'Never a card number: Paddle is the merchant of record and this app is '
+            'deliberately outside PCI scope.'
+        ),
+    )
+
+    class Meta:
+        model = UserPaymentRecord
+        fields = ['account', 'user', 'method', 'amount_usd', 'reference', 'details']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.instance and self.instance.pk:
+            self.fields['details'].initial = self.instance.details
+
+    def save(self, commit=True):
+        record = super().save(commit=False)
+        record.details = self.cleaned_data.get('details', '')
+        if commit:
+            record.save()
+        return record
+
+
+@admin.register(UserPaymentRecord)
+class UserPaymentRecordAdmin(SuperuserOnlyAdmin):
+    """
+    Superuser-only, because reading this table is reading customers' payment history.
+
+    The changelist deliberately shows a *masked* preview rather than the decrypted note: a
+    list view is the thing left open on a shared screen, and there is no reason to decrypt
+    fifty rows to answer "did this account pay?". The full text is on the change form, one
+    deliberate click away.
+    """
+
+    form = UserPaymentRecordForm
+    list_display = ['created_at', 'account', 'method', 'amount_usd', 'reference', 'masked']
+    list_filter = ['method', 'created_at']
+    search_fields = ['account__name', 'reference']
+    autocomplete_fields = ['account', 'user']
+    readonly_fields = ['created_at']
+
+    @admin.display(description='Details')
+    def masked(self, record):
+        """A length hint, not the content. Enough to see a row is populated."""
+        text = record.details
+        if not text:
+            return '—'
+        if text == UNREADABLE:
+            return status_badge('Unreadable', 'red')
+        return status_badge(f'Encrypted · {len(text)} chars', 'blue')
+
+    def save_model(self, request, obj, form, change):
+        # Who filed the record, when it was entered by hand rather than by a webhook.
+        if not change and obj.user_id is None:
+            obj.user = request.user
+        super().save_model(request, obj, form, change)
+
+
+# --- User administration -----------------------------------------------------------------
+# Django's own UserAdmin already ships the password-change form; it is re-registered here so
+# that (a) the capability is explicit and cannot be lost to a stray unregister, and (b) the
+# account a user belongs to is visible from the user page, which is where support starts.
+admin.site.unregister(User)
+
+
+@admin.register(User)
+class UserAdmin(DjangoUserAdmin):
+    # The dedicated set-password form, reached from the link on the change page. Named
+    # explicitly rather than inherited so it survives a future refactor of this class.
+    change_password_form = AdminPasswordChangeForm
+
+    inlines = [MembershipInline]
+    list_display = [
+        'username', 'email', 'account_name', 'is_active', 'is_staff', 'is_superuser',
+        'last_login',
+    ]
+    # search_fields is load-bearing, not cosmetic: MembershipAdmin and UserPaymentRecordAdmin
+    # both use autocomplete_fields against User, and autocomplete 500s without it.
+    search_fields = ['username', 'email', 'first_name', 'last_name']
+
+    @admin.display(description='Account', ordering='membership__account__name')
+    def account_name(self, user):
+        membership = getattr(user, 'membership', None)
+        return membership.account.name if membership else '—'
+
+    def has_change_permission(self, request, obj=None):
+        # A staff user must not be able to set another user's password — that is a full
+        # account takeover, and it is the whole reason this class is spelled out.
+        if obj is not None and not request.user.is_superuser:
+            return False
+        return super().has_change_permission(request, obj)

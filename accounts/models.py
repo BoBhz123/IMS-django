@@ -72,6 +72,14 @@ class Account(models.Model):
     # lapsed trial indistinguishable from a lapsed paid subscription, and those are different
     # sales conversations — and reactivating a paid account would silently hand back a trial.
     trial_ends_at = models.DateTimeField(null=True, blank=True)
+    # Latched on the first trial and never cleared by ordinary code, so one account gets one
+    # free trial. A null trial_ends_at cannot stand in for this: activating a paid plan leaves
+    # the old trial date behind, and clearing it (as the revoke action does) would otherwise
+    # hand the account a fresh fortnight for free.
+    has_used_trial = models.BooleanField(
+        default=False,
+        help_text='Set the first time a trial starts. Blocks a second free trial.',
+    )
 
     # Set by the Paddle webhook so a renewal or cancellation can find its way back to the
     # right row. Blank for accounts activated by discount key, cash, or the admin.
@@ -302,6 +310,86 @@ class DiscountKey(models.Model):
         if self.expires_at and self.expires_at <= now:
             return False
         return self.redemption_count < self.max_redemptions
+
+
+class UserPaymentRecord(models.Model):
+    """
+    An encrypted note of how somebody paid.
+
+    **This is not a card vault and must never become one.** Paddle is the merchant of record;
+    it holds the card and this app never sees a PAN. What lands here is the human detail a
+    cash or Whish sale leaves behind — "Whish, ref 88213, paid at the shop" — which is
+    ordinary business record-keeping that nonetheless names a customer and a transaction, and
+    so is worth encrypting at rest. Storing a real card number here would put this app in PCI
+    scope, which is the entire thing Paddle was chosen to avoid.
+
+    Encryption is Fernet (AES-128-CBC + HMAC), so a database dump alone is useless without
+    the key. Be clear about the threat model: the key lives in the application's environment,
+    so anything that can run this code can decrypt. This defends against a leaked backup, a
+    misconfigured replica, or a support user reading the table — not against a compromised
+    server.
+    """
+
+    CASH = 'cash'
+    WHISH = 'whish'
+    OMT = 'omt'
+    CARD = 'card'
+    OTHER = 'other'
+    METHOD_CHOICES = [
+        (CASH, 'Cash'),
+        (WHISH, 'Whish Money'),
+        (OMT, 'OMT'),
+        (CARD, 'Card (via Paddle)'),
+        (OTHER, 'Other'),
+    ]
+
+    account = models.ForeignKey(
+        Account, on_delete=models.CASCADE, related_name='payment_records',
+    )
+    user = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='payment_records',
+        help_text='Who recorded this, when it was entered by hand.',
+    )
+    # Deliberately in the clear: this is the column reporting groups by, and knowing a sale
+    # was cash is not sensitive. The identifying detail goes in the encrypted field.
+    method = models.CharField(max_length=16, choices=METHOD_CHOICES, default=CASH)
+    amount_usd = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+
+    # Ciphertext. Never read this directly — use the `details` property, which is the only
+    # thing that knows the key.
+    encrypted_details = models.BinaryField(blank=True, default=b'')
+
+    reference = models.CharField(
+        max_length=64, blank=True, default='',
+        help_text='Non-sensitive lookup handle, e.g. a receipt number. Stored in the clear.',
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['account', '-created_at'], name='payrec_account_created_idx'),
+        ]
+
+    def __str__(self):
+        return f'{self.get_method_display()} ${self.amount_usd} — {self.account.name}'
+
+    @property
+    def details(self):
+        """
+        The decrypted note, or a placeholder when the key cannot open it.
+
+        Returns a marker rather than raising: a rotated or missing key must not make the
+        admin changelist 500 for every row at once. The failure is visible in the value.
+        """
+        from .crypto import decrypt_text
+        return decrypt_text(self.encrypted_details)
+
+    @details.setter
+    def details(self, value):
+        from .crypto import encrypt_text
+        self.encrypted_details = encrypt_text(value)
 
 
 class ProcessedWebhookEvent(models.Model):

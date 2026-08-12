@@ -442,13 +442,36 @@ if AWS_STORAGE_BUCKET_NAME:
 # Resend over plain SMTP (smtp.resend.com:587, user 'resend', password = the API key), so
 # Django's own backend is reused and no SDK dependency is added. Left unset, these fall back
 # to the local smtp4dev container.
+def _env_flag(name, default='False'):
+    """
+    Parse a boolean environment variable the way DEBUG above is parsed.
+
+    `os.environ.get(name) == 'True'` is the tempting one-liner and it silently reads
+    EMAIL_USE_TLS=true (or TRUE, or 1) as False. For TLS that is not a cosmetic bug: the
+    connection is attempted in the clear, Resend rejects it on port 587, and every
+    verification code fails to send with nothing in the UI to say so.
+    """
+    return os.environ.get(name, default).strip().lower() in ('true', '1', 'yes', 'on')
+
+
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = os.environ.get('EMAIL_HOST', 'localhost')
 EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '25'))  # 25 matches smtp4dev's port mapping
 EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
-EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'False') == 'True'
-EMAIL_USE_SSL = os.environ.get('EMAIL_USE_SSL', 'False') == 'True'
+EMAIL_USE_TLS = _env_flag('EMAIL_USE_TLS')
+EMAIL_USE_SSL = _env_flag('EMAIL_USE_SSL')
+# Django raises if both are set, and the message points at the backend rather than at the
+# environment that actually caused it. Fail here, where the fix is obvious.
+if EMAIL_USE_TLS and EMAIL_USE_SSL:
+    raise ImproperlyConfigured(
+        'EMAIL_USE_TLS and EMAIL_USE_SSL are mutually exclusive. Use TLS on port 587 '
+        '(STARTTLS) or SSL on port 465, not both.'
+    )
+# The send happens inline on the request thread — there is no worker queue. Without a timeout
+# a wedged SMTP server holds the signup request open until the dyno's own timeout kills it,
+# and the user sees a hung page rather than "we could not send a code".
+EMAIL_TIMEOUT = int(os.environ.get('EMAIL_TIMEOUT', '10'))
 DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'ims-system@local.test')
 
 # --- Billing -------------------------------------------------------------------------
@@ -482,6 +505,14 @@ PADDLE_WEBHOOK_SECRET = os.environ.get('PADDLE_WEBHOOK_SECRET', '')
 PADDLE_PRICE_MONTHLY = os.environ.get('PADDLE_PRICE_MONTHLY', '')
 PADDLE_PRICE_ANNUAL = os.environ.get('PADDLE_PRICE_ANNUAL', '')
 PADDLE_PRICE_LIFETIME = os.environ.get('PADDLE_PRICE_LIFETIME', '')
+
+# --- Payment record encryption ----------------------------------------------------------
+# Fernet key for accounts.models.UserPaymentRecord. Generate with:
+#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Required when DEBUG is off; local dev derives one from SECRET_KEY (see accounts/crypto.py
+# for why that fallback is not allowed in production). Rotating this makes every existing
+# record unreadable — there is no re-encryption path, so treat it as write-once.
+PAYMENT_ENCRYPTION_KEY = os.environ.get('PAYMENT_ENCRYPTION_KEY', '')
 
 # --- Local (cash / Whish) payment contact ----------------------------------------------
 # Whish and cash settle over chat, not a gateway. These drive the deep links on the

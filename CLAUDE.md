@@ -498,6 +498,17 @@ Append here when something bites. Do not repeat these.
   that membership's `account` on it. A test that reuses the client after changing the account
   in the database reads the stale in-memory row and looks like a caching bug in the API. Build a
   fresh client from `User.objects.get(pk=…)` per request, as `AdminOverrideSyncTests` does.
+- **One trial per account, latched on `Account.has_used_trial`.** `start_trial` raises
+  `TrialAlreadyUsed`; only the admin reset action may pass `force=True`. Do not use a null
+  `trial_ends_at` as the signal — the revoke action clears it, which would hand a revoked
+  account a fresh trial.
+- **`UserPaymentRecord` must never hold a card number.** Paddle is merchant of record and this
+  app is deliberately outside PCI scope. It stores cash/Whish detail, Fernet-encrypted via
+  `accounts/crypto.py`. `PAYMENT_ENCRYPTION_KEY` is required when `DEBUG` is off and is
+  effectively write-once: rotating it makes every existing record unreadable.
+- **Boolean env vars need `_env_flag`, not `== 'True'`.** That comparison read
+  `EMAIL_USE_TLS=true` as False, attempted port 587 in the clear, and silently broke every
+  verification email. Any new boolean setting goes through the helper.
 - **This app has no `/api/` prefix.** The billing/onboarding endpoints are `/accounts/…`,
   `/billing/…` and `/auth/…`. Requests naming `/api/accounts/redeem-code/` mean
   `/billing/redeem-key/`.
