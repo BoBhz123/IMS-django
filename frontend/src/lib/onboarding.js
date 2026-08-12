@@ -17,6 +17,34 @@ export function formatCooldown(seconds) {
   return `${minutes}:${String(total % 60).padStart(2, '0')}`
 }
 
+/**
+ * The server's slug for "this sign-up session is over and the account is gone".
+ *
+ * Branch on this, never on the wording: the message is written for a person and will be
+ * reworded, and every other failure on the verify screen is recoverable where this one is not.
+ */
+export const REGISTRATION_EXPIRED_CODE = 'registration_expired'
+
+export function isRegistrationExpiredError(error) {
+  const response = error?.response
+  return response?.status === 410 || response?.data?.code === REGISTRATION_EXPIRED_CODE
+}
+
+/**
+ * Seconds left in the sign-up session, or null when there is no session to count.
+ *
+ * Presentation only. The server decides whether the session is over — `registration_session_expired`
+ * on the account payload — because a device whose clock is wrong would otherwise either
+ * strand a user whose codes still work or show a live form for an account already deleted.
+ */
+export function registrationSecondsRemaining(account, now = Date.now()) {
+  const expiresAt = account?.registration_expires_at
+  if (!expiresAt) return null
+  const deadline = Date.parse(expiresAt)
+  if (Number.isNaN(deadline)) return null
+  return Math.max(0, Math.ceil((deadline - now) / 1000))
+}
+
 const UNPAID_STATUSES = new Set(['pending_payment', 'past_due', 'canceled'])
 
 /**

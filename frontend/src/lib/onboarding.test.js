@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest'
 import {
   formatCooldown,
   isCompleteCode,
+  isRegistrationExpiredError,
   normalizeCode,
   isAllowedWhileUnpaid,
+  registrationSecondsRemaining,
   routeForAccount,
   routeForAccountStatus,
 } from './onboarding'
@@ -143,5 +145,51 @@ describe('the unpaid whitelist', () => {
     expect(
       routeForAccount({ subscription_status: 'trialing', subscription_live: true }, '/products'),
     ).toBeNull()
+  })
+})
+
+describe('isRegistrationExpiredError', () => {
+  it('recognises the server slug', () => {
+    expect(
+      isRegistrationExpiredError({
+        response: { status: 410, data: { code: 'registration_expired' } },
+      }),
+    ).toBe(true)
+  })
+
+  it('recognises the status even without a body', () => {
+    expect(isRegistrationExpiredError({ response: { status: 410, data: {} } })).toBe(true)
+  })
+
+  it('leaves ordinary failures alone', () => {
+    // A mistyped code must stay recoverable — treating it as an expired session would throw
+    // away a registration over one wrong digit.
+    expect(
+      isRegistrationExpiredError({
+        response: { status: 400, data: { code: 'invalid_code' } },
+      }),
+    ).toBe(false)
+    expect(isRegistrationExpiredError(undefined)).toBe(false)
+  })
+})
+
+describe('registrationSecondsRemaining', () => {
+  const now = Date.parse('2026-08-12T12:00:00Z')
+
+  it('counts down to the deadline', () => {
+    const account = { registration_expires_at: '2026-08-12T12:10:00Z' }
+    expect(registrationSecondsRemaining(account, now)).toBe(600)
+  })
+
+  it('clamps a passed deadline to zero rather than going negative', () => {
+    const account = { registration_expires_at: '2026-08-12T11:59:00Z' }
+    expect(registrationSecondsRemaining(account, now)).toBe(0)
+  })
+
+  it('is null when there is no session to count', () => {
+    // A verified account has the column cleared, and a superadmin has no account at all.
+    expect(registrationSecondsRemaining({ registration_expires_at: null }, now)).toBeNull()
+    expect(registrationSecondsRemaining(null, now)).toBeNull()
+    expect(registrationSecondsRemaining({ registration_expires_at: 'nonsense' }, now)).toBeNull()
   })
 })
