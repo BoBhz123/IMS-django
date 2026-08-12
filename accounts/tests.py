@@ -1,12 +1,16 @@
 import json
+import smtplib
 from datetime import date, datetime, timedelta
 from datetime import timezone as dt_timezone
+from io import StringIO
 from smtplib import SMTPException
 from unittest.mock import patch
 
 from django.contrib import admin
 from django.contrib.auth.models import Permission, User
 from django.core import mail
+from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db import IntegrityError, transaction
 from django.test import Client, RequestFactory, TestCase, override_settings
@@ -2804,3 +2808,57 @@ class EmailConfigTests(TestCase):
 
         self.assertFalse(sent)
         self.assertTrue(any('Failed to send' in line for line in captured.output))
+
+
+class SendTestEmailCommandTests(TestCase):
+    """The diagnostic command operators reach for when codes stop arriving."""
+
+    def run_command(self, *args, **kwargs):
+        out, err = StringIO(), StringIO()
+        call_command('send_test_email', *args, stdout=out, stderr=err, **kwargs)
+        return out.getvalue(), err.getvalue()
+
+    @override_settings(
+        EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend',
+        DEFAULT_FROM_EMAIL='support@example.com',
+    )
+    def test_a_working_backend_reports_success_and_actually_sends(self):
+        out, _ = self.run_command('owner@example.com')
+        self.assertIn('Sent.', out)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].from_email, 'support@example.com')
+        self.assertEqual(mail.outbox[0].to, ['owner@example.com'])
+
+    @override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')
+    def test_it_warns_that_a_non_smtp_backend_delivers_nothing(self):
+        # The silent-success trap: locmem and console accept everything and deliver none of
+        # it, so a "working" send proves nothing about production.
+        out, _ = self.run_command('owner@example.com', show_config=True)
+        self.assertIn('nothing will actually be delivered', out)
+
+    @override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')
+    def test_the_config_dump_masks_the_password(self):
+        with override_settings(EMAIL_HOST_PASSWORD='xsmtpsib-supersecret-value-here'):
+            out, _ = self.run_command('owner@example.com', show_config=True)
+        self.assertNotIn('supersecret', out)
+        self.assertIn('EMAIL_HOST_PASSWORD', out)
+
+    def test_an_smtp_rejection_becomes_a_command_error_with_a_hint(self):
+        # 525 reads like a credential problem and is not one — it is Brevo's IP allowlist.
+        # The mapped hint is what stops the next operator rotating a perfectly good SMTP key.
+        error = smtplib.SMTPAuthenticationError(525, b'5.7.1 Unauthorized IP address')
+        with patch('django.core.mail.send_mail', side_effect=error):
+            with patch(
+                'accounts.management.commands.send_test_email.send_mail', side_effect=error,
+            ):
+                with self.assertRaises(CommandError):
+                    self.run_command('owner@example.com')
+
+    def test_a_zero_send_without_an_exception_is_still_a_failure(self):
+        # send_mail returning 0 means nothing left the process, which a bare "no exception"
+        # check would read as success.
+        with patch(
+            'accounts.management.commands.send_test_email.send_mail', return_value=0,
+        ):
+            with self.assertRaises(CommandError):
+                self.run_command('owner@example.com')

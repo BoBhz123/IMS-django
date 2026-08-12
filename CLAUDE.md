@@ -506,6 +506,11 @@ Append here when something bites. Do not repeat these.
   app is deliberately outside PCI scope. It stores cash/Whish detail, Fernet-encrypted via
   `accounts/crypto.py`. `PAYMENT_ENCRYPTION_KEY` is required when `DEBUG` is off and is
   effectively write-once: rotating it makes every existing record unreadable.
+- **`525 5.7.1 Unauthorized IP address` from Brevo is not a credential problem.** It is
+  Brevo's "Authorised IPs" allowlist rejecting the sending host. Rotating the SMTP key does
+  nothing. `manage.py send_test_email <addr> --show-config` reproduces it and prints the hint.
+- **Brevo needs a verified sender.** `DEFAULT_FROM_EMAIL` on a free-mail domain (gmail.com)
+  cannot be DKIM-signed by us, so it is spam-filed or refused even once the IP is allowed.
 - **Boolean env vars need `_env_flag`, not `== 'True'`.** That comparison read
   `EMAIL_USE_TLS=true` as False, attempted port 587 in the clear, and silently broke every
   verification email. Any new boolean setting goes through the helper.
