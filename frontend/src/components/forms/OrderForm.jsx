@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Loader2, Plus, ScanLine, Trash2 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { DEFAULT_EXCHANGE_RATE, useCurrency } from '@/context/CurrencyContext'
@@ -8,8 +8,12 @@ import { CurrencyInput } from '@/components/ui/CurrencyInput'
 import { ProductPicker } from '@/components/forms/ProductPicker'
 import { StockBadge } from '@/components/ui/StockBadge'
 import { lookupByBarcode } from '@/hooks/useBarcodeLookup'
+import { useAllProducts } from '@/hooks/useAllProducts'
 import { useOpenSession } from '@/hooks/useOpenSession'
 import { hasBlockingStockError, stockStateFor } from '@/lib/stock'
+import {
+  availableStock, creditedUnitsByProductId, partyIdByName, toFormLines,
+} from '@/lib/transactionEdit'
 
 function emptyItem() {
   return { product: '', quantity: 1, unit_multiplier: 1, unit_price: 0, stock_quantity: null, product_name: '' }
@@ -35,25 +39,60 @@ function maxQuantityFor(items, index) {
   return Math.max(0, Math.floor((available - claimedElsewhere) / multiplier))
 }
 
-export function OrderForm({ open, onClose, ...rest }) {
+export function OrderForm({ open, onClose, order = null, ...rest }) {
   // Keyed body: every opening remounts it, so a created order does not leave its customer,
-  // exchange rate and line items behind for the next one. See useOpenSession.
+  // exchange rate and line items behind for the next one — and so switching from editing one
+  // order to editing another re-hydrates instead of showing the first one's lines. The
+  // session key alone would not do the second job, hence the order id in it. See
+  // useOpenSession.
   const session = useOpenSession(open)
   return (
-    <SlideOver open={open} onClose={onClose} title="Add order">
-      <OrderFormBody key={session} onClose={onClose} {...rest} />
+    <SlideOver open={open} onClose={onClose} title={order ? 'Edit order' : 'Add order'}>
+      <OrderFormBody
+        key={`${session}:${order?.id ?? 'new'}`}
+        onClose={onClose}
+        order={order}
+        {...rest}
+      />
     </SlideOver>
   )
 }
 
-function OrderFormBody({ onClose, onSaved, customers }) {
+function OrderFormBody({ onClose, onSaved, customers, order = null }) {
   const { formatAmount } = useCurrency()
+  const editing = Boolean(order)
 
-  const [customer, setCustomer] = useState('')
-  const [exchangeRate, setExchangeRate] = useState(DEFAULT_EXCHANGE_RATE)
-  const [items, setItems] = useState([emptyItem()])
+  // Only editing needs the catalog: the saved lines carry product ids, and the form needs
+  // each product's name (for the picker's label) and stock (for the quantity cap).
+  const { products: catalog, status: catalogStatus } = useAllProducts(editing)
+
+  const [customer, setCustomer] = useState(() =>
+    editing ? partyIdByName(order.customer, customers) : '',
+  )
+  const [exchangeRate, setExchangeRate] = useState(
+    () => (editing ? order.exchange_rate : DEFAULT_EXCHANGE_RATE),
+  )
+  const [items, setItems] = useState(() => (editing ? [] : [emptyItem()]))
+  const [hydrated, setHydrated] = useState(!editing)
   const [errors, setErrors] = useState({})
   const [saving, setSaving] = useState(false)
+
+  /**
+   * Stock this order already holds, per product — what the edit gives back before it takes
+   * anything new. Without it every line of an order that sold out its product reads as "over
+   * stock" and the form refuses to submit an edit that changes nothing about quantities.
+   */
+  const credited = useMemo(
+    () => (editing ? creditedUnitsByProductId(order.items, catalog, 'id') : new Map()),
+    [editing, order, catalog],
+  )
+
+  // Hydration waits for the catalog, so it cannot run in useState above.
+  useEffect(() => {
+    if (hydrated || catalogStatus !== 'ready') return
+    setItems(toFormLines(order.items, catalog, { productKey: 'id', credited }))
+    setHydrated(true)
+  }, [hydrated, catalogStatus, order, catalog, credited])
 
   const [scannerOpen, setScannerOpen] = useState(false)
   const [scanMessage, setScanMessage] = useState(null)
@@ -61,10 +100,17 @@ function OrderFormBody({ onClose, onSaved, customers }) {
 
   // The scan handlers have to stay referentially stable — BarcodeScannerModal lists them in the
   // deps of the effect that starts the camera — so they cannot close over `items` directly.
+  // `credited` is read through a ref for the same reason: it changes once, when the catalog
+  // arrives, and that must not restart the camera mid-scan.
   const itemsRef = useRef(items)
   useEffect(() => {
     itemsRef.current = items
   }, [items])
+
+  const creditedRef = useRef(credited)
+  useEffect(() => {
+    creditedRef.current = credited
+  }, [credited])
 
   /**
    * Put a scanned product on the order: bump the line that already holds it, otherwise take the
@@ -97,7 +143,9 @@ function OrderFormBody({ onClose, onSaved, customers }) {
       ...emptyItem(),
       product: String(product.id),
       unit_price: product.default_sell_price,
-      stock_quantity: product.stock_quantity,
+      // Credited, like every other line: scanning a product back onto the order being
+      // edited must see the same ceiling the hydrated lines do.
+      stock_quantity: availableStock(product, creditedRef.current),
       product_name: product.name,
     }
     const blank = current.findIndex((item) => !item.product)
@@ -142,7 +190,7 @@ function OrderFormBody({ onClose, onSaved, customers }) {
     updateItem(index, {
       product: productId,
       unit_price: product ? product.default_sell_price : 0,
-      stock_quantity: product ? product.stock_quantity : null,
+      stock_quantity: product ? availableStock(product, credited) : null,
       product_name: product ? product.name : '',
     })
   }
@@ -182,7 +230,14 @@ function OrderFormBody({ onClose, onSaved, customers }) {
     }
 
     try {
-      await api.post('/inventory/orders/', payload)
+      if (editing) {
+        // PUT, not PATCH: the server replaces the line items wholesale, and a PATCH that
+        // omitted `items` would leave the old lines standing. What is sent is the whole
+        // order as it should now read.
+        await api.put(`/inventory/orders/${order.id}/`, payload)
+      } else {
+        await api.post('/inventory/orders/', payload)
+      }
       onSaved()
       onClose()
     } catch (error) {
@@ -196,9 +251,31 @@ function OrderFormBody({ onClose, onSaved, customers }) {
     }
   }
 
+  if (!hydrated) {
+    return (
+      <div className="flex flex-col items-center gap-2 py-12 text-[13px] text-text-secondary">
+        {catalogStatus === 'error' ? (
+          <p className="text-accent-red">Couldn't load this order for editing. Close and retry.</p>
+        ) : (
+          <>
+            <Loader2 size={18} className="animate-spin text-accent-blue" />
+            <p>Loading order…</p>
+          </>
+        )}
+      </div>
+    )
+  }
+
   return (
     <>
       <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+        {editing && (
+          <p className="rounded-xl bg-accent-blue/10 px-3 py-2 text-[12px] text-text-secondary">
+            Saving replaces every line on this order. Stock is adjusted by the difference —
+            what this order currently holds is released first.
+          </p>
+        )}
+
         <Field label="Customer">
           <select
             value={customer}
@@ -352,7 +429,7 @@ function OrderFormBody({ onClose, onSaved, customers }) {
 
         {hasBlockingStockError(items) && (
           <p className="text-[13px] text-accent-red">
-            Reduce quantities to available stock before creating this order.
+            Reduce quantities to available stock before {editing ? 'saving' : 'creating'} this order.
           </p>
         )}
 
@@ -362,7 +439,7 @@ function OrderFormBody({ onClose, onSaved, customers }) {
           className="mt-1 flex items-center justify-center gap-2 rounded-xl bg-accent-blue py-2.5 text-[14px] font-semibold text-white hover:opacity-90 disabled:opacity-60"
         >
           {saving && <Loader2 size={14} className="animate-spin" />}
-          Create order
+          {editing ? 'Save changes' : 'Create order'}
         </button>
       </form>
 

@@ -1,6 +1,6 @@
 from django.contrib import admin,messages
 from . import models
-from .csv_format import iso as _iso, money as _money
+from .csv_format import iso as _iso, money as _money, text as _csv_safe
 from django.db.models.aggregates import Count
 from django.db.models import Sum, F
 from django.http import HttpResponse
@@ -116,7 +116,10 @@ def export_orders_to_csv(modeladmin, request, queryset):
         grand_total += calculated_total
         writer.writerow([
             order.id,
-            order.customer.name if order.customer else "No Customer",
+            # Escaped because these rows span every account and this file is opened by
+            # the platform superadmin — a subscriber naming a customer '=HYPERLINK(...)'
+            # would otherwise be attacking them.
+            _csv_safe(order.customer.name if order.customer else "No Customer"),
             _iso(order.placed_at),
             order.exchange_rate,
             _money(calculated_total),
@@ -145,7 +148,7 @@ def export_purchases_to_csv(modeladmin, request, queryset):
         grand_total += calculated_total
         writer.writerow([
             purchase.id,
-            purchase.supplier.name if purchase.supplier else "No Supplier",
+            _csv_safe(purchase.supplier.name if purchase.supplier else "No Supplier"),
             _iso(purchase.placed_at),
             _money(calculated_total),
         ])

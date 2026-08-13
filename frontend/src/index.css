@@ -188,12 +188,31 @@ select {
    `transform` on animated elements, and any transformed ancestor creates a new containing block
    that would re-trap the fixed-position invoice inside the modal's cropped box. */
 @media print {
-  /* A4 by default; .invoice-print below sets max-width: 100% alongside its fixed width, so
-     nothing overflows on Letter either — Letter is wider (215.9mm) than A4 (210mm), so
-     content sized to fit A4's width can never overflow it. */
+  /* `size: auto` lets the paper be whatever the user picked — A4, Letter, or a phone's
+     "save as PDF" sheet — instead of forcing A4 and letting anything wider band the page.
+     `margin: 0` does two jobs: it removes the page box's own margin so the invoice can fill
+     the sheet, and it is the only lever CSS has over the browser's default print headers and
+     footers (URL, page title, timestamp). Chrome and Safari suppress them when the page
+     margin is zero; Firefox honours its own preference and may still print them, which is a
+     browser setting and not something a stylesheet can override. The paper's own breathing
+     room is .invoice-print's padding below — with margin: 0 nothing else supplies it. */
   @page {
-    size: A4 portrait;
-    margin: 15mm;
+    size: auto;
+    margin: 0;
+  }
+
+  /* The dark margin bars are the app's own themed background painting the sheet edge-to-edge
+     under a translucent invoice. Forcing both the root and the body white removes them at the
+     source, in either theme. */
+  html,
+  body {
+    background: #ffffff !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    /* Mobile Safari otherwise carries the *screen* scroll position and viewport height into
+       the print rendering, which clips the invoice to one phone-screen's worth. */
+    height: auto !important;
+    overflow: visible !important;
   }
 
   body * {
@@ -209,28 +228,57 @@ select {
     inset: 0;
     top: 0;
     left: 0;
-    /* 100% here would be 100% of the *screen* viewport on some mobile browsers' print
-       renderers (notably iOS Safari), not the paper — that's what produces the
-       squeezed-to-phone-width or black-bar symptom. An explicit physical width fixes it
-       regardless of the device the print was triggered from. */
-    width: 210mm;
-    max-width: 100%;
+    /* Fluid to the sheet, capped at a readable measure and centred. A fixed physical width
+       (the previous 210mm) overflows Letter's printable area at some margins and forces a
+       scale-down on mobile print renderers; 100%/800px sizes to whatever `size: auto`
+       resolved to instead of second-guessing it. */
+    width: 100%;
+    max-width: 800px;
+    margin: 0 auto;
+    /* @page margin is 0, so the invoice supplies its own. */
+    padding: 12mm;
     height: auto;
     max-height: none !important;
     overflow: visible !important;
     background: #ffffff !important;
     color: #1d1d1f !important;
-    box-shadow: none !important;
-    border: none !important;
     box-sizing: border-box;
   }
+  /* No card chrome on paper — a shadow prints as a grey smear and a border reads as a second,
+     wrong page edge now that the invoice fills the sheet. */
+  .invoice-print,
+  .invoice-print * {
+    box-shadow: none !important;
+    text-shadow: none !important;
+    backdrop-filter: none !important;
+  }
+  .invoice-print {
+    border: none !important;
+    border-radius: 0 !important;
+  }
   /* Browsers strip background colors from print/PDF output by default (print-color-adjust:
-     economy) to save ink — without this, the invoice's accent header and zebra striping
-     would silently render as plain white. */
+     economy) to save ink — without this, the invoice's accent header, the PAID badge and the
+     zebra striping would silently render as plain white. */
   .invoice-print,
   .invoice-print * {
     -webkit-print-color-adjust: exact !important;
     print-color-adjust: exact !important;
+  }
+  /* Nothing may spill sideways: an overflowing table is what produces a clipped right-hand
+     column on a narrow sheet. */
+  .invoice-print table {
+    width: 100% !important;
+    table-layout: fixed;
+  }
+  .invoice-print td,
+  .invoice-print th {
+    overflow-wrap: anywhere;
+  }
+  /* A long itemised invoice must break across pages without splitting a row in half. */
+  .invoice-print tr,
+  .invoice-print .avoid-break {
+    break-inside: avoid;
+    page-break-inside: avoid;
   }
   .no-print {
     display: none !important;

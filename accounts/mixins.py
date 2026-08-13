@@ -1,3 +1,4 @@
+from .audit import log_deletion
 from .models import get_account
 
 
@@ -33,3 +34,17 @@ class AccountScopedMixin:
 
     def perform_create(self, serializer):
         serializer.save(account=self.account)
+
+    def perform_destroy(self, instance):
+        # Logged here rather than in a post_delete signal because this is the only layer that
+        # knows *who* deleted the row — a signal sees the instance and nothing else. One
+        # override covers every account-scoped collection, so a new viewset is audited by
+        # inheriting the mixin it already has to inherit in order to be scoped at all.
+        #
+        # The pk is read first and logged last. Django's collector sets `instance.pk = None`
+        # once the row is gone, so reading it afterwards records `pk=None`; and logging
+        # before the delete would record deletions that never happened, since a PROTECT
+        # foreign key raises here and ProtectedDeleteMixin turns that into a 409.
+        model_name, pk = type(instance).__name__, instance.pk
+        super().perform_destroy(instance)
+        log_deletion(self.request.user, self.account, model_name, pk)

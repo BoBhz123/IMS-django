@@ -8,6 +8,571 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-12 — The sign-up session: a deadline, a hard delete, and a way back
+
+Registration is now a *session* with an hour-long deadline of its own, and backing out of it
+is a button rather than a support ticket.
+
+**The premise it was requested under was wrong, and that is worth recording.** There was no
+hardcoded `123456` anywhere in the application — `verification.generate_code` has drawn from
+`secrets.randbelow` since Phase 2.5a, the code is stored as an HMAC and the templates render
+whatever was issued. Every `123456` in the tree is test data. `CODE_TTL` was already the
+requested 10 minutes. So nothing was removed; what was missing was everything *around* the
+code. `RegistrationSessionEndpointTests.test_the_emailed_code_is_generated_not_fixed` now
+signs up five times, reads the code out of each message, and fails if two ever match — a
+constant reintroduced here becomes a failing test rather than a belief about the code.
+
+**`registration_expires_at` is a separate column, not `created_at` plus an hour.** That
+choice is the whole safety argument. An admin can put a paying customer back to
+`pending_verification` — `VerifyEmailView` has handled that case since the trial work — and a
+derived deadline would read that customer as an hour-old sign-up and delete their login. The
+column is stamped once at registration and cleared for good at the first verification, so
+`is_pending_registration` needs the status *and* the timestamp, and a NULL means "this has
+been through verification at least once". There is a test for exactly that resurrection path.
+
+**Closing a session is a hard delete, because a soft one does not solve the problem.** There
+is a case-insensitive unique index on `auth_user.email` (migration 0004), so a row left
+behind keeps the address taken and "start over from scratch" fails with "an account with this
+email already exists" — the one error the user cannot fix themselves. `registration.discard`
+deletes the users, which cascades their memberships, their outstanding `EmailVerification`
+rows and their JWTs, then the account. It raises `NotDiscardable` rather than returning
+quietly, matching `start_trial`: a caller that believes it deleted an account and did not is
+worse than a loud failure, and this guard is what stands between an endpoint and a customer's
+data. Belt and braces beyond the status check — `has_used_trial`, `expires_at`, a Paddle
+customer id — because a row that has taken money is not a registration whatever its status
+column says.
+
+**A 410, deliberately, and not a 400.** An expired session and a mistyped digit are the two
+things this flow most needs to keep apart: one is recoverable by typing again, the other has
+destroyed the account the request was about. The response carries `code:
+'registration_expired'` and the SPA branches on that slug, never on the wording. An expired
+*code* inside a live session still returns `code_expired` and still asks for a resend — the
+two clocks are not the same clock, and collapsing them would throw away a registration over a
+ten-minute-old email.
+
+**Expiry is acted on at the endpoints, not by a job.** Nothing in this project runs on a
+schedule, which is the same reason trial liveness is computed rather than swept, so
+`verify-email/` and `resend-code/` both discard an expired registration before doing anything
+else. Verifying with a *correct* code after the deadline is refused, or the deadline would be
+advisory and one old email could hold an account open indefinitely.
+`purge_expired_registrations` is housekeeping for rows nobody ever comes back to, and reading
+`/accounts/subscription/` deliberately deletes nothing — a status poll that destroyed the
+account under the screen would be a very strange bug to diagnose.
+
+**"Back to sign up" exists for the typo.** Someone who mistyped their address cannot receive
+the code, cannot verify, and cannot re-register with the address they meant while the wrong
+row still holds it. Waiting an hour is not a fix a user should have to discover.
+`POST /accounts/abandon-registration/` discards the caller's own pending row and 409s on
+anything verified; the frontend clears its tokens whatever the server answers, because the
+row may already be gone and a token for a deleted user leaves the router bouncing back to a
+verification screen for an account that no longer exists.
+
+**The abandon endpoint's throttle is keyed on the client address, not the user — that is a
+hole this feature opened and closed in the same change.** Abandoning frees the email address,
+so sign-up → code → abandon → sign-up is a loop that mails the *same* victim repeatedly, and
+the per-user caps in `accounts.verification` cannot see it because every pass creates a new
+user row with a fresh budget. The address is the only identifier that survives the loop.
+
+The verify screen gains a live countdown (recomputed from the deadline each tick, so a
+backgrounded tab tells the truth when it wakes) and an expired state seeded from the server's
+computed `registration_session_expired` — the same reason `trial_days_remaining` is computed
+server-side, since a device with a wrong clock would otherwise either strand someone whose
+codes still work or show a live form for an account already deleted.
+
+Password reset needed no change and got none: it shares `issue_code`/`verify_code`, so it has
+always had dynamic codes, and it already blacklists every outstanding refresh token on
+confirm. It has no registration session to close.
+
+Verified: `manage.py test` 549 passed; `npm test` 269 passed; lint and build clean;
+`makemigrations --check` reports no drift.
+
+---
+
+## 2026-08-12 — HTML transactional email
+
+Codes now go out as `multipart/alternative` — a table-based HTML part and a real plain-text
+part — from `emails/otp_code.{html,txt}`, one template pair for both the signup and password
+reset flows. They differ in wording, not layout, and a second copy of the table scaffolding is
+a second thing to keep rendering correctly in Outlook.
+
+**The plain-text part is not decoration.** A single-part HTML mail with no text alternative is
+one of the oldest spam signals there is. It renders the same content properly rather than
+being a "please enable HTML" stub, which is worth as little to a filter as it is to someone
+reading on a watch.
+
+Table-based with inline styles because Outlook on Windows renders through Word, which drops
+`<style>` blocks, flexbox, grid, and `margin` on most elements. The code sits in its own
+bordered table rather than a styled `<div>` for the same reason — Word drops `background-color`
+and `padding` on divs and the code would sit unboxed on white. `letter-spacing` adds a trailing
+gap after the last glyph, so a matching negative `margin-right` pulls it back to centre.
+
+No images, no web fonts, no tracking pixel. Remote content triggers "images not displayed"
+warnings, adds filter weight, and delays the one thing the reader wants.
+
+`DEFAULT_FROM_EMAIL` is composed into `IMS Support <…>` in settings, and it detects an address
+that already carries a display name rather than double-wrapping — the doubled header is one
+Brevo rejects outright. `DEFAULT_FROM_ADDRESS` keeps the bare form for anything that needs it.
+
+`send_test_email` now sends through the real `send_verification_code`, so the probe puts
+exactly what a user receives into the inbox. A bespoke test body proved the SMTP hop worked
+and nothing about the mail people actually get, which was the half that was broken. It uses a
+`_ProbeUser` stand-in rather than creating a row — a diagnostic that writes to the database is
+one nobody runs against production.
+
+The footer wording caught a real bug in review: with no membership, `business_name` fell back
+to the phrase "your account" and the footer read "from your account's IMS account". The
+fallback is now empty and the templates word its absence themselves.
+
+**HTML does not fix the spam placement, and should not be claimed to.** The dominant signal is
+still that `support.imsapp@gmail.com` cannot be DKIM-signed by us — Brevo relays it, Gmail sees
+a gmail.com sender arriving from a third party, and files it accordingly. Sending from a domain
+we control, with SPF and DKIM published, is the actual fix. This work removes the
+easy signals (missing text part, no display name, unbranded subject) and makes the mail look
+like what it is.
+
+Verified: `manage.py test` 520 passed; a real send through Brevo landed in the target inbox.
+
+---
+
+## 2026-08-12 — One trial per account, an encrypted payment log, and the email-config fix
+
+**`has_used_trial` latches on the first trial.** A null `trial_ends_at` could not stand in for
+it: the revoke action clears that column, so a revoked account would have read as "never
+trialed" and collected a second free fortnight. `start_trial` raises `TrialAlreadyUsed` rather
+than returning quietly — a caller that thinks it granted a trial and did not is worse than a
+loud failure. The admin's reset action passes `force=True`, which is the one sanctioned way
+past the latch, and says so in a warning message.
+
+Migration `0009` backfills the flag for every account with a `trial_ends_at`. Without it the
+policy would only apply to signups from today. Accounts revoked *before* the backfill read as
+never-trialed and stay False — the safe direction to be wrong in, since it grants a trial to
+someone whose subscription was cancelled by hand rather than denying one to a real signup.
+
+`VerifyEmailView` catches `TrialAlreadyUsed` and lands on `pending_payment`. An admin can put
+an account back to `pending_verification`, and that path must not 500.
+
+**The email bug was in settings, not in `emails.py`.** That module already caught, logged and
+reported failures correctly. `EMAIL_USE_TLS` was parsed as `os.environ.get(...) == 'True'`,
+which reads `true`, `TRUE`, `1` and `yes` as False — the connection is then attempted in the
+clear, Resend rejects it on port 587, and every verification code fails to send with nothing
+in the UI to say so. Now parsed by `_env_flag`, the same way `DEBUG` already was in the same
+file. Also added: `EMAIL_TIMEOUT` (the send is inline on the request thread, so a wedged SMTP
+server otherwise holds signup open until the dyno kills it) and a boot-time error when TLS and
+SSL are both set, because Django's own message points at the backend rather than the
+environment that caused it.
+
+**`UserPaymentRecord` is not a card vault and must never become one.** Paddle is the merchant
+of record and this app never sees a PAN; what lands here is the detail a cash or Whish sale
+leaves behind. Fernet encrypts it at rest via `accounts/crypto.py`. The threat model is stated
+in that module rather than implied: this defends against a leaked dump, a stray backup, or a
+support user reading the table — not against a compromised server, since the key is in the
+process environment. `method` and `amount_usd` stay in the clear because reporting groups by
+them and "this was a cash sale" is not sensitive.
+
+`get_fernet()` refuses to fall back to a SECRET_KEY-derived key when DEBUG is off. The
+fallback would work perfectly until somebody rotated SECRET_KEY for unrelated reasons, and
+then every record would be unreadable at once with no error to trace it to. Tests supply their
+own key for the same reason — Django forces DEBUG=False under the runner. Decryption failure
+returns a marker instead of raising, so one bad row cannot 500 a changelist showing fifty.
+
+The admin changelist shows a masked length hint, not the note: a list view is what gets left
+open on a shared screen, and answering "did this account pay?" does not require decrypting
+fifty rows.
+
+**`UserAdmin` is re-registered explicitly.** Django already ships the password-change form, so
+this changes little functionally — but it pins the capability against a stray unregister,
+surfaces which account a user belongs to (where support actually starts), and adds the check
+that matters: a staff user cannot change another user's password, because that is a full
+account takeover and no model permission should grant it.
+
+`Settings` is out of `NAV_ITEMS`. It stays reachable everywhere because the account dropdown
+is rendered twice — in the Dock (`sm:flex`) and in `WindowChrome` (`sm:hidden`) — which is
+what makes removing the rail item safe on phones. "Back to Settings" on `/subscription` shows
+only for a live subscriber: someone locked out did not arrive from Settings and cannot use the
+app, so sign-out remains their exit.
+
+Verified: `manage.py test` 500 passed; `npm test` 256 passed; lint and build clean.
+
+---
+
+## 2026-08-12 — Merge: Phases 3-8 join the Phase 2.5 billing work
+
+`phase-3-expenses` (39 commits — expenses, barcodes, the dashboard profit series, CSV totals,
+camera scanning, categories, the account menu with OTP password reset, and the OWASP audit)
+merged into `feature/saas-single-db-migration`. Both branches had grown from the same commit
+and neither had seen the other.
+
+**Three conflicts needed real decisions, not just marker removal.**
+
+`Settings.jsx` existed on both sides as different pages — a password-reset flow on one, a
+subscription/billing/preferences page on the other. Neither was discardable, so the merged page
+carries four cards: details, Subscription & Billing, Password, Preferences. Their card-based
+`GlassCard` layout won over the flat sections, and the `Business` detail row was restored
+because their test scopes to that region.
+
+`accounts/views.py` needed the union of both import sets, minus `SubscriptionStatusSerializer`
+— `SubscriptionStatusView` now calls `subscription_payload`, which absorbed the no-account case
+the view used to spell out.
+
+**Two `0006_` migrations both branched off `0005`** — `emailverification_purpose` and
+`processedwebhookevent_…`. Django refuses multiple leaf nodes, so `0007_merge_20260812_1242`
+joins them. This is the kind of thing that only shows up when two long-lived branches meet.
+
+**The build caught what the tests could not.** Git cleanly auto-merged `App.jsx` into having
+`import { Settings }` *twice* — valid to every test that mocks the module, fatal to rolldown.
+`npm run build` is the only check in this project that sees it, which is exactly why CLAUDE.md
+insists on running it before calling frontend work done.
+
+`Settings` stays in `NAV_ITEMS` even though `UserMenu` also links to it: `MobileTabBar` renders
+`NAV_ITEMS` and nothing else, so removing it would strand `/settings` on phones — and that page
+is on the unpaid whitelist, so it has to stay reachable.
+
+`npm install` was required after the merge: `package.json` gained `@zxing/library` and three
+test files failed to resolve it until node_modules caught up. `npm audit` now reports 0
+vulnerabilities — the react-router-dom advisories noted in the working log are gone.
+
+Verified after merge: `manage.py test` 472 passed; `npm test` 251 passed; lint clean; build
+clean. (An earlier run reported 5 `setUpClass` errors — two test runs racing for the same
+Postgres test databases, not a defect.)
+
+---
+
+## 2026-08-12 — Phase 2.5b-4: one subscription contract, and a smart plan screen
+
+**The wire names changed.** `status` → `subscription_status`, `has_active_subscription` →
+`subscription_live`, `is_trialing` → `is_trial`, and `VerifyEmailView`'s bespoke `status` key
+joins them. Renamed rather than aliased: two names for one value in the same payload is a
+question every future reader has to answer, and every consumer lives in this repo.
+`subscription_payload()` is now the single projection, shared by `/accounts/subscription/` and
+by `/auth/users/me/` (nested under `subscription`, reusing the same serializer — nested rather
+than flattened because `id` and `email` would otherwise collide with the user's own).
+`SubscriptionPayloadContractTests` pins the exact field set and asserts the two endpoints
+return byte-identical bodies, because four separate frontend concerns read this shape and a
+silent rename breaks all four in different, hard-to-trace ways.
+
+**`payment_method` is inferred, not stored.** 'trial', 'card' if the Paddle ids are set,
+'manual' for anything else that reached `active` — key, cash, Whish, or an admin. A stored
+column would mean every activation path has to remember to set it; the Paddle ids are written
+only by the webhook, so their presence is already a reliable signal.
+
+**`/subscription` stops showing a price list to people who already pay.** A live subscriber
+gets a "Current active subscription" card — plan, payment type, renewal date — with the
+catalog, the Whish/cash pitch and the key box all behind a "Change or upgrade plan" reveal.
+Fronting checkout to someone who has paid reads as "we lost your payment". An account that is
+*not* live sees a `role="alert"` and the plans immediately: no extra click, because for them
+this screen is the only way back in.
+
+**Redemption now routes off the refreshed liveness, not the 200.** It was checking
+`refreshed?.status === 'active'`; a 200 from redeem is not proof of access, and routing home
+on one would have ProtectedRoute bounce the user straight back. There is a test for each
+direction.
+
+`renewalInfo` picks the clock that matters — `trial_ends_at` while trialing, `expires_at` when
+paid, and null for a lifetime licence, because "Renews: —" invites the question of whether
+something is broken. `subscriptionBadge` takes the whole account rather than a status string,
+for the reason that keeps recurring in this phase: an `active` row past its expiry still reads
+`active` in the database, so only the computed flag can be trusted.
+
+Settings gains the "Subscription & Billing" card the same helpers feed — plan, renewal date,
+account id — with the account id moved off the generic identity grid, since quoting it to
+support is a billing act.
+
+**Admin overrides sync because nothing caches.** `AdminOverrideSyncTests` activates, revokes,
+extends a trial and hand-edits an expiry through the real admin, then asserts each shows up on
+the customer's next fetch *and* opens or closes `/inventory/products/`. Writing it surfaced a
+test-only trap worth knowing: `force_authenticate` holds one `User` instance, and Django caches
+`user.membership.account` on it, so a reused client serves a stale in-memory Account and the
+sync appears broken. Real requests re-authenticate every time; the tests now build a client
+from a freshly loaded user.
+
+Verified: `manage.py test` 260 passed; `npm test` 129 passed; lint and build clean.
+
+---
+
+## 2026-08-12 — Phase 2.5b-3: unpaid whitelist and superuser-only billing admin
+
+Two gaps closed on top of 2.5b-2, plus badges. Most of the requested scope was already
+standing — `secrets`-based key generation, the redemption validation and payload, and the
+login/signup cross-links all shipped in earlier phases and are unchanged.
+
+**`/settings` joins `/subscription` on the unpaid whitelist.** An expired account was being
+bounced off every screen including its own account details, which is where the account id and
+email support asks for actually live — locking someone out of that while asking them to pay is
+hostile, and neither screen calls a gated endpoint, so allowing it costs nothing. The whitelist
+lives in `routeForAccountStatus`, which now takes the current path; `isAllowedWhileUnpaid`
+matches exact routes and nested children only, because a bare `startsWith` would let
+`/settings-export` through.
+
+**The whitelist deliberately does not apply to `pending_verification`.** An unverified account
+has not proved it owns the email address; that is a different and worse hole than an unpaid
+one, so verification still wins over the path check. There is a test pinning it.
+
+**Billing admin is superuser-only, enforced five ways.** `SuperuserOnlyAdmin` overrides
+`has_module_permission` alongside the four object permissions — the module check is what keeps
+the section off the admin index, and without it a staff user sees the links and gets a 403,
+which reads as a broken admin rather than a boundary. All five are needed because Django
+consults them independently, so a group grant would otherwise be enough to reach the models
+that hand out free subscriptions. Applied to `DiscountKey`, `DiscountKeyRedemption` and
+`ProcessedWebhookEvent`. The test grants a staff user *every* permission in the table and
+asserts they still cannot get in.
+
+**`AccountAdmin` is the deliberate exception.** It stays visible to staff, because a name and
+phone are ordinary support data and a support user who cannot find the customer cannot help
+them. What is gated is the ability to *change* what they have paid for: `get_actions` strips
+every activation action for non-superusers, and `get_readonly_fields` freezes the subscription
+and Paddle columns. Read-only rather than hidden, so support can still see why a customer is
+locked out. `get_actions` is the real gate — the action dropdown is only a UI affordance, and a
+test posts a `revoke_subscription` a staff user cannot see and asserts nothing happens.
+
+`admin.actions` takes the callables, not their names. A string there is resolved only against
+methods on the ModelAdmin, and these are module-level functions, so naming them registered
+nothing at all and every action silently vanished. The names are derived back off `__name__`
+for the gating, which is keyed by name.
+
+Status/plan/live badges via `format_html` — escaping matters because a business name is user
+input and reaches that column. `trialing` is amber rather than green: the account is live but
+on borrowed time, and that distinction is the point of scanning the column. The live badge
+shows the *computed* answer, so an `active` row whose expiry has passed reads "No" — the
+disagreement between column and enforcement becomes visible at a glance instead of via a
+support ticket.
+
+**Endpoint paths were left alone.** The request named `/api/accounts/me/`,
+`/api/accounts/redeem-code/` and friends; this app has no `/api/` prefix and the real paths are
+`/auth/users/me/`, `/accounts/subscription/`, `/billing/redeem-key/` and `/auth/jwt/blacklist/`.
+Read as identifying *which* endpoints must stay reachable rather than as a rename, since
+renaming them would break every caller in the SPA for no functional gain. `UnpaidWhitelistTests`
+pins all four as reachable while `canceled`, and the core inventory endpoints as blocked.
+
+Verified: `manage.py test` 248 passed; `npm test` 107 passed; lint and build clean.
+
+---
+
+## 2026-08-12 — Phase 2.5b-2: cardless trial, Paddle checkout, and the signed webhook
+
+The gateway half of Phase 2.5, plus a reversal: **the 14-day trial is back.** 2.5a deleted it on the
+grounds that a trial is a free bypass of the payment wall. That is still true, and the business chose
+cardless acquisition anyway — recorded here so it is not later "fixed" back as a regression.
+
+**The trial is safe because liveness is computed, not stored.** `LIVE_STATUSES` gains `TRIALING`, but
+`has_active_subscription` reads `trial_ends_at` for a trialing row, so an elapsed trial locks itself
+out with no scheduled job in existence. A `trialing` row with a *null* `trial_ends_at` denies rather
+than grants: an unbounded free trial is the one failure a payment wall cannot survive, so the null
+case fails closed. The admin's sweep action only tidies the stored column so the list filter tells
+the truth; it is explicitly not enforcement.
+
+**The clock starts at verification, not signup.** Setting `trialing` at account creation would have
+made the trial a way around email verification, since trialing grants access. So signup writes
+`trial_ends_at` (the column is never null) but leaves the status at `pending_verification`, and
+`VerifyEmailView` calls `start_trial`, which restamps from now — a customer who took three days to
+find the email still gets a full fourteen.
+
+**One tier, three billing choices.** `monthly`, `annual`, `one_time`, all granting identical access;
+nothing branches on `plan_type` to decide what a customer may do. `activate_account` now defaults
+`months` per plan via `PLAN_MONTHS`, because the webhook names a plan rather than computing a
+duration — an omitted argument would otherwise activate an annual purchase for one month.
+
+**Checkout is opened by Paddle.js, not by a server-side transaction create.** The overlay needs only
+a price id and the public client token, so starting a checkout costs no API call and cannot fail on a
+stale server key. The server's job is to decide which price the customer may buy and to stamp the
+account id into `custom_data` so the webhook can find its way back. Still no amount and no currency
+anywhere in the request — see the USD-only rule.
+
+**Only the webhook grants access.** Signature verification runs against `request.body`, not
+`request.data`: DRF's parsed dict re-serialises with different key order and whitespace and the HMAC
+stops matching. Idempotency is an *insert* — `ProcessedWebhookEvent.objects.create()` in a
+`try/except IntegrityError` — because check-then-insert lets two concurrent deliveries of the same
+retry both through, and a double activation double-extends `expires_at`. The plan comes from the
+line item's price id rather than `custom_data.plan`: custom_data is what we asked for, the line item
+is what the money bought, and when they disagree the money is the authority. An unrecognised price or
+an unmatchable account is logged and answered 200 — retrying will not fix either, and a non-2xx just
+tells Paddle to keep trying forever. `subscription.past_due` deliberately does *not* revoke: Paddle
+retries a failed card for days, and cutting access on the first failure locks out customers whose
+second attempt succeeds.
+
+**Local payments settle over chat.** WhatsApp and Telegram deep links on `/subscription`, pre-filled
+with account id, email and selected plan — the three things a customer otherwise forgets to include.
+Blank contact settings hide the button rather than rendering a link to nowhere.
+
+The plan cards became radio inputs. They had been a `role="button"` container with a "Pay with card"
+button nested inside, which is invalid ARIA — the outer control's accessible name swallows the inner
+button's text, and a screen reader cannot tell the two targets apart. The test caught it as six
+matches for three buttons.
+
+Admin gains activate-monthly/annual/lifetime, extend trial, reset trial, revoke, and the trial sweep.
+Activation runs each row through `activate_account` rather than `queryset.update()` — the old bulk
+update set the status column and left `expires_at` null, producing an account that reads active and
+computes as not live. Revoke clears both clocks, since a leftover date would keep serving a
+chargeback. `ProcessedWebhookEvent` is registered read-only: deleting a row lets the next retry
+re-activate an account.
+
+Frontend also gains a persistent trial banner (quiet until the last three days — a fortnight-long
+banner that shouts from day one is one users stop seeing) and a `/settings` page showing subscription
+state from the server's computed fields rather than re-deriving them against the device clock.
+
+**Not done, needs a human:** every Paddle credential in `.env` is a placeholder, and the three prices
+do not exist in the catalog. They could not be created from the session — the Paddle MCP connection
+is read-only and `client.products.create` fails without `product.write`. With placeholders the
+provider reports card checkout unavailable and the app falls back to keys and Whish/cash, which is
+the designed degradation. No end-to-end sandbox checkout has therefore been exercised.
+
+Verified: `manage.py test` 226 passed; `npm test` 91 passed; lint and build clean.
+## 2026-08-10 — The playground app is deleted
+
+Closing the last item the OWASP audit left open. `playground/` held `say_hello`, which read
+`Order.objects` with no account filter and no authentication — every account's orders, to anyone.
+It was never routed, so it was never exploitable, but it sat one innocuous line of `urls.py` away
+from being a cross-tenant leak. Deleted rather than left tripwired.
+
+**Removal was pure subtraction.** The app defined no models, held no migrations beyond the empty
+`__init__.py`, and owned no tables — checked against the live dev database (`django_migrations` had
+no `playground` rows and `information_schema` no `playground%` tables) before anything was removed,
+because "it's only a scratch app" is exactly the assumption that loses data when it turns out to be
+wrong.
+
+**The tripwire test was replaced, not dropped.** `test_a05_the_playground_scratch_view_is_not_routed`
+had nothing left to guard, but the lesson generalises:
+`test_a05_every_routed_inventory_view_requires_authentication` now walks `inventory/urls.py` and
+fails if any routed view does not demand an authenticated caller. A plain Django view — which has no
+`permission_classes` at all — routed under `/inventory/` would be the same bug wearing a new name.
+
+`HISTORY.md` and the audit specs keep their original wording; the finding is annotated as resolved
+rather than rewritten, since they record what was true when they were written.
+
+Verified: `manage.py test` 387 passed; `npm test` 178 passed; build clean; `check` and
+`check --deploy` both report 0 issues; `makemigrations --check` reports no drift; `seed_data` runs
+end to end.
+
+---
+
+## 2026-08-10 — OWASP Top 10 audit, CSP, and the security audit trail
+
+Full report: `docs/superpowers/specs/2026-08-10-owasp-top-10-audit.md`. Ten categories, each
+asserted by behaviour rather than by the presence of a setting, plus semgrep's `p/owasp-top-ten`
+and seven supporting rulesets (281 rules, 187 files).
+
+**The automated scans found nothing new, and that is the result worth recording.** Both real gaps
+this pass — no CSP, no audit trail — are *missing controls*, and the worst bug of the previous pass
+was broken authorization. Scanners find sinks. They do not find absent defences or authorization
+mistakes, which look exactly like ordinary code.
+
+**F-06 closed, as authorised.** The app now refuses to boot when `DEBUG` is off and `SECRET_KEY` is
+still the committed default. This mattered more than a stale-config warning: `SIMPLE_JWT` has no
+separate `SIGNING_KEY`, so that key signs every token — a deploy missing the variable let anyone who
+can read this repository mint a token for any user. `manage.py check --deploy` is now clean.
+
+**CSP added, hand-rolled rather than `django-csp`** — a dependency means `pipenv install`, which
+relocks, and a relock has silently bumped Django and DRF here before. Two things were verified
+before shipping a policy that could break the app: the Django 6 admin emits **zero** inline
+`<script>` blocks and zero inline handlers, so `script-src 'self'` does not lock the owner out of
+the admin; and the built `index.html` pulls Google Fonts from two hosts that both had to be listed
+or the app renders in a fallback face. `'unsafe-inline'` stays in `style-src` because framer-motion
+writes inline styles every frame and nonces cannot cover style *attributes* — stated rather than
+quietly tolerated. `CSP_REPORT_ONLY=1` rolls a future policy change out without blocking.
+
+CSP earns its place here specifically because **JWTs live in `localStorage`**, so an XSS is a full
+account takeover. That is now recorded as an accepted risk with `HttpOnly` cookies named as the
+structural fix — CSP is mitigation, not a solution, and the report says so.
+
+**There was no security audit trail at all.** No `LOGGING` config, and no record of who deleted
+what — and deletions here are irreversible, so "rows are missing from my customer list" had no
+answer. `accounts/audit.py` now logs deletions, password changes, email verifications and
+key-granted subscriptions, alongside `django.security` and `axes`, to stdout.
+
+The deletion hook lives in `AccountScopedMixin.perform_destroy`, so one override covers every
+scoped collection and a new viewset is audited by inheriting the mixin it already needs in order to
+be scoped. The pk is captured *before* the delete and logged *after* it: Django's collector nulls
+`instance.pk` on the way out, and logging beforehand would record deletions that never happened,
+since a PROTECT foreign key raises and becomes a 409. Both directions are tested.
+
+**Uploads were tested adversarially and held.** PHP source with an `image/jpeg` content type, an
+SVG carrying `<script>`, a 2 MB+ file, and a `../../../../etc/` filename: rejected, rejected,
+rejected, and stored safely inside the account's own directory. The declared content type is never
+believed — Pillow has to be able to open the file.
+
+**Swept clean:** no raw SQL, no `subprocess`/`eval`, no unsafe deserialization, no
+`dangerouslySetInnerHTML`, and **no outbound HTTP client anywhere** — SSRF needs a fetcher and there
+is none. A test now scans for one, so adding it becomes a deliberate act.
+
+**One latent risk recorded rather than fixed:** `playground.views.say_hello` reads `Order.objects`
+with no account filter and no authentication. It is unreachable — `playground.urls` is never
+`include()`d — and a test is now the tripwire, because that view is one innocuous line of `urls.py`
+away from being a cross-tenant leak. Deleting the scratch app is the better fix and is the owner's
+call.
+
+Also documented as accepted: access tokens outlive a password change by up to their remaining day
+(revoking them needs a per-request revocation check), and there is no per-user role model inside an
+account.
+
+Verified: `manage.py test` 387 passed; `npm test` 178 passed; lint and build clean;
+`check --deploy` reports 0 issues; `pip-audit` and `npm audit` both 0.
+
+---
+
+## 2026-08-10 — Phase 8: security audit and hardening
+
+Scanned with `pip-audit`, `bandit`, `npm audit`, `semgrep` (5 rulesets, 256 rules) and
+`manage.py check --deploy`. Findings report:
+`docs/superpowers/specs/2026-08-09-phase-8-security-audit-findings.md`, committed as a baseline
+*before* any fix, so it records what the scanners said rather than describing an already-clean tree.
+
+**The worst finding came from a test, not a scanner.** The nested product-image route was
+unscoped: `ProductImageViewSet.get_queryset()` replaced `AccountScopedMixin`'s instead of chaining
+through it, so the only filter was the product id taken from the URL. Product ids are sequential, so
+any subscriber could walk `/inventory/products/<n>/images/` and list, attach to, retrieve or delete
+**any other account's** product images. The declared `account_lookup = 'product__account'` made the
+viewset look scoped while doing nothing. semgrep, bandit and pip-audit were all silent — an
+authorization bug reads as ordinary ORM code. The Task 8.2 matrix caught it on its first run.
+
+That is the argument for the matrix over per-feature isolation tests: coverage previously tracked
+whoever remembered to write it. The matrix drives every case from a resource list, so an endpoint
+added without scoping fails rather than ships. It asserts 404 and never 403 throughout — a 403 on
+someone else's row confirms the row exists, which is an existence oracle across the tenant boundary.
+
+**CSV formula injection reached 4 of the 5 exports.** `_csv_safe` had existed since the export
+redesign but was applied only to the products export, because it lived in `views.py` where
+`admin.py` could not reach it while the shared `csv_format.py` held only `money()` and `iso()` — the
+exact "a formula fix usually needs both" trap the Working Log warns about. It is now `text()` in
+`csv_format.py`, applied everywhere. The admin half matters most: those rows span every account and
+the file is opened by the platform superadmin, so a subscriber naming a customer `=HYPERLINK(…)` was
+attacking them, not themselves.
+
+The escape is deliberately **not** applied to `money()` output. `-` leads a formula and also leads a
+negative line profit, so escaping money cells would emit `'-6.00`, turn the numeric columns back into
+text and silently undo the redesign that made them summable. A test pins that.
+
+`CORS_ALLOW_ALL_ORIGINS` now follows `DEBUG`, with the allowlist read from the environment so adding
+a domain is config rather than a deploy. Verified in a subprocess: the test runner forces
+`DEBUG = False` *after* `ims.settings` is imported, so an in-process assertion proves nothing about
+production. The three CSV exports share one `exports` throttle scope at 30/hour per user — they walk
+every line item an account has recorded, and a per-view budget would just be three times the ceiling
+for the same work. Patching `ScopedRateThrottle.THROTTLE_RATES` in place is what makes that testable;
+`override_settings(REST_FRAMEWORK=…)` never reaches it, because DRF copies the rates into a class
+attribute at import.
+
+**Accepted without change, with reasons:** bandit's 93 findings are all LOW and all noise — test
+fixtures plus false positives on strings like `'password_reset'` and `'10/hour'`, and `random` used
+only by `seed_data`. That last one was verified rather than assumed: `random` appears nowhere outside
+the seeder, and both real generators (`verification.py`, `billing/keys.py`) use `secrets`.
+`pip-audit`'s only hits are three CVEs in `mcp`, which is pinned by **semgrep itself** and is not a
+project dependency — re-running against the declared dependencies alone reports nothing.
+
+**Two corrections to previously recorded beliefs.** `npm audit` is now completely clean: the
+`react-router-dom` advisories the Working Log described as open were resolved upstream, and the entry
+has been removed rather than carried forward. And installing the tooling did *not* relock the
+project — `Pipfile.lock` is untouched and Django is still 6.0.8 with DRF 3.17.2.
+
+**Deliberately left open — needs an owner decision.** `SECRET_KEY` and `DEBUG` both default to their
+*unsafe* values, so a deploy missing `DJANGO_SECRET_KEY` runs on the key committed to this repo, and
+`SIMPLE_JWT` has no separate `SIGNING_KEY`, so that key signs every token. The obvious hardening is to
+refuse to boot when `DEBUG` is off and the key is still the default — but if the live deployment is
+currently running on that default, shipping the guard takes production down on the next release.
+Confirm whether `DJANGO_SECRET_KEY` is set on Heroku first. Everything else in `check --deploy`
+already passes: HSTS, SSL redirect, secure and HTTP-only cookies, `X_FRAME_OPTIONS`.
+
+Verified: `manage.py test` 350 passed; `npm test` 178 passed; lint and build clean.
+
+---
+
 ## 2026-08-10 — Account menu and OTP password reset
 
 An account menu replaces the bare Sign out button, and `/settings` carries a three-screen password

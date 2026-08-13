@@ -9,6 +9,7 @@ import {
   Eye,
   FileText,
   Loader2,
+  Pencil,
   Plus,
   ShoppingCart,
 } from 'lucide-react'
@@ -40,6 +41,7 @@ export function Orders() {
   const [status, setStatus] = useState('loading')
   const [refreshKey, setRefreshKey] = useState(0)
   const [addOpen, setAddOpen] = useState(false)
+  const [editOrder, setEditOrder] = useState(null)
 
   const [productCache, setProductCache] = useState(new Map())
   const [invoiceLoadingId, setInvoiceLoadingId] = useState(null)
@@ -116,7 +118,8 @@ export function Orders() {
       }
 
       // OrderSerializer.customer is a StringRelatedField (name only) — look up the phone
-      // number from the already-fetched customers list by name (Customer.name is unique).
+      // number and address from the already-fetched customers list by name (Customer.name is
+      // unique per account).
       const matchedCustomer = customers.find((c) => c.name === order.customer)
 
       setInvoiceOrder({
@@ -125,6 +128,7 @@ export function Orders() {
         exchange_rate: order.exchange_rate,
         customer: order.customer,
         customerPhone: matchedCustomer?.phone_number || null,
+        customerLocation: matchedCustomer?.location || null,
         items: order.items.map((item) => ({
           name: nextCache.get(item.product) ?? `Product #${item.product}`,
           quantity: item.quantity,
@@ -139,6 +143,10 @@ export function Orders() {
 
   function openDetail(order) {
     setDetailOrder(order)
+  }
+
+  function openEdit(order) {
+    setEditOrder(order)
   }
 
   const exportParams = {}
@@ -199,6 +207,7 @@ export function Orders() {
             onViewInvoice={openInvoice}
             invoiceLoadingId={invoiceLoadingId}
             onViewDetail={openDetail}
+            onEdit={openEdit}
           />
           <OrdersCards
             orders={orders}
@@ -206,6 +215,7 @@ export function Orders() {
             onViewInvoice={openInvoice}
             invoiceLoadingId={invoiceLoadingId}
             onViewDetail={openDetail}
+            onEdit={openEdit}
           />
 
           {status === 'ready' && result.count === 0 && (
@@ -244,6 +254,7 @@ export function Orders() {
           partyLabel="Customer"
           partyName={invoiceOrder.customer}
           partyPhone={invoiceOrder.customerPhone}
+          partyLocation={invoiceOrder.customerLocation}
           items={invoiceOrder.items}
         />
       )}
@@ -267,6 +278,17 @@ export function Orders() {
       <OrderForm
         open={addOpen}
         onClose={() => setAddOpen(false)}
+        onSaved={() => setRefreshKey((k) => k + 1)}
+        customers={customers}
+      />
+
+      {/* A second instance rather than one form with a mode flag: `open` drives the
+          SlideOver's mount/unmount animation, and toggling both the flag and the order on the
+          same instance would animate the "Add order" panel into an "Edit order" one. */}
+      <OrderForm
+        open={Boolean(editOrder)}
+        order={editOrder}
+        onClose={() => setEditOrder(null)}
         onSaved={() => setRefreshKey((k) => k + 1)}
         customers={customers}
       />
@@ -318,6 +340,19 @@ function InvoiceButton({ order, onViewInvoice, invoiceLoadingId }) {
   )
 }
 
+function EditButton({ onClick }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] font-medium text-text-secondary hover:bg-canvas-2 hover:text-text-primary"
+    >
+      <Pencil size={12} />
+      Edit
+    </button>
+  )
+}
+
 function ViewButton({ onClick }) {
   return (
     <button
@@ -331,7 +366,7 @@ function ViewButton({ onClick }) {
   )
 }
 
-function OrdersTable({ orders, sort, onSort, loading, onViewInvoice, invoiceLoadingId, onViewDetail }) {
+function OrdersTable({ orders, sort, onSort, loading, onViewInvoice, invoiceLoadingId, onViewDetail, onEdit }) {
   const { formatAmount } = useCurrency()
 
   return (
@@ -377,6 +412,7 @@ function OrdersTable({ orders, sort, onSort, loading, onViewInvoice, invoiceLoad
                       <td className="px-5 py-2.5 text-right">
                         <div className="flex items-center justify-end gap-1">
                           <ViewButton onClick={() => onViewDetail(order)} />
+                          <EditButton onClick={() => onEdit(order)} />
                           <InvoiceButton order={order} onViewInvoice={onViewInvoice} invoiceLoadingId={invoiceLoadingId} />
                         </div>
                       </td>
@@ -390,7 +426,7 @@ function OrdersTable({ orders, sort, onSort, loading, onViewInvoice, invoiceLoad
   )
 }
 
-function OrdersCards({ orders, loading, onViewInvoice, invoiceLoadingId, onViewDetail }) {
+function OrdersCards({ orders, loading, onViewInvoice, invoiceLoadingId, onViewDetail, onEdit }) {
   const { formatAmount } = useCurrency()
 
   if (loading) {
@@ -424,6 +460,7 @@ function OrdersCards({ orders, loading, onViewInvoice, invoiceLoadingId, onViewD
               </span>
               <div className="flex items-center gap-1">
                 <ViewButton onClick={() => onViewDetail(order)} />
+                <EditButton onClick={() => onEdit(order)} />
                 <InvoiceButton order={order} onViewInvoice={onViewInvoice} invoiceLoadingId={invoiceLoadingId} />
               </div>
             </div>

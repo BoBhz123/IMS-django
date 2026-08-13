@@ -3,6 +3,7 @@ from datetime import timedelta
 
 import dj_database_url
 import sentry_sdk
+from django.core.exceptions import ImproperlyConfigured
 from sentry_sdk.integrations.django import DjangoIntegration
 
 # Initialized as early as possible (before most other settings/imports run), per Sentry's
@@ -59,10 +60,56 @@ SECRET_KEY = os.environ.get(
 # not just the literal string 'False', since env vars are always strings.
 DEBUG = os.environ.get('DJANGO_DEBUG', 'True').strip().lower() not in ('false', '0', 'no')
 
-# Comma-separated list via ALLOWED_HOSTS env var (e.g. "client.myimsapp.com,testlab.myimsapp.com").
-# Falls back to '*' (unchanged local-dev/current-prod behavior) when unset. '.myimsapp.com' as a
-# leading-dot entry matches that domain and all its subdomains, per Django's ALLOWED_HOSTS docs.
-ALLOWED_HOSTS = [h.strip() for h in os.environ.get('ALLOWED_HOSTS', '*').split(',') if h.strip()]
+# Fail loudly rather than open. Without this, a deploy that forgets DJANGO_SECRET_KEY runs on
+# the key committed above — and since SIMPLE_JWT has no separate SIGNING_KEY, that key signs
+# every JWT, so anyone reading this repository could mint a token for any user. A silent
+# insecure boot is worse than a refused one: nothing surfaces until the forged tokens do.
+# Scoped to `not DEBUG` so local development is untouched.
+if not DEBUG and SECRET_KEY.startswith('django-insecure-'):
+    raise ImproperlyConfigured(
+        'DJANGO_SECRET_KEY is unset, so SECRET_KEY is still the insecure default committed '
+        'in ims/settings.py. It signs every JWT. Set DJANGO_SECRET_KEY to a long random '
+        'value, or set DJANGO_DEBUG=True if this is local development.'
+    )
+
+# The canonical domain, 2026-08-13. Everything below that needs to name the site reads from
+# here, so a future move is one edit rather than a hunt through settings.
+SITE_DOMAIN = os.environ.get('SITE_DOMAIN', 'myimsapp.com').strip()
+SITE_URL = f'https://{SITE_DOMAIN}'
+
+# Comma-separated list via the ALLOWED_HOSTS env var (e.g. "myimsapp.com,.myimsapp.com").
+#
+# The fallback used to be '*', which accepts any Host header and gives up Django's
+# HTTP Host header protection entirely — it was a placeholder from before this app had a
+# domain. It is now the real domain, so a deploy that forgets the env var fails closed on an
+# unexpected host instead of open.
+#
+# '.myimsapp.com' is a leading-dot entry: per Django's ALLOWED_HOSTS docs it matches the
+# domain *and* every subdomain, so it alone would cover 'myimsapp.com'. Both are listed
+# because the bare domain is the one people look for when reading this file.
+#
+# NOTE: this list deliberately does not include the *.herokuapp.com dyno hostname. Requests
+# arriving on it 400 unless ALLOWED_HOSTS names it — which is correct for a domain that has
+# cut over, and a live-site outage for one that has not. Keep it in the Heroku config var
+# until DNS for myimsapp.com actually resolves to the app.
+ALLOWED_HOSTS = [
+    h.strip() for h in os.environ.get(
+        'ALLOWED_HOSTS', f'{SITE_DOMAIN},.{SITE_DOMAIN},localhost,127.0.0.1',
+    ).split(',') if h.strip()
+]
+
+# Required for any cookie-authenticated POST from the browser — the Django admin's login and
+# every one of its change forms. Django rejects those with a 403 "Origin checking failed"
+# unless the Origin header matches an entry here, and behind Heroku's TLS termination the
+# scheme has to be spelled out. Absent entirely until now, which worked only because the
+# admin was reached over the *.herokuapp.com domain Django was already trusting implicitly
+# through ALLOWED_HOSTS; the moment a custom domain fronts it, the admin stops accepting
+# logins. The wildcard form is what CsrfViewMiddleware expects for subdomains.
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip() for origin in os.environ.get(
+        'CSRF_TRUSTED_ORIGINS', f'{SITE_URL},https://*.{SITE_DOMAIN}',
+    ).split(',') if origin.strip()
+]
 
 # Heroku terminates TLS at its edge and forwards plain HTTP to the dyno — without this,
 # SECURE_SSL_REDIRECT (further down, active when DEBUG=False) sees every request as
@@ -78,7 +125,10 @@ SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 # docs/superpowers/specs/2026-08-07-saas-single-db-migration-design.md for why the
 # schema-per-tenant setup was removed.
 INSTALLED_APPS = [
-    'django.contrib.admin',
+    # Not 'django.contrib.admin' — this config subclasses it only to point `default_site` at
+    # ims.admin_site.SuperuserOnlyAdminSite, which restricts /admin/ to is_superuser rather
+    # than Django's default is_staff. Everything else about the admin app is unchanged.
+    'ims.apps.IMSAdminConfig',
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
@@ -95,8 +145,6 @@ INSTALLED_APPS = [
     #local apps
     'accounts',
     'inventory',
-    #dev apps
-    'playground',
 ]
 
 # Debug toolbar is a development profiler — it should never be loaded in production, where
@@ -114,6 +162,10 @@ AUTHENTICATION_BACKENDS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    # CSP and Referrer-Policy — Django's SecurityMiddleware has no CSP setting at all.
+    # Verified against the Django 6 admin, which emits no inline <script> blocks and no
+    # inline event handlers, so script-src 'self' does not break it.
+    'ims.security_headers.SecurityHeadersMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -169,13 +221,31 @@ _database_url_config = dj_database_url.config()
 if _database_url_config:
     DATABASES['default'] = _database_url_config
 
-CORS_ALLOW_ALL_ORIGINS = True
+# Tied to DEBUG rather than left on. A wildcard lets any site on the internet make
+# credentialed cross-origin calls with a victim's browser; it was a dev convenience carried
+# from before this app had accounts, and it is a real exposure the moment auth moves to
+# cookies or a same-site scheme. Local dev is unchanged because DEBUG is True there.
+CORS_ALLOW_ALL_ORIGINS = DEBUG
 
-# Explicit allowlist, kept alongside the wildcard above for when CORS_ALLOW_ALL_ORIGINS
-# is eventually turned off (that flag takes precedence over this list while it's True).
-# Covers the Vite dev server both un-tenanted and via the tenant1 subdomain used for
-# local multi-tenant testing.
+# The production contract. Read from the environment so adding a domain is a config change
+# rather than a code deploy; the literals are the fallback.
+#
+# The deployed SPA and the API are same-origin — WhiteNoise serves the built bundle from the
+# same Heroku app — so nothing in normal operation is actually a cross-origin request and
+# this list is belt-and-braces. It names the site anyway so that a browser reaching the API
+# from the canonical domain is never the thing that breaks, and so a future split (a separate
+# static host, a mobile web wrapper) is a config change.
+#
+# The localhost entries are the Vite dev server, kept in the fallback because CORS_ALLOW_ALL_
+# ORIGINS follows DEBUG and a developer running with DEBUG=False locally would otherwise be
+# blocked by their own backend.
 CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',')
+    if origin.strip()
+] or [
+    SITE_URL,
+    f'https://www.{SITE_DOMAIN}',
     'http://localhost:5173',
     'http://tenant1.localhost:5173',
 ]
@@ -250,6 +320,16 @@ REST_FRAMEWORK = {
         # check and the confirm endpoint together, since both take the same code.
         'password_reset_request': '10/hour',
         'password_reset_verify': '30/hour',
+        # Counted per client address rather than per user — see AbandonRegistrationThrottle.
+        # Abandoning frees the email address, so the sign-up/abandon loop is a way to mail one
+        # victim repeatedly, and each pass gets a fresh per-user budget. A human fixing a typo
+        # needs one or two.
+        'abandon_registration': '10/hour',
+        # The CSV exports walk every line item an account has ever recorded — the most
+        # expensive request an authenticated caller can make, and the cheapest to repeat in
+        # a loop. 30/hour is far above any real use (the SPA exports on a button press) and
+        # far below what it takes to tie up the database.
+        'exports': '30/hour',
     },
 }
 
@@ -258,6 +338,10 @@ DJOSER = {
     'SERIALIZERS': {
         'user_create': 'accounts.serializers.UserCreateWithAccountSerializer',
         'user_create_password_retype': 'accounts.serializers.UserCreateWithAccountSerializer',
+        # Both keys: djoser picks 'current_user' for /users/me/ and 'user' for the rest, and
+        # setting only one leaves the other returning a payload without the subscription.
+        'user': 'accounts.serializers.UserWithSubscriptionSerializer',
+        'current_user': 'accounts.serializers.UserWithSubscriptionSerializer',
     },
 }
 
@@ -291,6 +375,66 @@ AXES_LOCKOUT_PARAMETERS = ['username', 'ip_address']
 # exactly one proxy hop and reading X-Forwarded-For recovers the real client IP.
 AXES_IPWARE_PROXY_COUNT = 1
 AXES_IPWARE_META_PRECEDENCE_ORDER = ('HTTP_X_FORWARDED_FOR', 'REMOTE_ADDR')
+
+# Roll a policy change out in report-only mode first when touching ims/security_headers.py
+# against a live deployment: the browser reports violations without blocking anything.
+CSP_REPORT_ONLY = os.environ.get('CSP_REPORT_ONLY', '').strip().lower() in ('1', 'true', 'yes')
+# Extra image hosts, comma-separated, for a deployment serving media from somewhere the
+# AWS_S3_CUSTOM_DOMAIN setting does not already cover.
+CSP_EXTRA_IMG_SRC = [
+    origin.strip()
+    for origin in os.environ.get('CSP_EXTRA_IMG_SRC', '').split(',')
+    if origin.strip()
+]
+# The browser Sentry SDK uses VITE_SENTRY_DSN, whose ingest host can differ from the Django
+# one; without listing it here, connect-src blocks frontend error reporting silently.
+CSP_EXTRA_CONNECT_SRC = [
+    origin.strip()
+    for origin in os.environ.get('CSP_EXTRA_CONNECT_SRC', '').split(',')
+    if origin.strip()
+]
+
+# Security audit trail. To stdout, which Heroku captures and Sentry's logging integration
+# forwards from WARNING up — no log-shipping dependency and no table to prune. This is an
+# audit *trail*, not tamper-evident audit *storage*: anyone with dyno access can write to
+# stdout. Right level for a single-operator business tool, wrong level for a compliance
+# obligation, and stated plainly so nobody assumes otherwise.
+#
+# django.security.* is Django's own channel for suspicious operations (bad Host headers,
+# tampered signatures). axes logs every failed and locked-out login. ims.security is ours.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'security': {
+            'format': '[{asctime}] {levelname} {name} {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'security_console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'security',
+        },
+    },
+    'loggers': {
+        'ims.security': {
+            'handlers': ['security_console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'django.security': {
+            'handlers': ['security_console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'axes': {
+            'handlers': ['security_console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+    },
+}
 
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = 'DENY'
@@ -351,23 +495,94 @@ if AWS_STORAGE_BUCKET_NAME:
 # Resend over plain SMTP (smtp.resend.com:587, user 'resend', password = the API key), so
 # Django's own backend is reused and no SDK dependency is added. Left unset, these fall back
 # to the local smtp4dev container.
+def _env_flag(name, default='False'):
+    """
+    Parse a boolean environment variable the way DEBUG above is parsed.
+
+    `os.environ.get(name) == 'True'` is the tempting one-liner and it silently reads
+    EMAIL_USE_TLS=true (or TRUE, or 1) as False. For TLS that is not a cosmetic bug: the
+    connection is attempted in the clear, Resend rejects it on port 587, and every
+    verification code fails to send with nothing in the UI to say so.
+    """
+    return os.environ.get(name, default).strip().lower() in ('true', '1', 'yes', 'on')
+
+
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = os.environ.get('EMAIL_HOST', 'localhost')
 EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '25'))  # 25 matches smtp4dev's port mapping
 EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
-EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'False') == 'True'
-EMAIL_USE_SSL = os.environ.get('EMAIL_USE_SSL', 'False') == 'True'
-DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'ims-system@local.test')
+EMAIL_USE_TLS = _env_flag('EMAIL_USE_TLS')
+EMAIL_USE_SSL = _env_flag('EMAIL_USE_SSL')
+# Django raises if both are set, and the message points at the backend rather than at the
+# environment that actually caused it. Fail here, where the fix is obvious.
+if EMAIL_USE_TLS and EMAIL_USE_SSL:
+    raise ImproperlyConfigured(
+        'EMAIL_USE_TLS and EMAIL_USE_SSL are mutually exclusive. Use TLS on port 587 '
+        '(STARTTLS) or SSL on port 465, not both.'
+    )
+# The send happens inline on the request thread — there is no worker queue. Without a timeout
+# a wedged SMTP server holds the signup request open until the dyno's own timeout kills it,
+# and the user sees a hung page rather than "we could not send a code".
+EMAIL_TIMEOUT = int(os.environ.get('EMAIL_TIMEOUT', '10'))
+# The address mail is sent from, and the name shown beside it. A bare address renders in the
+# inbox as "support.imsapp" or the raw string depending on the client, which reads as
+# machine-generated; a display name is the cheapest credibility signal there is.
+#
+# Composed rather than hardcoded so DEFAULT_FROM_EMAIL can be given either form in .env: set
+# it bare and EMAIL_FROM_NAME wraps it, or set the whole "Name <addr>" string and it is left
+# alone. Double-wrapping produces a header Brevo rejects outright.
+_from_email = os.environ.get('DEFAULT_FROM_EMAIL', 'ims-system@local.test')
+EMAIL_FROM_NAME = os.environ.get('EMAIL_FROM_NAME', 'IMS Support')
+if EMAIL_FROM_NAME and '<' not in _from_email:
+    DEFAULT_FROM_EMAIL = f'{EMAIL_FROM_NAME} <{_from_email}>'
+else:
+    DEFAULT_FROM_EMAIL = _from_email
+# The bare address, for anything that needs it without the display name (SPF checks, logs).
+DEFAULT_FROM_ADDRESS = _from_email
 
 # --- Billing -------------------------------------------------------------------------
 # 'dummy' refuses card checkout and leaves discount keys as the only activation route.
-# 'paddle' is reserved for Phase 2.5b-2 and currently raises ImproperlyConfigured rather
-# than half-working.
+# 'paddle' requires the PADDLE_* settings below and is what production runs.
 BILLING_PROVIDER = os.environ.get('BILLING_PROVIDER', 'dummy')
 
 # Display only — what the plan cards show. The server never accepts an amount from the
-# client; when Paddle lands, the charged amount comes from a configured price id, and these
-# exist purely so the SPA has something to render.
+# client: the charged amount comes from the configured Paddle price id, and these exist
+# purely so the SPA has something to render. **USD, always.** See CLAUDE.md — no card
+# charge in this app is ever denominated in anything else.
 BILLING_PRICE_MONTHLY_USD = os.environ.get('BILLING_PRICE_MONTHLY_USD', '15')
+BILLING_PRICE_ANNUAL_USD = os.environ.get('BILLING_PRICE_ANNUAL_USD', '150')
 BILLING_PRICE_ONE_TIME_USD = os.environ.get('BILLING_PRICE_ONE_TIME_USD', '299')
+
+# --- Paddle ---------------------------------------------------------------------------
+# 'sandbox' or 'production'. Chooses both the API host and the environment Paddle.js is
+# initialised with; the two must agree or checkout opens against the wrong catalogue.
+PADDLE_ENVIRONMENT = os.environ.get('PADDLE_ENVIRONMENT', 'sandbox')
+PADDLE_API_KEY = os.environ.get('PADDLE_API_KEY', '')
+# The client-side token, safe to ship to the browser. Distinct from the API key, which is
+# a server secret and must never reach the SPA.
+PADDLE_CLIENT_TOKEN = os.environ.get('PADDLE_CLIENT_TOKEN', '')
+# Signs incoming notifications. Without it the webhook rejects everything rather than
+# trusting unverified bodies — an unauthenticated endpoint that grants subscriptions is the
+# worst possible thing to leave open.
+PADDLE_WEBHOOK_SECRET = os.environ.get('PADDLE_WEBHOOK_SECRET', '')
+
+# Plan key -> Paddle price id. One tier, three billing choices, all granting identical
+# access; nothing in the app branches on which of these the customer bought.
+PADDLE_PRICE_MONTHLY = os.environ.get('PADDLE_PRICE_MONTHLY', '')
+PADDLE_PRICE_ANNUAL = os.environ.get('PADDLE_PRICE_ANNUAL', '')
+PADDLE_PRICE_LIFETIME = os.environ.get('PADDLE_PRICE_LIFETIME', '')
+
+# --- Payment record encryption ----------------------------------------------------------
+# Fernet key for accounts.models.UserPaymentRecord. Generate with:
+#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Required when DEBUG is off; local dev derives one from SECRET_KEY (see accounts/crypto.py
+# for why that fallback is not allowed in production). Rotating this makes every existing
+# record unreadable — there is no re-encryption path, so treat it as write-once.
+PAYMENT_ENCRYPTION_KEY = os.environ.get('PAYMENT_ENCRYPTION_KEY', '')
+
+# --- Local (cash / Whish) payment contact ----------------------------------------------
+# Whish and cash settle over chat, not a gateway. These drive the deep links on the
+# subscription screen; blank simply hides the corresponding button.
+WHATSAPP_NUMBER = os.environ.get('WHATSAPP_NUMBER', '')
+TELEGRAM_USERNAME = os.environ.get('TELEGRAM_USERNAME', '')

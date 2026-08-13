@@ -26,6 +26,20 @@ class ProviderUnavailable(Exception):
 class BillingProvider(ABC):
     name = 'base'
 
+    def is_configured(self):
+        """
+        Whether card checkout can actually be opened right now.
+
+        Asked by the plan screen so it can hide a pay button rather than offer one that
+        always fails. Deliberately not `name != 'dummy'`: a real provider with half its
+        credentials filled in is just as unable to take a payment as no provider at all.
+        """
+        return False
+
+    def price_id_for(self, plan_key):
+        """The gateway price id backing a plan, or '' if this provider has none."""
+        return ''
+
     @abstractmethod
     def create_checkout(self, account, plan_key):
         """

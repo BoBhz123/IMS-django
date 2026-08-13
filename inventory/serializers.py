@@ -83,13 +83,61 @@ def _units_by_product_id(items_data):
     return totals
 
 
-def _insufficient_stock_errors(units_by_id, products):
+def _insufficient_stock_errors(units_by_id, products, credited_units=None):
+    """
+    The lines that ask for more units than exist, as human-readable errors.
+
+    `credited_units` is what the *current* version of this transaction has already taken out
+    of stock and is about to give back — non-empty only when editing. Without it an edit that
+    leaves a line untouched fails against itself: an order that sold the last 5 of a product
+    sees stock_quantity 0, so re-submitting the same 5 reads as a 5-unit overdraw. The units
+    being replaced have to be credited back before the ceiling is applied, not after.
+    """
+    credited_units = credited_units or {}
     return [
-        f"Insufficient stock for '{product.name}': "
-        f"requested {units_by_id[product.id]}, available {product.stock_quantity}."
+        f"Insufficient stock for '{product.name}': requested {units_by_id[product.id]}, "
+        f"available {product.stock_quantity + credited_units.get(product.id, 0)}."
         for product in products
-        if units_by_id[product.id] > product.stock_quantity
+        if units_by_id[product.id] > product.stock_quantity + credited_units.get(product.id, 0)
     ]
+
+
+def _units_by_product_id_of(items):
+    """`_units_by_product_id` for saved rows, which hold `product_id` rather than a Product."""
+    totals = defaultdict(int)
+    for item in items:
+        totals[item.product_id] += item.quantity * item.unit_multiplier
+    return totals
+
+
+def _apply_stock_deltas(deltas):
+    """
+    One UPDATE per affected product, computed in the database.
+
+    F() rather than read-modify-write for the same reason the create paths use it: the value
+    being adjusted may have moved since this transaction read it, and a Python-side subtraction
+    would write a stale absolute number over whatever landed in between.
+    """
+    for product_id, delta in deltas.items():
+        if delta:
+            Product.objects.filter(id=product_id).update(
+                stock_quantity=F('stock_quantity') + delta
+            )
+
+
+def _stock_deltas(added, removed):
+    """
+    Signed stock movement per product: `added` minus `removed`, over the union of both.
+
+    Neutral names because the two callers pass them the other way round — a purchase adds
+    the new lines and takes back the old ones, an order does the reverse — and the union is
+    the load-bearing part either way: a product dropped from a transaction appears on only
+    one side and still has to move.
+    """
+    return {
+        product_id: added.get(product_id, 0) - removed.get(product_id, 0)
+        for product_id in set(added) | set(removed)
+    }
 
 class ProductImageSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
@@ -197,6 +245,15 @@ class PurchaseSerializer(serializers.ModelSerializer):
         fields = ['id','placed_at','supplier','exchange_rate','items','total_price']
         
 class CreatePurchaseSerializer(AccountScopedSerializerMixin, serializers.ModelSerializer):
+    """
+    The write serializer for purchases — POST, PUT and PATCH alike.
+
+    Still named Create* for continuity with CreateOrderSerializer and the read/write split
+    documented in CLAUDE.md; `update()` below is what makes a purchase editable after the
+    fact. Editing replaces the line items wholesale rather than diffing them, because a line
+    has no client-visible identity to diff against — see update().
+    """
+
     account_scoped_fields = {'supplier': Supplier}
 
     id = serializers.UUIDField(read_only = True)
@@ -222,12 +279,64 @@ class CreatePurchaseSerializer(AccountScopedSerializerMixin, serializers.ModelSe
 
         # Purchases have no ceiling to validate against, but they have the same
         # stale-instance problem as orders when one product appears on two lines.
-        for product_id, units in units_by_id.items():
-            Product.objects.filter(id=product_id).update(
-                stock_quantity=F('stock_quantity') + units
-            )
+        _apply_stock_deltas(units_by_id)
         return purchase
-    
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        """
+        Edit a purchase, reversing its stock effect and re-applying the new one atomically.
+
+        `items` absent (a PATCH that only moves the supplier or the exchange rate) leaves the
+        lines and the stock alone. `items` present replaces every line, because a client
+        holding a purchase has no per-line id to diff against — PurchaseItemSerializer does
+        not expose one, so "the second line" is a position, and positions do not survive a
+        reorder. Replace-and-recompute is the only semantics that cannot silently mis-target.
+        """
+        items_data = validated_data.pop('items', None)
+
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+
+        if items_data is not None:
+            self._replace_items(instance, items_data)
+        return instance
+
+    def _replace_items(self, purchase, items_data):
+        old_items = list(purchase.items.all())
+        old_units = _units_by_product_id_of(old_items)
+        new_units = _units_by_product_id(items_data)
+        deltas = _stock_deltas(new_units, old_units)  # purchases add stock, so the sign flips
+
+        # Lock every product on either side before deciding anything: a concurrent sale of a
+        # product whose received quantity is being reduced must not slip between the check
+        # and the update. The union matters — a product dropped from the purchase entirely is
+        # absent from new_units but still has stock to take back.
+        locked = {
+            product.id: product
+            for product in Product.objects.select_for_update().filter(id__in=deltas)
+        }
+
+        # Reducing a received quantity claws stock back, and that stock may already have been
+        # sold. Refusing is the only honest answer: silently clamping at zero would leave the
+        # books saying goods were never received while the sale that consumed them stands.
+        errors = [
+            f"Cannot reduce '{locked[product_id].name}' to {new_units.get(product_id, 0)} "
+            f"units: only {locked[product_id].stock_quantity} in stock, and this purchase "
+            f"supplied {old_units.get(product_id, 0)}."
+            for product_id, delta in deltas.items()
+            if locked[product_id].stock_quantity + delta < 0
+        ]
+        if errors:
+            raise serializers.ValidationError({'items': errors})
+
+        purchase.items.all().delete()
+        PurchaseItem.objects.bulk_create(
+            [PurchaseItem(purchase_order=purchase, **item_data) for item_data in items_data]
+        )
+        _apply_stock_deltas(deltas)
+
 class SupplierSerializer(serializers.ModelSerializer):
    class Meta():
         model = Supplier
@@ -254,6 +363,12 @@ class OrderItemSerializer(serializers.ModelSerializer):
         
         
 class CreateOrderSerializer(AccountScopedSerializerMixin, serializers.ModelSerializer):
+    """
+    The write serializer for orders — POST, PUT and PATCH alike. See
+    CreatePurchaseSerializer for why it keeps the Create* name and why editing replaces
+    the line items rather than diffing them.
+    """
+
     account_scoped_fields = {'customer': Customer}
 
     items = CreateOrderItemSerializer(many = True)
@@ -270,6 +385,14 @@ class CreateOrderSerializer(AccountScopedSerializerMixin, serializers.ModelSeria
     def validate_items(self, items):
         if not items:
             raise serializers.ValidationError("An order must contain at least one item.")
+
+        # On an edit the ceiling cannot be judged from stock_quantity alone — this order's
+        # own units are already deducted from it, so re-submitting an unchanged line would
+        # read as an overdraw of exactly its own size. The authoritative check for both paths
+        # runs under the row lock in create()/update(); skipping it here only means an edit
+        # gets its stock error from there instead of from this cheaper pre-check.
+        if self.instance is not None:
+            return items
 
         units_by_id = _units_by_product_id(items)
         products = Product.objects.filter(id__in=units_by_id)
@@ -307,14 +430,72 @@ class CreateOrderSerializer(AccountScopedSerializerMixin, serializers.ModelSeria
         ])
 
         # One UPDATE per product, computed in the database, rather than a save() per line.
-        for product_id, units in units_by_id.items():
-            Product.objects.filter(id=product_id).update(
-                stock_quantity=F('stock_quantity') - units
-            )
+        _apply_stock_deltas({pid: -units for pid, units in units_by_id.items()})
         return order
-        
-        
-            
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        """
+        Edit an order: give back what it took from stock, then take what it now asks for.
+
+        `items` absent (a PATCH moving only the customer or the exchange rate) leaves lines
+        and stock untouched.
+        """
+        items_data = validated_data.pop('items', None)
+
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+
+        if items_data is not None:
+            self._replace_items(instance, items_data)
+        return instance
+
+    def _replace_items(self, order, items_data):
+        old_items = list(order.items.all())
+        old_units = _units_by_product_id_of(old_items)
+        new_units = _units_by_product_id(items_data)
+        deltas = _stock_deltas(old_units, new_units)  # orders consume stock
+
+        locked = {
+            product.id: product
+            for product in Product.objects.select_for_update().filter(id__in=deltas)
+        }
+
+        # The ceiling is stock plus what this order is giving back, which is what
+        # credited_units carries. Judged here rather than in validate_items because only
+        # here are the rows locked — two concurrent edits of two different orders can
+        # otherwise both clear the check and both deduct.
+        errors = _insufficient_stock_errors(
+            new_units,
+            [locked[product_id] for product_id in new_units],
+            credited_units=old_units,
+        )
+        if errors:
+            raise serializers.ValidationError({'items': errors})
+
+        # COGS must not be restated by an edit. A product that was already on this order
+        # keeps the cost captured when it was sold; product.cost_price is a *current* figure
+        # that gets corrected, so re-reading it for an unchanged line would quietly rewrite
+        # the profit of a past sale every time somebody fixes a supplier price. Only a
+        # genuinely new line has no snapshot to inherit, and takes today's cost.
+        cost_by_product_id = {item.product_id: item.unit_cost_price for item in old_items}
+
+        order.items.all().delete()
+        OrderItem.objects.bulk_create([
+            OrderItem(
+                order=order,
+                unit_cost_price=cost_by_product_id.get(
+                    item_data['product'].id, locked[item_data['product'].id].cost_price
+                ),
+                **item_data,
+            )
+            for item_data in items_data
+        ])
+        _apply_stock_deltas(deltas)
+
+
+
 class OrderSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True, read_only=True)
     id = serializers.UUIDField(read_only=True)

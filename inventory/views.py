@@ -1,4 +1,4 @@
-from django.shortcuts import render
+from django.shortcuts import get_object_or_404, render
 from django.db.models import Prefetch,F,Q,DateField,ProtectedError
 from django.db.models.aggregates import Sum,Count
 from rest_framework import status
@@ -11,10 +11,11 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
 from rest_framework.views import APIView
+from rest_framework.throttling import ScopedRateThrottle
 from .filters import ProductFilter,PurchaseFilter,OrderFilter,ExpenseFilter
 from .pagination import DefaultPagination
 from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order,Expense,LINE_TOTAL,LINE_COGS
-from .csv_format import iso as _iso, money as _money
+from .csv_format import iso as _iso, money as _money, text as _csv_safe
 from .reporting import DateWindow
 from .serializers import *
 import csv
@@ -27,6 +28,7 @@ class ProductImageViewSet(AccountScopedMixin, ModelViewSet):
     # ProductImage has no account column — it is owned through its product.
     account_lookup = 'product__account'
 
+    queryset = ProductImage.objects.all()
     serializer_class = ProductImageSerializer
     parser_classes = [MultiPartParser, FormParser]
 
@@ -34,10 +36,26 @@ class ProductImageViewSet(AccountScopedMixin, ModelViewSet):
         return {**super().get_serializer_context(), 'product_id': self.kwargs['product_pk']}
 
     def get_queryset(self):
-        return ProductImage.objects.filter(product_id=self.kwargs['product_pk'])
+        # Chained through super() deliberately. This used to be a bare
+        # `ProductImage.objects.filter(product_id=...)`, which silently discarded
+        # AccountScopedMixin's filter and left the nested route unscoped — `account_lookup`
+        # above was declared but never reached. Any authenticated subscriber could then list,
+        # replace or delete another account's product images by guessing a product id.
+        # Found by the Phase 8 isolation matrix.
+        return super().get_queryset().filter(product_id=self.kwargs['product_pk'])
+
+    def get_product_or_404(self):
+        # 404 rather than 403: a 403 would confirm the product exists while belonging to
+        # someone else, which is an existence oracle across the tenant boundary.
+        return get_object_or_404(
+            Product.objects.filter(account=self.account), pk=self.kwargs['product_pk'],
+        )
 
     def perform_create(self, serializer):
-        # Not AccountScopedMixin's save(account=...): there is no such field to stamp.
+        # Not AccountScopedMixin's save(account=...): there is no such field to stamp. The
+        # ownership check therefore has to happen explicitly — the queryset scoping above
+        # governs reads only, and the parent product id comes straight off the URL.
+        self.get_product_or_404()
         serializer.save()
 
 
@@ -123,7 +141,7 @@ class _TotalAnnotationMixin:
 
 
 class PurchaseViewSet(AccountScopedMixin, _TotalAnnotationMixin, ModelViewSet):
-    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+    http_method_names = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options']
     queryset = Purchase.objects.select_related('supplier').prefetch_related(
         Prefetch(
             'items',
@@ -137,7 +155,11 @@ class PurchaseViewSet(AccountScopedMixin, _TotalAnnotationMixin, ModelViewSet):
     ordering_fields = ['annotated_total', 'placed_at']
 
     def get_serializer_class(self):
-        if self.request.method == 'POST':
+        # PUT/PATCH belong on the write serializer too. Left on PurchaseSerializer they
+        # appear to work and do almost nothing: its `items` and `supplier` are read-only
+        # representations, so an edit would silently drop every line change and save only
+        # the exchange rate — a 200 that discarded the request.
+        if self.request.method in ('POST', 'PUT', 'PATCH'):
             return CreatePurchaseSerializer
         return PurchaseSerializer
 
@@ -156,7 +178,9 @@ class OrderViewSet(AccountScopedMixin, _TotalAnnotationMixin, ModelViewSet):
     ordering_fields = ['annotated_total', 'placed_at']
 
     def get_serializer_class(self):
-        if self.request.method == 'POST':
+        # See PurchaseViewSet.get_serializer_class — OrderSerializer's `items` is
+        # read_only=True, so editing through it would return 200 having changed nothing.
+        if self.request.method in ('POST', 'PUT', 'PATCH'):
             return CreateOrderSerializer
         return OrderSerializer
 
@@ -287,13 +311,12 @@ class AnalyticsView(APIView):
 
      
      
-def _csv_safe(value):
-    if isinstance(value, str) and value.startswith(('=', '+', '-', '@', '\t', '\r')):
-        return "'" + value
-    return value
-
-
 class ExportProductsCSVView(APIView):
+    # Scoped throttle rather than the project default (there is none): these three are
+    # the only endpoints whose cost grows with the account's entire history.
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'exports'
+
     def get(self, request):
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = 'attachment; filename="products_export.csv"'
@@ -345,6 +368,11 @@ class ExportProductsCSVView(APIView):
 
 
 class ExportOrdersCSVView(APIView):
+    # Scoped throttle rather than the project default (there is none): these three are
+    # the only endpoints whose cost grows with the account's entire history.
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'exports'
+
     def get(self, request):
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = 'attachment; filename="orders_detailed_export.csv"'
@@ -412,11 +440,11 @@ class ExportOrdersCSVView(APIView):
 
             writer.writerow([
                 item.order.id,
-                item.order.customer.name if item.order.customer else "No Customer",
+                _csv_safe(item.order.customer.name if item.order.customer else "No Customer"),
                 _iso(item.order.placed_at),
                 item.order.exchange_rate,
-                item.product.name if item.product else "Unknown Product",
-                item.product.barcode or '' if item.product else '',
+                _csv_safe(item.product.name if item.product else "Unknown Product"),
+                _csv_safe(item.product.barcode or '' if item.product else ''),
                 item.quantity,
                 item.unit_multiplier,
                 units,
@@ -437,6 +465,11 @@ class ExportOrdersCSVView(APIView):
     
     
 class ExportPurchasesCSVView(APIView):
+    # Scoped throttle rather than the project default (there is none): these three are
+    # the only endpoints whose cost grows with the account's entire history.
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'exports'
+
     def get(self, request):
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = 'attachment; filename="purchases_detailed_export.csv"'
@@ -489,11 +522,14 @@ class ExportPurchasesCSVView(APIView):
 
             writer.writerow([
                 item.purchase_order.id,
-                item.purchase_order.supplier.name if item.purchase_order.supplier else "No Supplier",
+                _csv_safe(
+                    item.purchase_order.supplier.name
+                    if item.purchase_order.supplier else "No Supplier"
+                ),
                 _iso(item.purchase_order.placed_at),
                 item.purchase_order.exchange_rate,
-                item.product.name if item.product else "Unknown Product",
-                item.product.barcode or '' if item.product else '',
+                _csv_safe(item.product.name if item.product else "Unknown Product"),
+                _csv_safe(item.product.barcode or '' if item.product else ''),
                 item.quantity,
                 item.unit_multiplier,
                 units,

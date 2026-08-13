@@ -1,7 +1,10 @@
 import { createContext, useContext, useEffect, useState } from 'react'
 import { api, tokenStore } from '@/lib/api'
 
-const AuthContext = createContext(null)
+// Exported so a consumer that must tolerate having no session — useSellerIdentity, which
+// renders an invoice's letterhead — can read it with useContext and fall back, rather than
+// going through useAuth, which throws outside a provider.
+export const AuthContext = createContext(null)
 
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null)
@@ -64,6 +67,30 @@ export function AuthProvider({ children }) {
     await login(email, password)
   }
 
+  /**
+   * Throw away an unverified sign-up and return to anonymous.
+   *
+   * Local state is cleared whatever the server says. The row may already be gone — the
+   * session can lapse and be discarded by the verify or resend endpoint between renders —
+   * and holding on to a token for a deleted user would leave the router bouncing the person
+   * back to a verification screen for an account that no longer exists.
+   *
+   * No /auth/jwt/blacklist/ call, unlike logout: the user row is deleted, which cascades its
+   * outstanding tokens, so there is nothing left to blacklist and the request would only 401.
+   */
+  async function abandonRegistration() {
+    try {
+      await api.post('/accounts/abandon-registration/')
+    } catch {
+      // Already discarded, or the session lapsed first. Either way the outcome we want has
+      // happened, and the local clear below is what the user actually sees.
+    }
+    tokenStore.clear()
+    setUser(null)
+    setAccount(null)
+    setStatus('anonymous')
+  }
+
   async function refreshAccount() {
     const { data } = await api.get('/accounts/subscription/')
     setAccount(data)
@@ -88,7 +115,16 @@ export function AuthProvider({ children }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, account, status, login, register, refreshAccount, logout }}
+      value={{
+        user,
+        account,
+        status,
+        login,
+        register,
+        refreshAccount,
+        abandonRegistration,
+        logout,
+      }}
     >
       {children}
     </AuthContext.Provider>

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ArrowDown, ArrowUp, ArrowUpDown, ChevronLeft, ChevronRight, Eye, FileText, Plus, Truck } from 'lucide-react'
+import { ArrowDown, ArrowUp, ArrowUpDown, ChevronLeft, ChevronRight, Eye, FileText, Pencil, Plus, Truck } from 'lucide-react'
 import axios from 'axios'
 import { api } from '@/lib/api'
 import { computeItemsTotal, formatDate, shortId } from '@/lib/format'
@@ -29,6 +29,7 @@ export function Purchases() {
   const [status, setStatus] = useState('loading')
   const [refreshKey, setRefreshKey] = useState(0)
   const [addOpen, setAddOpen] = useState(false)
+  const [editPurchase, setEditPurchase] = useState(null)
   const [invoicePurchase, setInvoicePurchase] = useState(null)
   const [detailPurchase, setDetailPurchase] = useState(null)
 
@@ -85,8 +86,14 @@ export function Purchases() {
   }
 
   function openInvoice(purchase) {
+    // PurchaseSerializer.supplier is a name only — match it back for the phone number, the
+    // same way Orders does for customers. Supplier has no address field, so a purchase
+    // order carries no location line.
+    const matchedSupplier = suppliers.find((s) => s.name === purchase.supplier)
+
     setInvoicePurchase({
       ...purchase,
+      supplierPhone: matchedSupplier?.phone_number || null,
       items: purchase.items.map((item) => ({
         name: item.product,
         quantity: item.quantity,
@@ -98,6 +105,10 @@ export function Purchases() {
 
   function openDetail(purchase) {
     setDetailPurchase(purchase)
+  }
+
+  function openEdit(purchase) {
+    setEditPurchase(purchase)
   }
 
   const exportParams = {}
@@ -157,12 +168,14 @@ export function Purchases() {
             loading={status === 'loading'}
             onViewInvoice={openInvoice}
             onViewDetail={openDetail}
+            onEdit={openEdit}
           />
           <PurchasesCards
             purchases={purchases}
             loading={status === 'loading'}
             onViewInvoice={openInvoice}
             onViewDetail={openDetail}
+            onEdit={openEdit}
           />
 
           {status === 'ready' && result.count === 0 && (
@@ -201,6 +214,7 @@ export function Purchases() {
           exchangeRate={invoicePurchase.exchange_rate}
           partyLabel="Supplier"
           partyName={invoicePurchase.supplier}
+          partyPhone={invoicePurchase.supplierPhone}
           items={invoicePurchase.items}
         />
       )}
@@ -223,6 +237,15 @@ export function Purchases() {
       <PurchaseForm
         open={addOpen}
         onClose={() => setAddOpen(false)}
+        onSaved={() => setRefreshKey((k) => k + 1)}
+        suppliers={suppliers}
+      />
+
+      {/* Separate instance from the add form — see the note in Orders.jsx. */}
+      <PurchaseForm
+        open={Boolean(editPurchase)}
+        purchase={editPurchase}
+        onClose={() => setEditPurchase(null)}
         onSaved={() => setRefreshKey((k) => k + 1)}
         suppliers={suppliers}
       />
@@ -272,6 +295,19 @@ function InvoiceButton({ purchase, onViewInvoice }) {
   )
 }
 
+function EditButton({ onClick }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] font-medium text-text-secondary hover:bg-canvas-2 hover:text-text-primary"
+    >
+      <Pencil size={12} />
+      Edit
+    </button>
+  )
+}
+
 function ViewButton({ onClick }) {
   return (
     <button
@@ -285,7 +321,7 @@ function ViewButton({ onClick }) {
   )
 }
 
-function PurchasesTable({ purchases, sort, onSort, loading, onViewInvoice, onViewDetail }) {
+function PurchasesTable({ purchases, sort, onSort, loading, onViewInvoice, onViewDetail, onEdit }) {
   const { formatAmount } = useCurrency()
 
   return (
@@ -335,6 +371,7 @@ function PurchasesTable({ purchases, sort, onSort, loading, onViewInvoice, onVie
                       <td className="px-5 py-2.5 text-right">
                         <div className="flex items-center justify-end gap-1">
                           <ViewButton onClick={() => onViewDetail(purchase)} />
+                          <EditButton onClick={() => onEdit(purchase)} />
                           <InvoiceButton purchase={purchase} onViewInvoice={onViewInvoice} />
                         </div>
                       </td>
@@ -348,7 +385,7 @@ function PurchasesTable({ purchases, sort, onSort, loading, onViewInvoice, onVie
   )
 }
 
-function PurchasesCards({ purchases, loading, onViewInvoice, onViewDetail }) {
+function PurchasesCards({ purchases, loading, onViewInvoice, onViewDetail, onEdit }) {
   const { formatAmount } = useCurrency()
 
   if (loading) {
@@ -384,6 +421,7 @@ function PurchasesCards({ purchases, loading, onViewInvoice, onViewDetail }) {
               </span>
               <div className="flex items-center gap-1">
                 <ViewButton onClick={() => onViewDetail(purchase)} />
+                <EditButton onClick={() => onEdit(purchase)} />
                 <InvoiceButton purchase={purchase} onViewInvoice={onViewInvoice} />
               </div>
             </div>

@@ -5,6 +5,7 @@ import { ToastContainer } from '@/components/ui/ToastContainer'
 import { Login } from '@/pages/Login'
 import { Signup } from '@/pages/Signup'
 import { VerifyEmail } from '@/pages/VerifyEmail'
+import { Settings } from '@/pages/Settings'
 import { Subscription } from '@/pages/Subscription'
 import { Dashboard } from '@/pages/Dashboard'
 import { Products } from '@/pages/Products'
@@ -14,7 +15,6 @@ import { Purchases } from '@/pages/Purchases'
 import { Customers } from '@/pages/Customers'
 import { Expenses } from '@/pages/Expenses'
 import { Suppliers } from '@/pages/Suppliers'
-import { Settings } from '@/pages/Settings'
 
 function App() {
   return (

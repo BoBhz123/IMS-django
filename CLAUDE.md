@@ -43,15 +43,26 @@ frontend work done — the build catches import errors that neither the tests no
 **Do not use browser automation / Claude-in-Chrome for verification.** Verify through the Django test
 runner, Vitest unit and component tests, or direct API response checks — never by driving a browser.
 
-**Tests live in `inventory/tests.py` (69) and `accounts/tests.py` (22)**, all plain
-`TestCase`/`APIClient`. `playground/tests.py` is still the Django-generated stub. Coverage is real but
-not total — it is strongest on stock arithmetic, account isolation, and subscription gating.
+**Tests live in `inventory/tests.py` and `accounts/tests.py`**, all plain `TestCase`/`APIClient`.
+Coverage is real but not total — it is strongest on stock arithmetic, account isolation, subscription
+gating, and the security controls added in Phase 8 and the OWASP pass.
 
 **Settings are env-var driven** in `ims/settings.py`: `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`,
 `ALLOWED_HOSTS`, `DATABASE_URL`, `SENTRY_DSN`, and the `AWS_*` block (Cloudflare R2) all fall back to
 local-dev defaults when unset. The local DB is Postgres (`inventory` on localhost:5432, user
-`postgres`). `CORS_ALLOW_ALL_ORIGINS = True` is still on — dev-only, flag it rather than fixing it as a
-drive-by change.
+`postgres`). `CORS_ALLOW_ALL_ORIGINS` follows `DEBUG` since Phase 8, and `CORS_ALLOWED_ORIGINS` is
+read from the environment (comma-separated) with the Vite dev origins as the fallback — so adding a
+production domain is a config change, not a deploy.
+
+`DJANGO_SECRET_KEY` and `DJANGO_DEBUG` still *default* to their unsafe values for local dev, but
+**the app now refuses to boot when `DEBUG` is off and `SECRET_KEY` is still the committed default**
+(F-06, closed 2026-08-10 once the owner confirmed the variable is set on Heroku). `SIMPLE_JWT` has no
+separate `SIGNING_KEY`, so that key signs every token — a silent insecure boot meant anyone who could
+read this repo could mint a token for any user.
+
+Security headers live in `ims/security_headers.py` (CSP + Referrer-Policy), hand-rolled rather than
+`django-csp` to avoid a lockfile relock. `CSP_REPORT_ONLY=1` rolls a policy change out without
+blocking; `CSP_EXTRA_IMG_SRC` / `CSP_EXTRA_CONNECT_SRC` add origins without a code change.
 
 **This app is deployed** (Heroku, with WhiteNoise serving the built React app and R2 for media).
 Deployment steps are not in scope for routine work — never run migrations, resets, or config changes
@@ -69,8 +80,7 @@ Things loosened deliberately for local development. Check each before a producti
    *This one cannot reach production by itself:* `server.*` configures the Vite dev server only,
    and `vite build` ignores it, so nothing in `dist/` is affected. The exposure is the local
    machine while a tunnel is actually running — treat the tunnel as public, because it is.
-2. **`CORS_ALLOW_ALL_ORIGINS = True`** in `ims/settings.py` — this one *does* ship. Flagged for
-   Phase 8 (`PLAN.md`), not to be fixed as a drive-by change.
+2. ~~**`CORS_ALLOW_ALL_ORIGINS = True`**~~ — fixed in Phase 8; it now follows `DEBUG`.
 3. **`BILLING_PRICE_MONTHLY_USD` / `BILLING_PRICE_ONE_TIME_USD`** — the committed `15` / `299` are
    display-only placeholders, not agreed pricing. See the Phase 2.5 section.
 
@@ -84,8 +94,6 @@ Django apps under a single `ims` project, plus a React frontend:
 - **`accounts/`** — `Account` + `Membership`: who owns data, and subscription state. Also holds
   `permissions.py` (`HasActiveSubscription`), `mixins.py` (`AccountScopedMixin`), and the signup
   serializer that provisions an account.
-- **`playground/`** — scratch/dev-only app (`say_hello` view rendering `hello.html`), not part of the
-  real API surface. Don't extend it as if it were production code.
 - **`frontend/`** — React + Vite + Tailwind SPA. Built to `frontend/dist/` and served by WhiteNoise
   via `ims/views.py::spa_index`, which is the catch-all route in `ims/urls.py`.
 
@@ -181,9 +189,11 @@ code with the API export views, so a formula/format fix usually needs to happen 
 **Full design:** `docs/superpowers/specs/2026-08-07-saas-single-db-migration-design.md`
 **Completed work log:** `HISTORY.md` — read it at session start.
 
-**Status:** Phases 1–7 complete. **Phase 8** (security audit) is gated on the user installing the
-scanning tools — see `PLAN.md`, Task 8.0; do not start it before they confirm.
-**Phase 2.5b-2** remains blocked on Paddle merchant approval; see the PAUSE STATUS below.
+**Status:** Phases 1–8 complete. One item from Phase 8 is deliberately open and needs an owner
+decision — F-06, the `DJANGO_SECRET_KEY` boot guard; see the Settings note above and the findings
+report.
+**Phase 2.5b-2/-3/-4** are done. What still needs a human is real Paddle credentials and the three
+USD prices in the catalog — not code; see "what shipped, and what still needs a human" below.
 
 Phases are a dependency chain. 3–5 all touch models that Phase 2 restructures, so running them out of
 order means writing migrations twice. Finish each phase (including its tests) before starting the next.
@@ -210,12 +220,24 @@ dashboard or hand every subscriber the platform. Drop the global `unique=True` o
 `Category`/`Customer` `.name` for per-account uniqueness, or the first account to name a product blocks
 every other account.
 
-### Phase 2.5 — Secure onboarding & payment gateway — **2.5a + 2.5b-1 done, 2.5b-2 blocked on Paddle approval**
+### Phase 2.5 — Secure onboarding & payment gateway — **done (2.5a, 2.5b-1 … 2.5b-4)**
 **Design:** `docs/superpowers/specs/2026-08-08-secure-onboarding-payment-gateway-design.md`
 
-Signup takes email + password + phone, emails a 6-digit code, and grants no access until either a
-Paddle card payment (monthly subscription or one-time lifetime licence) or a 100%-off discount key is
-redeemed. **This deletes Phase 2's 14-day trial** — a trial is a free bypass of the wall.
+Signup takes email + password + phone, emails a 6-digit code, and starts a **cardless 14-day trial**
+once that code is verified. After the trial, access needs a Paddle card payment, a 100%-off discount
+key, or a manual admin activation.
+
+**⚠️ The 14-day trial was deleted in 2.5a and reinstated in 2.5b-2 (2026-08-12), by explicit
+decision.** 2.5a's reasoning — "a trial is a free bypass of the payment wall" — is still true; the
+business chose cardless acquisition over a hard wall anyway. Do not "fix" this back. What keeps it
+safe is that trial liveness is *computed* from `trial_ends_at`, never read off the status column, so
+an elapsed trial locks itself out with no scheduled job running, and a `trialing` row with a null
+`trial_ends_at` denies rather than grants.
+
+**One tier, three billing choices.** `monthly`, `annual`, `one_time` — all granting identical access.
+Nothing in the app branches on `plan_type` to decide what a customer may *do*, only on whether their
+subscription is live. The moment a feature checks `plan_type`, this becomes a tiered product and the
+whole permission story needs revisiting.
 
 **Paddle, not Stripe.** Stripe does not onboard Lebanon-registered businesses and there is no foreign
 entity. Paddle is a merchant of record, so no local acquiring relationship is needed. A provider
@@ -244,45 +266,39 @@ Split for sequencing, and 2.5b split again once the Paddle dependency was isolat
 - **2.5b-1** activation, the provider seam, discount keys, and the `/subscription` screen — **done**.
   Plan: `docs/superpowers/plans/2026-08-08-phase-2.5b1-billing-foundation-discount-keys.md`. None of
   it depends on Paddle, so a cash-only business is fully operational today.
-- **2.5b-2** Paddle checkout, the signed webhook, and `ProcessedWebhookEvent` — **blocked**. Needs
-  live credentials, and the design requires the "will Paddle accept a Lebanon-registered seller?"
-  risk validated *before* this is built, not after. Sandbox access unblocks development either way.
+- **2.5b-2** Paddle checkout, the signed webhook, and `ProcessedWebhookEvent` — **done**, see below.
+  Built against the sandbox; the "will Paddle accept a Lebanon-registered seller?" risk is still open
+  but no longer blocks anything, because keys and Whish/cash work without a gateway.
 
-Routes to `active` today: redeeming a discount key, or the `activate_accounts` Django admin action.
+Routes to `active` today: a Paddle payment (once credentials are real), redeeming a discount key, or
+the Django admin's activate/extend/reset/revoke actions. New signups also get 14 cardless trial days.
 
-#### ⏸ PAUSE STATUS — where Phase 2.5b stopped and what resumes it
+#### Phase 2.5b-2 — what shipped, and what still needs a human
 
-Read this before touching `accounts/billing/`. Work moved on to Phase 3 with 2.5b deliberately
-half-finished; that is a pause, not an oversight, and not a bug to be fixed by improvising a gateway.
+`accounts/billing/paddle.py` (checkout + signature verification), `accounts/billing/webhooks.py`
+(`POST /billing/webhook/paddle/`, `ProcessedWebhookEvent` idempotency), the `paddle_*` columns, and
+Paddle.js in the SPA are all in place. `BILLING_PROVIDER='paddle'` no longer raises.
 
-- **Completed:** Phase 2.5a (email OTP onboarding) and Phase 2.5b-1 (billing foundation and 100%-off
-  discount keys). Both are recorded in `HISTORY.md`.
-- **Paused at:** Phase 2.5b-2 — Paddle checkout, the signed webhook, `ProcessedWebhookEvent`
-  idempotency, and Paddle.js in the SPA. None of it is written.
-- **Reason for the pause:** awaiting Paddle merchant-account approval and sandbox/production
-  credentials. The design also requires the "will Paddle accept a Lebanon-registered seller?" risk
-  validated *before* 2.5b-2 is built rather than after, so this is a sequencing decision and not
-  merely a missing password.
-- **Current state:** the provider seam is live with `BILLING_PROVIDER='dummy'`. The dummy refuses card
-  checkout (`503 card_checkout_unavailable`) instead of faking a payment, and `BILLING_PROVIDER='paddle'`
-  raises `ImproperlyConfigured` on purpose until 2.5b-2 lands. Discount keys and the admin
-  `activate_accounts` action are the only routes to `active`, and they are sufficient — a cash-only
-  business is fully operational as things stand.
-- **Environment setup before any production deploy:** set `BILLING_PRICE_MONTHLY_USD` and
-  `BILLING_PRICE_ONE_TIME_USD`. The committed values (`15` and `299`) are display-only placeholders,
-  not agreed pricing. They are what the plan cards render; the server never accepts an amount from
-  the client, so these do not control what anyone is charged — but shipping them unset would quote
-  invented prices to real customers.
-
-**To resume:** get sandbox credentials, then build `accounts/billing/paddle.py` behind the existing
-`BillingProvider` interface and add the webhook. `activate_account` already accepts `grace_days`, so
-the renewal path is a new caller rather than a rewrite.
+**Still needs a human, before production:**
+- **Real Paddle credentials.** Everything in `.env` is a placeholder. `PADDLE_API_KEY`,
+  `PADDLE_CLIENT_TOKEN`, `PADDLE_WEBHOOK_SECRET` and the three `PADDLE_PRICE_*` ids all come from the
+  sandbox dashboard. With placeholders the provider reports card checkout unavailable and the app
+  falls back to keys and Whish/cash, which is the designed degradation, not a bug.
+- **The three prices do not exist in the Paddle catalog yet.** They could not be created from here:
+  the Paddle MCP connection is read-only (no `product.write`). Grant it at
+  https://vendors.paddle.com/mcps, or create them by hand under Catalog → Products. All three must be
+  **USD** — see the USD-only rule above.
+- **The webhook destination.** Point it at `/billing/webhook/paddle/` and subscribe to
+  `transaction.completed`, `subscription.activated`, `subscription.updated`, `subscription.canceled`,
+  `subscription.paused`. Anything else is logged and acknowledged.
+- **The seller-approval question is still open** ("will Paddle accept a Lebanon-registered seller?").
+  The code no longer blocks on it, because discount keys and Whish/cash work regardless.
 
 What the obvious implementation gets wrong:
 - **"No account until paid" is not implementable.** You cannot charge a card or verify an email before
   a row exists to attach them to. The account is created immediately in `pending_verification` and is
-  simply inert: `LIVE_STATUSES` narrows to `(ACTIVE,)`, so Phase 2's default `HasActiveSubscription`
-  already locks every endpoint with no new checks.
+  simply inert: `LIVE_STATUSES` is `(ACTIVE, TRIALING)` and a fresh account is neither, so Phase 2's
+  default `HasActiveSubscription` already locks every endpoint with no new checks.
 - **The paywall will block the escape from the paywall.** Every endpoint needed to get *out* of
   pending state — subscription status, resend code, verify code, create checkout, redeem key — must
   declare `permission_classes = [IsAuthenticated]` explicitly to shed the default. Miss one and the
@@ -334,9 +350,15 @@ import, or the constraint dropped) rather than silently taking the first match. 
 through `maxQuantityFor` so Phase 1's stock cap still holds; purchase scans are uncapped, because a
 purchase adds stock.
 
-### Phase 8 — Security audit — **blocked, by design**
-Do not start. `PLAN.md` Task 8.0 requires the user to install `pip-audit`, `bandit` and `semgrep`
-and confirm before any Phase 8 work begins.
+### Phase 8 — Security audit — **done**
+Findings: `docs/superpowers/specs/2026-08-09-phase-8-security-audit-findings.md`. See `HISTORY.md`.
+
+Fixed: an unscoped nested product-image route (**cross-account read and write** — the most serious
+bug found in the project, and no scanner saw it; the isolation matrix did), CSV formula injection in
+4 of the 5 exporters, CORS wide open outside `DEBUG`, and unthrottled CSV exports.
+
+Open by design: **F-06**, the `SECRET_KEY`/`DEBUG` fail-open default. Needs confirmation that
+`DJANGO_SECRET_KEY` is set on Heroku before a boot guard can be added safely.
 
 ### Phase 4 — Barcodes — **done**
 Optional indexed `Product.barcode` in `ProductViewSet.search_fields`, so `?search=` covers it. Form
@@ -365,6 +387,121 @@ initially kept for saved formulas, then removed outright at the owner's directio
 it was judged the larger risk. That redesign also made all money numeric, added `Barcode` and
 `Total Units`, and moved dates to ISO 8601. See `HISTORY.md`.
 
+### Phase 9 — Admin lockdown, editable transactions, invoice redesign — **done (2026-08-13)**
+
+Three unrelated pieces of work, done together.
+
+**1. `/admin/` is superuser-only.** `ims/admin_site.py::SuperuserOnlyAdminSite` overrides
+`has_permission` (`is_active and is_superuser`, dropping Django's `is_staff` test) and `login`
+(an already-authenticated non-superuser is redirected to `/`, the SPA, instead of being shown a
+login form for the session they are already in). Wired through `ims/apps.py::IMSAdminConfig`'s
+`default_site` and the `INSTALLED_APPS` entry — *not* `'django.contrib.admin'` any more — because
+that hook is read before `autodiscover()`, so every existing `admin.site.register` lands on the
+restricted site with no edits.
+
+This **reverses** the earlier "staff may still look a customer up" decision (`AccountAdmin`
+deliberately not using `SuperuserOnlyAdmin`). A customer lookup is not worth a hole in a site that
+also exposes every other account's business data. The per-model gates
+(`SuperuserOnlyAdmin`, `get_actions`, `get_readonly_fields`) all stay — they are the layer
+underneath, and `AdminPermissionBoundaryTests` now asks them directly rather than over HTTP,
+because the site bounces staff before any view runs.
+
+**2. Orders and purchases are editable.** `CreateOrderSerializer`/`CreatePurchaseSerializer` gained
+`update()`, and both viewsets route `PUT`/`PATCH` to them — left on the read serializers an edit
+returns 200 having silently discarded every line change, since their `items` is read-only. Names
+keep the `Create*` prefix; they are the write serializers for all three verbs now.
+
+Editing **replaces** the line items wholesale rather than diffing them: a line has no
+client-visible id, so "the second line" is a position and positions do not survive a reorder.
+Stock moves by the *net delta* under `select_for_update()` inside the existing `@transaction.atomic`
+— lock the union of old and new products, validate, then apply `old − new` (orders) or `new − old`
+(purchases). A `PATCH` without `items` leaves lines and stock untouched.
+
+What the obvious implementation gets wrong:
+- **An order's own units are already out of stock.** Comparing new lines against the bare
+  `stock_quantity` rejects an order for units it is itself holding — an order that sold the last 10
+  cannot even have its customer corrected. `_insufficient_stock_errors(credited_units=…)` credits
+  them back first. The frontend has the same rule in `lib/transactionEdit.js`, or every line of such
+  an order renders as "over stock" and the save button stays disabled.
+- **A dropped product appears on only one side.** Iterating the new items alone never returns the
+  stock of a line that was deleted. `_stock_deltas` works over the union.
+- **Reducing a purchase can drive stock negative** — the goods may already be sold. Refused with a
+  400, not clamped: clamping leaves the books saying goods were never received while the sale that
+  consumed them stands.
+- **An edit must not restate COGS.** A product already on the order keeps its
+  `OrderItem.unit_cost_price` snapshot; only a genuinely new line takes today's `product.cost_price`.
+  Re-reading it for every line would rewrite the profit of a past sale each time a supplier price is
+  corrected.
+- **Nothing is denormalised, so nothing needs recalculating.** Totals, profit and analytics are all
+  computed from the rows — `total_price`, `total_profit`, `AnalyticsView`. There is no ledger,
+  balance or metrics table to reverse. `OrderEditingTests.test_analytics_reflect_the_edited_order`
+  pins that.
+
+Out of scope, and absent from the data model: per-line or per-order **discounts**, and
+**customer/supplier balances**. Neither exists as a field anywhere; adding either is its own
+decision.
+
+**3. Invoice redesign.** `Invoice.jsx` rebuilt to the reference layout: letterhead with the real
+business name/phone/email (from `useSellerIdentity`, reading the account off `AuthContext` — no
+logo, no seller address, neither is stored), a `BILL TO` block with the customer's name, location
+and phone, a `# / ITEMS / UNIT / QTY / UNIT COST / TOTAL` table, subtotal and total with their LBP
+conversions, a `PAID` badge, and a configurable tagline in `lib/invoiceConfig.js`.
+
+`UNIT` is `unit_multiplier` and `QTY` is `quantity`, in separate columns — the two multiply to the
+units stock is deducted by, and merging them loses that. The `PAID` badge is static and carries the
+transaction date: there is no payment-status column, and these are cash-sale records written after
+the money moved.
+
+The `@media print` block in `index.css` was reworked for mobile printing: `@page { size: auto;
+margin: 0 }` (which is also the only lever CSS has over the browser's own URL/timestamp headers —
+Chrome and Safari suppress them at zero margin, Firefox honours its own preference regardless), the
+invoice sized `width: 100%; max-width: 800px` with its own `12mm` padding instead of a fixed
+`210mm`, `html`/`body` forced white to kill the dark margin bars, and `table-layout: fixed` so no
+column can be clipped off a narrow sheet.
+
+### Domain migration — client.myimsapp.com → myimsapp.com — **done (2026-08-13)**
+
+The canonical domain is **`myimsapp.com`**. `ims/settings.py` grew a `SITE_DOMAIN` /
+`SITE_URL` pair that `ALLOWED_HOSTS`, `CSRF_TRUSTED_ORIGINS` and the `CORS_ALLOWED_ORIGINS`
+fallback all derive from, so moving domain again is one edit (or one `SITE_DOMAIN` env var),
+not a hunt through settings. Every default stays overridable from the environment.
+
+Two changes of substance, beyond the string swap:
+
+- **`ALLOWED_HOSTS` no longer falls back to `'*'`.** The wildcard accepted any Host header and
+  gave up Django's Host-header protection entirely — a placeholder from before this app had a
+  domain. The fallback is now `myimsapp.com,.myimsapp.com,localhost,127.0.0.1`, so a deploy
+  that forgets the env var fails closed.
+- **`CSRF_TRUSTED_ORIGINS` did not exist.** It has to name the site or the Django admin's
+  login POST is rejected with "Origin checking failed" the moment a custom domain fronts the
+  app — it only worked before because the admin was reached over the `*.herokuapp.com` host.
+
+`.myimsapp.com` is a leading-dot entry: per Django's docs it matches the domain *and* every
+subdomain, which is what keeps the existing `client.` and `testlab.` hosts serving.
+
+**Production state after the cutover** (`ims-tenant-app`, config v46):
+- Domains registered: `myimsapp.com` (ALIAS/ANAME → `curly-parrot-w6pzgej6b6zwtm2b66ynh1zp.herokudns.com`),
+  `*.myimsapp.com` (CNAME → `darwinian-pheasant-5sravvq7x6t5lxt0dklt42l9.herokudns.com`), plus
+  the pre-existing `client.` and `testlab.` hosts.
+- `ALLOWED_HOSTS=myimsapp.com,.myimsapp.com` — **the `*.herokuapp.com` dyno hostname was
+  deliberately dropped** at the owner's direction, having been warned. That URL no longer
+  serves the app.
+- `CSRF_TRUSTED_ORIGINS=https://myimsapp.com,https://*.myimsapp.com`.
+
+**Still outstanding, and it is DNS, not code:** `myimsapp.com` has no A/CNAME record at all, so
+the apex does not resolve. DNS is on Cloudflare, which supports CNAME flattening, so the
+ALIAS/ANAME target above can be entered as a proxied CNAME at the root. Until that record
+exists the site is reachable only at `client.myimsapp.com`.
+
+**The frontend API base URL is deliberately not hardcoded to the domain.** `lib/api.js`
+derives it from `window.location.origin`; baking in `https://myimsapp.com` breaks local dev
+outright and, during a cutover, makes the copy of the app served from one host issue
+credentialed calls to another. Same-origin derivation already *is* `https://myimsapp.com`
+when the page came from there.
+
+`DomainConfigurationTests` (`inventory/tests.py`) pins all of this, including a guard that
+fails if the old subdomain reappears in `ims/`, `accounts/`, `inventory/` or `frontend/src/`.
+
 ---
 
 # Working Log — mistakes, gotchas, anti-patterns
@@ -375,6 +512,26 @@ Append here when something bites. Do not repeat these.
   on it, or a code issued for one flow becomes spendable in another and the two flows start expiring
   each other's outstanding codes and sharing one hourly send budget. `issue_code`/`verify_code` both
   take `purpose`; the default is `email_verification` only because that flow predates the field.
+- **There has never been a hardcoded `123456` fallback.** `verification.generate_code` uses
+  `secrets.randbelow`; every `123456` in the tree is test data. If a report says otherwise,
+  check `RegistrationSessionEndpointTests.test_the_emailed_code_is_generated_not_fixed`
+  before changing anything — it signs up five times and fails if two codes ever match.
+- **Two clocks, and they are not the same clock.** `verification.CODE_TTL` (10 min) expires a
+  *code* and is recoverable by resending. `registration.REGISTRATION_SESSION_TTL` (60 min)
+  expires the whole unverified *sign-up* and hard-deletes it. Collapsing them throws away a
+  registration over a ten-minute-old email; the endpoints return `code_expired` and
+  `registration_expired` respectively, and the SPA branches on the slug, never the wording.
+- **`Account.registration_expires_at` is what makes deleting an account safe, and it must
+  stay a stored column.** Deriving the deadline from `created_at` would sweep any paying
+  customer an admin has put back to `pending_verification`. It is stamped once at signup and
+  cleared for good at the first verification, so NULL means "verified at least once" and
+  `is_pending_registration` requires both halves. `registration.discard` raises
+  `NotDiscardable` for anything else — never bypass it to delete an account.
+- **Discarding a registration frees the email address, so the abandon endpoint is throttled
+  per client address, not per user.** Sign-up → code → abandon → sign-up mails one victim
+  repeatedly, and each pass creates a new user row with a fresh per-user budget, so a
+  user-keyed throttle counts nothing. Any new endpoint that can delete an unverified account
+  needs the same treatment.
 - **A multi-step OTP flow must not spread its decision across steps.** If the endpoint that changes
   something trusts an earlier "verify" call, being authenticated is enough to skip the code entirely
   and the extra screens are theatre. `PasswordResetConfirmView` takes the code and the new password in
@@ -432,11 +589,77 @@ Append here when something bites. Do not repeat these.
 - **`activate_account` (`accounts/billing/activation.py`) is the only supported way to set
   `subscription_status = ACTIVE`** outside the admin action. Assigning the column directly skips the
   expiry arithmetic — the account reads as live with a stale or absent `expires_at`.
-- **`BILLING_PROVIDER='paddle'` raises `ImproperlyConfigured` by design** until 2.5b-2. That is not a
-  broken import; the error message names the phase.
+- **`BILLING_PROVIDER='paddle'` works now** (2.5b-2). With placeholder credentials it reports card
+  checkout unavailable rather than erroring — `is_configured()` is what the plan screen asks, not
+  `name != 'dummy'`, because a half-credentialed provider takes payments exactly as well as no
+  provider at all.
+- **The Paddle webhook signs the *raw* body.** Use `request.body`, never `request.data` — DRF's
+  parsed dict re-serialises with different key order and whitespace, and the HMAC stops matching.
+- **Idempotency is an insert, not a check-then-insert.** `ProcessedWebhookEvent.objects.create()`
+  inside `try/except IntegrityError` is what makes two concurrent deliveries of the same Paddle retry
+  safe; `if not exists(): create()` lets both through and double-extends `expires_at`.
+- **A `trialing` account whose `trial_ends_at` has passed still reads `trialing` in the database.**
+  Nothing sweeps the column on a schedule (the admin action is housekeeping, not enforcement), so any
+  code branching on the bare status is wrong — ask `has_active_subscription`. This bit the frontend
+  router: `routeForAccountStatus` needs the account object, not just the status string.
+- **Don't nest a `<button>` inside a `role="button"` card.** The Subscription plan cards did this;
+  the accessible name of the outer control swallowed the inner button's text, so
+  `getAllByRole('button', {name: /pay with card/i})` matched six elements instead of three. The cards
+  are radio inputs now, which is both valid ARIA and free arrow-key navigation.
 - **Discount key codes are stored normalized** — uppercase, no dashes. Querying `DiscountKey` by the
   dash-separated form the user was shown never matches; run it through
   `accounts.billing.keys.normalize_key` first.
+- **The Paddle MCP connection is read-only.** It has no `product.write`, so prices cannot be created
+  from a session — `client.products.create` fails with "not authorized". Grant the permission at
+  https://vendors.paddle.com/mcps or use the dashboard.
+- **`ModelAdmin.actions` resolves strings against the admin class only.** Listing module-level
+  action functions by name registers nothing and every action silently disappears from the
+  dropdown — pass the callables. `get_actions` gates by *name*, so derive those off `__name__`
+  rather than retyping them.
+- **Superuser-only admin needs `has_module_permission` too**, not just the four object
+  permissions. Without it the section still renders on the admin index and only the links 403,
+  which looks like a bug rather than a boundary. `SuperuserOnlyAdmin` in `accounts/admin.py`
+  overrides all five; `AccountAdmin` deliberately does not use it (staff may look a customer
+  up; only superusers may change what they paid for, via `get_actions`/`get_readonly_fields`).
+- **The unpaid route whitelist is `/subscription` + `/settings`**, and it must not apply to
+  `pending_verification` — an unverified account has not proved it owns the address, which is a
+  worse hole than an unpaid one. Match exact paths and nested children, never bare
+  `startsWith`, or `/settings-export` walks through.
+- **The subscription wire names are `subscription_status` / `subscription_live` / `is_trial`**,
+  not the model's `has_active_subscription` / `is_trialing`. One projection —
+  `accounts.serializers.subscription_payload` — feeds both `/accounts/subscription/` and the
+  `subscription` key of `/auth/users/me/`; `SubscriptionPayloadContractTests` pins the field set.
+- **`force_authenticate` reuses one `User` instance**, and Django caches `user.membership` and
+  that membership's `account` on it. A test that reuses the client after changing the account
+  in the database reads the stale in-memory row and looks like a caching bug in the API. Build a
+  fresh client from `User.objects.get(pk=…)` per request, as `AdminOverrideSyncTests` does.
+- **One trial per account, latched on `Account.has_used_trial`.** `start_trial` raises
+  `TrialAlreadyUsed`; only the admin reset action may pass `force=True`. Do not use a null
+  `trial_ends_at` as the signal — the revoke action clears it, which would hand a revoked
+  account a fresh trial.
+- **`UserPaymentRecord` must never hold a card number.** Paddle is merchant of record and this
+  app is deliberately outside PCI scope. It stores cash/Whish detail, Fernet-encrypted via
+  `accounts/crypto.py`. `PAYMENT_ENCRYPTION_KEY` is required when `DEBUG` is off and is
+  effectively write-once: rotating it makes every existing record unreadable.
+- **`525 5.7.1 Unauthorized IP address` from Brevo is not a credential problem.** It is
+  Brevo's "Authorised IPs" allowlist rejecting the sending host. Rotating the SMTP key does
+  nothing. `manage.py send_test_email <addr> --show-config` reproduces it and prints the hint.
+- **Transactional mail is `multipart/alternative`, always.** `accounts/emails.py` renders
+  `emails/otp_code.html` *and* `.txt`; dropping the text part is a well-known spam signal.
+  Templates are table-based with inline styles because Outlook renders through Word.
+- **`DEFAULT_FROM_EMAIL` is composed in settings** into `IMS Support <addr>` and skips wrapping
+  when the env value already has a display name. Double-wrapping produces a header Brevo
+  rejects.
+- **Brevo needs a verified sender.** `DEFAULT_FROM_EMAIL` on a free-mail domain (gmail.com)
+  cannot be DKIM-signed by us, so it is spam-filed or refused even once the IP is allowed.
+- **Boolean env vars need `_env_flag`, not `== 'True'`.** That comparison read
+  `EMAIL_USE_TLS=true` as False, attempted port 587 in the clear, and silently broke every
+  verification email. Any new boolean setting goes through the helper.
+- **This app has no `/api/` prefix.** The billing/onboarding endpoints are `/accounts/…`,
+  `/billing/…` and `/auth/…`. Requests naming `/api/accounts/redeem-code/` mean
+  `/billing/redeem-key/`.
+- **`react-router-dom` has 2 open high-severity advisories** (`npm audit`). `npm audit fix --force`
+  downgrades to 7.11.0, a breaking change — left alone deliberately; raise it as its own decision.
 - **`OrderItem.unit_cost_price` is the only correct source of COGS.** `product.cost_price` is a
   *current* figure that gets corrected; reading it for any historical calculation restates the past.
   The snapshot is what `OrderItem.profit`, `LINE_COGS`/`items_cogs`, `AnalyticsView` and
@@ -482,8 +705,43 @@ Append here when something bites. Do not repeat these.
   validator — the constraint then surfaces as an uncaught `IntegrityError` 500 instead of a 400. See
   `AccountUniqueNameMixin` and `ProductSerializer.validate_barcode`. Both strip before comparing,
   because the model strips before storing.
-- **`react-router-dom` has 2 open high-severity advisories** (`npm audit`). `npm audit fix --force`
-  downgrades to 7.11.0, a breaking change — left alone deliberately; raise it as its own decision.
+- **The security audit trail is `accounts/audit.py`, logged to `ims.security`.** Deletions are
+  hooked in `AccountScopedMixin.perform_destroy`, so any new account-scoped viewset is audited for
+  free — but capture the pk *before* `super().perform_destroy()` and log *after* it: Django's
+  collector nulls `instance.pk`, and logging first records deletions that a PROTECT foreign key then
+  prevented. Never put a code, token or password in the trail.
+- **CSP is enforced (`ims/security_headers.py`), so no inline `<script>` may ever be added** to the
+  SPA's `index.html` or to a Django template — `script-src` is `'self'` with no nonce. Check
+  `npm run build` output if a build tool starts inlining. `'unsafe-inline'` in `style-src` is
+  load-bearing for framer-motion and cannot be removed without replacing the animation library.
+- **JWTs live in `localStorage`, so any XSS is a full account takeover.** This is a recorded,
+  accepted risk — `HttpOnly` cookies are the structural fix and a much larger change. Treat any new
+  HTML-rendering or `dangerouslySetInnerHTML` path as security-critical.
+- **There is no scratch app.** `playground/` was deleted on 2026-08-10: its `say_hello` view read
+  every account's orders with no auth and no scoping, and although it was never routed it sat one
+  line of `urls.py` away from being a cross-tenant leak.
+  `test_a05_every_routed_inventory_view_requires_authentication` is the generalised guard that
+  replaced it — it fails if any view routed under `/inventory/` does not demand an authenticated
+  caller. Don't add a scratch app back; use a test or the shell.
+- **Scanners do not find authorization bugs.** Phase 8's worst finding — an unscoped nested route
+  allowing cross-account read *and* write — was invisible to semgrep, bandit and pip-audit, because
+  it looks like ordinary ORM code. It took a test that crossed the tenant boundary. Run the matrix
+  (`inventory.tests.TenantIsolationMatrixTests`), and add any new scoped collection to its
+  `RESOURCES` list.
+- **Overriding `get_queryset()` on a scoped viewset silently opts out of `AccountScopedMixin`.**
+  Always chain through `super().get_queryset()`. `ProductImageViewSet` declared
+  `account_lookup = 'product__account'` and never reached it for four phases, which made the viewset
+  *look* scoped. A nested route also needs the parent checked in `perform_create` — queryset scoping
+  governs reads only, and the parent id comes off the URL.
+- **`csv_format.text()` escapes formula-leading cells; never apply it to `money()` output.** `-`
+  leads a formula and also leads a negative line profit, so escaping money emits `'-6.00` and turns
+  the numeric columns back into text — undoing the redesign that made them summable.
+- **DRF caches throttle rates in a class attribute.** `override_settings(REST_FRAMEWORK=…)` does not
+  change them: `SimpleRateThrottle.THROTTLE_RATES` is bound at import and `api_settings` rebuilds a
+  different dict. Patch `ScopedRateThrottle.THROTTLE_RATES` in place instead.
+- **`settings.DEBUG` is forced to `False` by the test runner**, *after* `ims/settings.py` has been
+  imported. Anything derived from `DEBUG` at import time therefore cannot be asserted in-process —
+  check it in a subprocess, or the test proves nothing about production.
 - **`@zxing/library` must stay behind `await import()`.** A top-level import puts ~450 kB into every
   page load of a bundle already past Vite's size warning. Measured: the entry chunk grows ~5 kB and
   the library gets its own chunk. Check `npm run build` output after touching a scanner call site.
@@ -509,6 +767,46 @@ Append here when something bites. Do not repeat these.
   emptied field is not refilled with the `0` that emptying it reported. Widening that effect makes
   the field fight the user mid-keystroke; narrowing it back to mount-only reintroduces the bug where
   picking or scanning a product left the price showing `0` beside a correct total.
+- **`ALLOWED_HOSTS` on Heroku no longer lists the `*.herokuapp.com` dyno hostname.** Dropped
+  during the 2026-08-13 domain cutover at the owner's direction. Requests arriving on that
+  URL no longer serve the app, so it is not a fallback and not a way to check whether a
+  deploy is healthy — use `client.myimsapp.com` (or the apex, once its DNS record exists).
+- **`.myimsapp.com` with the leading dot already matches the bare domain.** Django's docs are
+  explicit: a leading-dot entry matches the domain and every subdomain. Listing both is for
+  the human reading settings.py, not because either is redundant to add.
+- **Never hardcode the API base URL in `frontend/src/lib/api.js`.** It derives from
+  `window.location.origin` on purpose — the same bundle is served from the apex, every
+  subdomain, and a LAN/tunnel URL in dev. A baked-in origin breaks local development and,
+  mid-cutover, makes one host's copy of the app call another host with credentials.
+- **The Django admin is superuser-only, and the check is at the AdminSite.**
+  `ims/admin_site.py` overrides `has_permission`; `INSTALLED_APPS` names
+  `ims.apps.IMSAdminConfig`, not `django.contrib.admin`. Reverting that one line lets every
+  `is_staff` user back into every account's data, and no per-model test would fail — which is
+  why `SuperuserOnlyAdminSiteTests` asserts `admin.site`'s class directly.
+- **`Create*Serializer` handles PUT and PATCH too, not just POST.** Routing an edit to
+  `OrderSerializer`/`PurchaseSerializer` instead returns 200 having changed nothing but the
+  exchange rate — their `items` and party fields are read-only representations. A silent
+  discard, not an error.
+- **An edit's stock check must credit back the transaction's own units.** The rows are already
+  deducted, so `new_units > stock_quantity` rejects an order for stock it is itself holding.
+  Server: `_insufficient_stock_errors(credited_units=…)`. Browser:
+  `lib/transactionEdit.js::availableStock`. Both, or the two disagree and the form blocks a save
+  the API would have accepted.
+- **Stock deltas on an edit are computed over the *union* of old and new products.** A product
+  removed from the transaction appears in neither the new items nor any loop over them, so its
+  stock never comes back. `_stock_deltas` in `inventory/serializers.py`.
+- **Editing must not re-read `product.cost_price` for a line that was already there.**
+  `OrderItem.unit_cost_price` is a snapshot of what the sale cost at the time; re-stamping it
+  restates the profit of a past sale whenever a cost is corrected. Only genuinely new lines take
+  today's cost.
+- **`PurchaseItem.product` is a product *name* on the wire, `OrderItem.product` is an id.**
+  PurchaseItemSerializer declares it as a StringRelatedField. Any code turning saved items back
+  into form state has to know which — `toFormLines(..., {productKey})` does.
+- **Print rules hang off `.invoice-print` in `index.css`, and `@page { margin: 0 }` is
+  load-bearing.** It is the only CSS lever over the browser's own print headers/footers, and with
+  it the invoice must supply its own padding or the content runs to the paper edge. Don't
+  reintroduce a fixed `210mm` width — it overflows Letter's printable area and forces a scale-down
+  on mobile print renderers.
 - **`ProductPicker` only learns a product's name by being clicked.** Any code path that sets a line's
   `product` id some other way must also pass `selectedName`, or the picker reads "Select product"
   while holding a real id.

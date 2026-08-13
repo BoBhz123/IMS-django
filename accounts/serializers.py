@@ -1,12 +1,16 @@
+from datetime import timedelta
+
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
-from djoser.serializers import UserCreateSerializer
+from django.utils import timezone
+from djoser.serializers import UserCreateSerializer, UserSerializer
 from rest_framework import serializers
 
 from .emails import send_verification_code
-from .models import Account, Membership
+from .models import Account, Membership, get_account
+from .registration import registration_deadline
 from .verification import issue_code
 
 
@@ -73,7 +77,17 @@ class UserCreateWithAccountSerializer(UserCreateSerializer):
         account = Account.objects.create(
             name=business_name or user.email,
             phone=phone,
+            # The trial clock starts at signup, but the status does *not*: the account stays
+            # pending_verification until the emailed code is entered. Setting `trialing` here
+            # would make the trial a way around email verification, since trialing grants
+            # access. VerifyEmailView promotes it, and restamps the clock so nobody loses
+            # trial days to a slow inbox.
             subscription_status=Account.PENDING_VERIFICATION,
+            trial_ends_at=timezone.now() + timedelta(days=Account.TRIAL_DAYS),
+            # The sign-up session's own deadline, separate from the code's 10-minute TTL. A
+            # code can be re-sent; this one cannot be extended, and when it passes the whole
+            # registration is discarded so the address is free to sign up again.
+            registration_expires_at=registration_deadline(),
         )
         Membership.objects.create(user=user, account=account, is_owner=True)
 
@@ -125,25 +139,96 @@ class PasswordResetConfirmSerializer(serializers.Serializer):
 
 class SubscriptionStatusSerializer(serializers.ModelSerializer):
     """
-    Read-only projection of onboarding/billing state for the SPA's router.
+    Read-only projection of onboarding/billing state. The single source of truth for what the
+    SPA knows about a subscription — the router, the trial banner, the settings card and the
+    plan screen all read this one shape, so they cannot disagree with each other.
 
-    `has_active_subscription` is the computed property, not the stored column — the frontend
-    must make the same call the permission class does, or the two disagree the moment a
-    subscription lapses.
+    `subscription_live` and `is_trial` are the *computed* properties, not the stored columns.
+    That distinction is the whole design: nothing sweeps `subscription_status` on a schedule,
+    so an `active` row whose `expires_at` has passed still reads `active` in the database.
+    Anything branching on the bare status is wrong, including in the browser.
     """
 
     business_name = serializers.CharField(source='name', read_only=True)
-    status = serializers.CharField(source='subscription_status', read_only=True)
-    has_active_subscription = serializers.BooleanField(read_only=True)
+    # Named for what enforcement actually asks. `has_active_subscription` is the model
+    # property; `subscription_live` is the wire name, and the two are deliberately the same
+    # value under different names rather than two independently computed answers.
+    subscription_live = serializers.BooleanField(
+        source='has_active_subscription', read_only=True,
+    )
+    is_trial = serializers.BooleanField(source='is_trialing', read_only=True)
+    # Computed server-side so the banner counts down against the same clock the permission
+    # class enforces. Sending trial_ends_at alone and subtracting in the browser would drift
+    # with the device's system time — a wrong clock would show a trial as live when the API
+    # has already stopped serving it.
+    trial_days_remaining = serializers.IntegerField(read_only=True, allow_null=True)
+    # 'card' | 'manual' | 'trial' | '' — inferred, see Account.payment_method.
+    payment_method = serializers.CharField(read_only=True)
+    # Computed here for the same reason trial_days_remaining is: the verify screen must not
+    # decide the session is over against the device's clock while the server is still
+    # accepting codes, or the reverse. `registration_expires_at` ships alongside it only so
+    # the screen can render a countdown, never so it can make the decision itself.
+    registration_session_expired = serializers.BooleanField(read_only=True)
     email = serializers.SerializerMethodField()
 
     class Meta:
         model = Account
         fields = [
-            'status', 'plan_type', 'expires_at', 'has_active_subscription',
+            'id', 'subscription_status', 'plan_type', 'expires_at', 'trial_ends_at',
+            'subscription_live', 'is_trial', 'trial_days_remaining', 'payment_method',
+            'registration_expires_at', 'registration_session_expired',
             'business_name', 'phone', 'email',
         ]
 
     def get_email(self, account):
         membership = account.memberships.first()
         return membership.user.email if membership else ''
+
+
+def subscription_payload(user):
+    """
+    The subscription projection for a user, including the no-account case.
+
+    A superadmin has no Membership and neither does a user whose provisioning failed. Both
+    must come back as "not a subscriber" rather than "unpaid" — reporting the platform owner
+    as unpaid redirects them to a paywall for a subscription they were never meant to have.
+    Shared by the status endpoint and the /auth/users/me/ payload so the two cannot drift.
+    """
+    account = get_account(user)
+    if account is not None:
+        return SubscriptionStatusSerializer(account).data
+    return {
+        'id': None,
+        'subscription_status': None,
+        'plan_type': '',
+        'expires_at': None,
+        'trial_ends_at': None,
+        'subscription_live': bool(user.is_superuser),
+        'is_trial': False,
+        'trial_days_remaining': None,
+        'payment_method': '',
+        'registration_expires_at': None,
+        'registration_session_expired': False,
+        'business_name': '',
+        'phone': '',
+        'email': user.email,
+    }
+
+
+class UserWithSubscriptionSerializer(UserSerializer):
+    """
+    djoser's /auth/users/me/, plus the subscription state.
+
+    Nested under one key rather than flattened onto the user: these are facts about the
+    *account*, not the person, and flattening would collide `id` and `email` with the user's
+    own. It reuses SubscriptionStatusSerializer rather than restating the fields, so there is
+    exactly one definition of this payload in the codebase.
+    """
+
+    subscription = serializers.SerializerMethodField()
+
+    class Meta(UserSerializer.Meta):
+        fields = tuple(UserSerializer.Meta.fields) + ('subscription',)
+
+    def get_subscription(self, user):
+        return subscription_payload(user)

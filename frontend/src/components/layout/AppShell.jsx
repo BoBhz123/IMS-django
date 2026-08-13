@@ -1,5 +1,6 @@
 import { Outlet, useLocation } from 'react-router-dom'
 import { Dock, MobileTabBar, NAV_ITEMS } from './Dock'
+import { TrialBanner } from './TrialBanner'
 import { WindowChrome } from './WindowChrome'
 
 export function AppShell() {
@@ -13,6 +14,7 @@ export function AppShell() {
       <MobileTabBar />
 
       <div className="px-3 py-4 pb-24 sm:px-6 sm:py-6 sm:pb-6 sm:pl-28 lg:pl-32">
+        <TrialBanner />
         <div className="mx-auto max-w-6xl overflow-hidden rounded-squircle border border-glass-border bg-glass backdrop-blur-2xl [box-shadow:var(--shadow-glass)]">
           <WindowChrome title={activeItem?.label ?? 'IMS'} />
           <div className="p-4 sm:p-6">

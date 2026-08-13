@@ -9,15 +9,20 @@ from rest_framework_simplejwt.token_blacklist.models import OutstandingToken
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
 
-from . import verification
+from . import registration, verification
+from .audit import log_auth_event
+from .billing.activation import TrialAlreadyUsed, start_trial
 from .emails import send_password_reset_code, send_verification_code
 from .models import Account, get_account
+# subscription_payload replaces the direct SubscriptionStatusSerializer use that used to be
+# here: the no-account case (superadmin) now lives in that helper rather than being spelled
+# out in the view, and /auth/users/me/ shares it.
 from .serializers import (
-    PasswordResetConfirmSerializer, SubscriptionStatusSerializer, VerifyEmailSerializer,
+    PasswordResetConfirmSerializer, VerifyEmailSerializer, subscription_payload,
 )
 from .throttles import (
-    PasswordResetRequestThrottle, PasswordResetVerifyThrottle, ResendCodeThrottle,
-    VerifyEmailThrottle,
+    AbandonRegistrationThrottle, PasswordResetRequestThrottle, PasswordResetVerifyThrottle,
+    ResendCodeThrottle, VerifyEmailThrottle,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,6 +42,35 @@ _ERROR_CODES = {
     ),
 }
 
+# The one error the SPA has to treat differently from every other 400 on these screens: the
+# account behind the request no longer exists, so there is nothing to retry and no session to
+# keep. It carries its own `code` so the frontend branches on that rather than on wording.
+REGISTRATION_EXPIRED = 'registration_expired'
+REGISTRATION_EXPIRED_DETAIL = (
+    'Your sign-up session has expired and the details you entered have been discarded. '
+    'Please start the sign-up process again.'
+)
+
+
+def _close_expired_registration(user):
+    """
+    Discard the caller's registration if its session is over, and return the 410 to send.
+
+    Returns None when there is nothing to close, so callers read as
+    `response = _close_expired_registration(...)` / `if response: return response`.
+
+    410 Gone, not 400: the resource this request is about has been deliberately destroyed and
+    will not come back. A 400 would be indistinguishable from a mistyped code, which is the
+    exact confusion this whole flow is meant to remove.
+    """
+    account = get_account(user)
+    if not registration.discard_if_expired(account):
+        return None
+    return Response(
+        {'detail': REGISTRATION_EXPIRED_DETAIL, 'code': REGISTRATION_EXPIRED},
+        status=status.HTTP_410_GONE,
+    )
+
 
 class SubscriptionStatusView(APIView):
     """What the SPA reads to decide which onboarding screen, if any, to show."""
@@ -44,20 +78,10 @@ class SubscriptionStatusView(APIView):
     permission_classes = ONBOARDING_PERMISSIONS
 
     def get(self, request):
-        account = get_account(request.user)
-        if account is None:
-            # Superadmins have no membership, and neither does a user whose provisioning
-            # failed. Reporting either as "unpaid" would send the platform owner to a paywall.
-            return Response({
-                'status': None,
-                'plan_type': '',
-                'expires_at': None,
-                'has_active_subscription': bool(request.user.is_superuser),
-                'business_name': '',
-                'phone': '',
-                'email': request.user.email,
-            })
-        return Response(SubscriptionStatusSerializer(account).data)
+        # Always re-read from the database, so a superadmin's manual override in the Django
+        # admin — activate, extend, revoke — shows up on the next fetch with nothing to
+        # invalidate. There is no cache here on purpose.
+        return Response(subscription_payload(request.user))
 
 
 class VerifyEmailView(APIView):
@@ -65,6 +89,13 @@ class VerifyEmailView(APIView):
     throttle_classes = [VerifyEmailThrottle]
 
     def post(self, request):
+        # Before the code is even looked at. A correct code arriving after the session has
+        # closed must not verify anything — otherwise the deadline is advisory, and an
+        # account could sit unverified indefinitely on the strength of one old email.
+        expired = _close_expired_registration(request.user)
+        if expired:
+            return expired
+
         serializer = VerifyEmailSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
@@ -79,12 +110,37 @@ class VerifyEmailView(APIView):
         if account and account.subscription_status == Account.PENDING_VERIFICATION:
             # Guarded rather than unconditional: re-verifying must never downgrade an account
             # that has since paid.
-            account.subscription_status = Account.PENDING_PAYMENT
-            account.save(update_fields=['subscription_status'])
+            #
+            # Verification is where the cardless trial actually begins. start_trial restamps
+            # trial_ends_at from now rather than honouring the value written at signup, so a
+            # customer who took three days to find the email still gets a full 14 — the
+            # signup value only exists so the column is never null.
+            #
+            # An account can be back at pending_verification with its trial already spent —
+            # an admin resetting the status, or a re-verification after a support fix. That
+            # must land on the paywall, not 500 and not hand out a second free fortnight.
+            try:
+                start_trial(account)
+            except TrialAlreadyUsed:
+                account.subscription_status = Account.PENDING_PAYMENT
+                account.save(update_fields=['subscription_status'])
 
+        if account and account.registration_expires_at is not None:
+            # Clearing this is what ends the sign-up session for good, and it is what makes
+            # the hard delete safe forever after: `is_pending_registration` needs both the
+            # status *and* this timestamp, so an admin who later resets a real customer to
+            # pending_verification cannot have their account swept. Cleared outside the
+            # status guard above, because a re-verification of an already-paid account
+            # should still close any session left behind.
+            account.registration_expires_at = None
+            account.save(update_fields=['registration_expires_at'])
+
+        log_auth_event('email_verified', request.user, account=getattr(account, 'pk', None))
+        # `subscription_status`, matching the name every other endpoint uses for this column.
+        # One name across the API is worth more than the shorter key here.
         return Response({
             'detail': 'Email verified.',
-            'status': account.subscription_status if account else None,
+            'subscription_status': account.subscription_status if account else None,
         })
 
 
@@ -93,6 +149,13 @@ class ResendCodeView(APIView):
     throttle_classes = [ResendCodeThrottle]
 
     def post(self, request):
+        # Same guard as verification: a resend after the session has closed would issue a
+        # code for an account that is about to stop existing, and would let someone hold a
+        # registration open forever by pressing the button.
+        expired = _close_expired_registration(request.user)
+        if expired:
+            return expired
+
         try:
             _, code = verification.issue_code(request.user)
         except verification.ResendThrottled as throttled:
@@ -111,6 +174,43 @@ class ResendCodeView(APIView):
         # Reports success even when the send failed. The user's only recourse is this same
         # button either way, and the distinction leaks nothing useful.
         return Response({'detail': 'A new code is on its way.'})
+
+
+class AbandonRegistrationView(APIView):
+    """
+    "Back to sign up": throw away an unverified registration on purpose.
+
+    The typo case is the reason this exists. Someone who mistypes their email cannot receive
+    the code, cannot verify, and — because auth_user.email is uniquely indexed — cannot
+    simply sign up again with the address they meant to use if the wrong row is still
+    holding it. Waiting an hour for the session to lapse is not a fix a user should have to
+    find on their own.
+
+    It deletes the caller's *own* pending registration and nothing else: `registration.discard`
+    refuses anything that has ever been verified, so a live account cannot be destroyed here
+    even if this view is called with one.
+    """
+
+    permission_classes = ONBOARDING_PERMISSIONS
+    throttle_classes = [AbandonRegistrationThrottle]
+
+    def post(self, request):
+        account = get_account(request.user)
+        try:
+            registration.discard(account, reason='abandoned_by_user')
+        except registration.NotDiscardable:
+            # 409, not 404: the account is real, it is simply past the point where throwing
+            # it away is something an endpoint may do.
+            return Response(
+                {
+                    'detail': (
+                        'This account has already been verified and cannot be discarded.'
+                    ),
+                    'code': 'not_pending_registration',
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response({'detail': 'Sign-up cancelled. You can start again.'})
 
 
 # Changing a password is not a paid feature, and someone who thinks their account is
@@ -208,6 +308,7 @@ class PasswordResetConfirmView(APIView):
             request.user.save(update_fields=['password'])
 
         revoked = _revoke_refresh_tokens(request.user)
+        log_auth_event('password_changed', request.user, sessions_revoked=revoked)
         return Response({
             'detail': 'Your password has been changed. Please sign in again.',
             'sessions_revoked': revoked,

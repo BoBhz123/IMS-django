@@ -1,3 +1,5 @@
+import math
+
 from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
 from django.core.validators import RegexValidator
@@ -13,28 +15,37 @@ class Account(models.Model):
 
     PENDING_VERIFICATION = 'pending_verification'
     PENDING_PAYMENT = 'pending_payment'
+    TRIALING = 'trialing'
     ACTIVE = 'active'
     PAST_DUE = 'past_due'
     CANCELED = 'canceled'
     SUBSCRIPTION_STATUS_CHOICES = [
         (PENDING_VERIFICATION, 'Pending email verification'),
         (PENDING_PAYMENT, 'Pending payment'),
+        (TRIALING, 'Free trial'),
         (ACTIVE, 'Active'),
         (PAST_DUE, 'Past due'),
         (CANCELED, 'Canceled'),
     ]
 
     MONTHLY = 'monthly'
+    ANNUAL = 'annual'
     ONE_TIME = 'one_time'
     PLAN_TYPE_CHOICES = [
         (MONTHLY, 'Monthly subscription'),
+        (ANNUAL, 'Annual subscription'),
         (ONE_TIME, 'One-time licence (lifetime)'),
     ]
 
-    # The only status that grants access. There is deliberately no trial status: a trial is
-    # by definition a free bypass of the payment wall. The pending_* states mean "signed up
-    # but not onboarded"; past_due and canceled mean "stop serving".
-    LIVE_STATUSES = (ACTIVE,)
+    # How long a cardless trial runs. One place, because the signup serializer, the admin's
+    # reset action, and the tests all have to agree on it.
+    TRIAL_DAYS = 14
+
+    # The statuses that can grant access. `trialing` is a deliberate reversal of the Phase
+    # 2.5a decision to have no trial at all — the business chose cardless acquisition over a
+    # hard wall. Note it is *can* grant, not *does*: liveness is still computed below, so a
+    # trialing row whose trial_ends_at has passed is as locked out as a canceled one.
+    LIVE_STATUSES = (ACTIVE, TRIALING)
 
     name = models.CharField(max_length=255)
     phone = models.CharField(
@@ -57,6 +68,38 @@ class Account(models.Model):
         max_length=20, choices=PLAN_TYPE_CHOICES, blank=True, default='',
     )
     expires_at = models.DateTimeField(null=True, blank=True)
+    # Separate from expires_at on purpose. Collapsing both into one column would make a
+    # lapsed trial indistinguishable from a lapsed paid subscription, and those are different
+    # sales conversations — and reactivating a paid account would silently hand back a trial.
+    trial_ends_at = models.DateTimeField(null=True, blank=True)
+    # Latched on the first trial and never cleared by ordinary code, so one account gets one
+    # free trial. A null trial_ends_at cannot stand in for this: activating a paid plan leaves
+    # the old trial date behind, and clearing it (as the revoke action does) would otherwise
+    # hand the account a fresh fortnight for free.
+    has_used_trial = models.BooleanField(
+        default=False,
+        help_text='Set the first time a trial starts. Blocks a second free trial.',
+    )
+    # When the whole unverified sign-up closes out. Stamped at registration and cleared the
+    # moment the email is verified, which is what makes it safe to hard-delete on: a NULL
+    # here means "this account has been through verification at least once", so an admin who
+    # puts a real customer back to pending_verification can never have their rows swept.
+    # Deriving the deadline from created_at instead would delete exactly that customer.
+    registration_expires_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text=(
+            'Deadline for an unverified sign-up. Cleared on verification; a NULL value '
+            'means this account is not a pending registration.'
+        ),
+    )
+
+    # Set by the Paddle webhook so a renewal or cancellation can find its way back to the
+    # right row. Blank for accounts activated by discount key, cash, or the admin.
+    paddle_customer_id = models.CharField(max_length=64, blank=True, default='', db_index=True)
+    paddle_subscription_id = models.CharField(
+        max_length=64, blank=True, default='', db_index=True,
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -73,10 +116,81 @@ class Account(models.Model):
         No scheduled job flips 'active' to 'past_due' when expires_at passes, so the column
         goes stale the moment a subscription lapses. Deriving liveness here means the
         permission class, the admin, and any future billing webhook cannot disagree.
+
+        A trial reads its own clock: trial_ends_at, not expires_at. A trialing row with no
+        trial_ends_at is not live — an unbounded free trial is the one failure mode a
+        payment wall cannot survive, so the null case denies rather than allows.
         """
         if self.subscription_status not in self.LIVE_STATUSES:
             return False
+        if self.subscription_status == self.TRIALING:
+            return self.trial_ends_at is not None and self.trial_ends_at > timezone.now()
         return self.expires_at is None or self.expires_at > timezone.now()
+
+    @property
+    def is_trialing(self):
+        return self.subscription_status == self.TRIALING and self.has_active_subscription
+
+    @property
+    def is_pending_registration(self):
+        """
+        Whether this row is an unverified sign-up that has never completed.
+
+        Both halves matter. The status alone is not enough — an admin can put a paying
+        customer back to pending_verification — and the timestamp alone is not enough
+        either, since it is only cleared on the *first* verification.
+        """
+        return (
+            self.subscription_status == self.PENDING_VERIFICATION
+            and self.registration_expires_at is not None
+        )
+
+    @property
+    def registration_session_expired(self):
+        """
+        Computed, for the same reason `has_active_subscription` is: nothing sweeps this
+        column on a schedule, so the row survives its own deadline until something asks.
+
+        False for anything that is not a pending registration, so a verified or paid account
+        can never read as an expired sign-up.
+        """
+        if not self.is_pending_registration:
+            return False
+        return self.registration_expires_at <= timezone.now()
+
+    @property
+    def payment_method(self):
+        """
+        How this account is paying, as a coarse label for the UI.
+
+        Inferred rather than stored: there is no payment_method column, and adding one would
+        mean every activation path has to remember to set it. The Paddle ids are written only
+        by the webhook, so their presence is a reliable signal that a card is on file;
+        anything else that reached `active` got there by key, cash, Whish, or an admin, all
+        of which are the same thing to the customer reading this — a manual activation.
+        """
+        if self.subscription_status == self.TRIALING:
+            return 'trial'
+        if self.paddle_customer_id or self.paddle_subscription_id:
+            return 'card'
+        if self.subscription_status == self.ACTIVE:
+            return 'manual'
+        return ''
+
+    @property
+    def trial_days_remaining(self):
+        """
+        Whole days left, rounded up, or None when there is no live trial.
+
+        Rounded up so the last partial day reads as "1 day left" rather than "0" — a banner
+        that says zero while the app still works reads as a bug to the person seeing it.
+        """
+        if not self.trial_ends_at:
+            return None
+        seconds = (self.trial_ends_at - timezone.now()).total_seconds()
+        if seconds <= 0:
+            return 0
+        return math.ceil(seconds / 86400)
 
 
 class Membership(models.Model):
@@ -235,6 +349,108 @@ class DiscountKey(models.Model):
         if self.expires_at and self.expires_at <= now:
             return False
         return self.redemption_count < self.max_redemptions
+
+
+class UserPaymentRecord(models.Model):
+    """
+    An encrypted note of how somebody paid.
+
+    **This is not a card vault and must never become one.** Paddle is the merchant of record;
+    it holds the card and this app never sees a PAN. What lands here is the human detail a
+    cash or Whish sale leaves behind — "Whish, ref 88213, paid at the shop" — which is
+    ordinary business record-keeping that nonetheless names a customer and a transaction, and
+    so is worth encrypting at rest. Storing a real card number here would put this app in PCI
+    scope, which is the entire thing Paddle was chosen to avoid.
+
+    Encryption is Fernet (AES-128-CBC + HMAC), so a database dump alone is useless without
+    the key. Be clear about the threat model: the key lives in the application's environment,
+    so anything that can run this code can decrypt. This defends against a leaked backup, a
+    misconfigured replica, or a support user reading the table — not against a compromised
+    server.
+    """
+
+    CASH = 'cash'
+    WHISH = 'whish'
+    OMT = 'omt'
+    CARD = 'card'
+    OTHER = 'other'
+    METHOD_CHOICES = [
+        (CASH, 'Cash'),
+        (WHISH, 'Whish Money'),
+        (OMT, 'OMT'),
+        (CARD, 'Card (via Paddle)'),
+        (OTHER, 'Other'),
+    ]
+
+    account = models.ForeignKey(
+        Account, on_delete=models.CASCADE, related_name='payment_records',
+    )
+    user = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='payment_records',
+        help_text='Who recorded this, when it was entered by hand.',
+    )
+    # Deliberately in the clear: this is the column reporting groups by, and knowing a sale
+    # was cash is not sensitive. The identifying detail goes in the encrypted field.
+    method = models.CharField(max_length=16, choices=METHOD_CHOICES, default=CASH)
+    amount_usd = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+
+    # Ciphertext. Never read this directly — use the `details` property, which is the only
+    # thing that knows the key.
+    encrypted_details = models.BinaryField(blank=True, default=b'')
+
+    reference = models.CharField(
+        max_length=64, blank=True, default='',
+        help_text='Non-sensitive lookup handle, e.g. a receipt number. Stored in the clear.',
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['account', '-created_at'], name='payrec_account_created_idx'),
+        ]
+
+    def __str__(self):
+        return f'{self.get_method_display()} ${self.amount_usd} — {self.account.name}'
+
+    @property
+    def details(self):
+        """
+        The decrypted note, or a placeholder when the key cannot open it.
+
+        Returns a marker rather than raising: a rotated or missing key must not make the
+        admin changelist 500 for every row at once. The failure is visible in the value.
+        """
+        from .crypto import decrypt_text
+        return decrypt_text(self.encrypted_details)
+
+    @details.setter
+    def details(self, value):
+        from .crypto import encrypt_text
+        self.encrypted_details = encrypt_text(value)
+
+
+class ProcessedWebhookEvent(models.Model):
+    """
+    One row per gateway event we have already acted on.
+
+    Paddle retries a notification until it gets a 2xx, and a retry that re-runs activation
+    would extend expires_at a second time — the customer pays for one month and gets two.
+    The unique event_id is what makes handling idempotent: the insert is attempted first and
+    an IntegrityError means "already done", which is race-free in a way that
+    check-then-insert is not.
+    """
+
+    event_id = models.CharField(max_length=128, unique=True)
+    event_type = models.CharField(max_length=64)
+    received_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ['-received_at']
+
+    def __str__(self):
+        return f'{self.event_type} ({self.event_id})'
 
 
 class DiscountKeyRedemption(models.Model):

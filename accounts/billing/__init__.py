@@ -3,9 +3,11 @@ from django.core.exceptions import ImproperlyConfigured
 
 from .base import PLAN_KEYS, BillingProvider, ProviderUnavailable, UnknownPlan
 from .dummy import DummyProvider
+from .paddle import PaddleProvider
 
 __all__ = [
-    'PLAN_KEYS', 'BillingProvider', 'ProviderUnavailable', 'UnknownPlan', 'get_provider',
+    'PLAN_KEYS', 'BillingProvider', 'PaddleProvider', 'ProviderUnavailable', 'UnknownPlan',
+    'get_provider',
 ]
 
 
@@ -15,9 +17,5 @@ def get_provider():
     if configured == 'dummy':
         return DummyProvider()
     if configured == 'paddle':
-        raise ImproperlyConfigured(
-            "BILLING_PROVIDER='paddle' is not implemented yet — Paddle checkout lands in "
-            'Phase 2.5b-2, once seller approval comes through. Use the dummy provider and '
-            'discount keys until then.'
-        )
+        return PaddleProvider()
     raise ImproperlyConfigured(f'Unknown BILLING_PROVIDER: {configured!r}')

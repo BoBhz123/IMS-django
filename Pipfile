@@ -4,6 +4,9 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
+# Direct dependency since accounts/crypto.py: Fernet for the payment-record field encryption.
+# Added by hand rather than via pipenv install, which relocks everything (see CLAUDE.md).
+cryptography = "*"
 django = "*"
 django-debug-toolbar = "*"
 djangorestframework = "*"

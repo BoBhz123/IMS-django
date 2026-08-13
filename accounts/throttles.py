@@ -36,6 +36,28 @@ class PasswordResetVerifyThrottle(ScopedRateThrottle):
     scope = 'password_reset_verify'
 
 
+class AbandonRegistrationThrottle(ScopedRateThrottle):
+    """
+    Keyed on the client address, deliberately — not on the user.
+
+    Discarding a registration frees the email address, so sign-up → code → abandon → sign-up
+    is a loop that can mail the *same* victim address repeatedly. The per-user caps in
+    accounts.verification cannot see it, because every pass through the loop creates a brand
+    new user row and therefore a brand new budget. The address is the only identifier that
+    survives the loop, so it is the one this counts.
+
+    The rate only has to accommodate a human fixing a typo, which is once or twice.
+    """
+
+    scope = 'abandon_registration'
+
+    def get_cache_key(self, request, view):
+        return self.cache_format % {
+            'scope': self.scope,
+            'ident': self.get_ident(request),
+        }
+
+
 class RedeemKeyThrottle(ScopedRateThrottle):
     """
     The key space is about 10^17, so this is not the primary defence — it exists so a
