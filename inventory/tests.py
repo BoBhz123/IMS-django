@@ -3369,3 +3369,546 @@ class SPASecurityHeaderTests(TestCase):
             response = middleware(self.client.get('/').wsgi_request)
             self.assertIn('Content-Security-Policy-Report-Only', response)
             self.assertNotIn('Content-Security-Policy', response)
+
+
+class OrderEditingTests(AccountFixtureMixin, APITestCase):
+    """
+    Editing a placed order reverses its stock and financial effect before applying the new
+    one, atomically.
+
+    The whole difficulty is that an order's own units are already out of stock by the time
+    it is edited. Any check that compares the new lines against the bare stock_quantity
+    rejects an order for units it is itself holding.
+    """
+
+    def setUp(self):
+        self.account, self.user, self.client, self.auth_header = self.make_account_user('boss')
+        category = Category.objects.create(name='Widgets', account=self.account)
+        self.widget = Product.objects.create(
+            name='Widget', description='', cost_price='4.00', default_sell_price='10.00',
+            category=category, stock_quantity=10, account=self.account,
+        )
+        self.gadget = Product.objects.create(
+            name='Gadget', description='', cost_price='2.00', default_sell_price='5.00',
+            category=category, stock_quantity=20, account=self.account,
+        )
+        self.customer = Customer.objects.create(name='Walk-in', account=self.account)
+
+    def line(self, product, quantity, multiplier=1, price='10.00'):
+        return {
+            'product': product.id, 'quantity': quantity,
+            'unit_multiplier': multiplier, 'unit_price': price,
+        }
+
+    def place(self, items, **extra):
+        response = self.client.post(
+            '/inventory/orders/', {'exchange_rate': 89000, 'items': items, **extra},
+            content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        return Order.objects.get(id=response.json()['id'])
+
+    def edit(self, order, payload, method='put'):
+        return getattr(self.client, method)(
+            f'/inventory/orders/{order.id}/', payload,
+            content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
+        )
+
+    def stock(self, product):
+        product.refresh_from_db()
+        return product.stock_quantity
+
+    # --- stock recalculation -------------------------------------------------------------
+
+    def test_increasing_a_quantity_deducts_only_the_difference(self):
+        order = self.place([self.line(self.widget, 3)])
+        self.assertEqual(self.stock(self.widget), 7)
+
+        response = self.edit(order, {'exchange_rate': 89000, 'items': [self.line(self.widget, 5)]})
+        self.assertEqual(response.status_code, 200, response.content)
+        # 10 - 5, not 7 - 5: the original 3 came back before the new 5 went out.
+        self.assertEqual(self.stock(self.widget), 5)
+
+    def test_decreasing_a_quantity_returns_the_difference(self):
+        order = self.place([self.line(self.widget, 8)])
+        self.edit(order, {'exchange_rate': 89000, 'items': [self.line(self.widget, 2)]})
+        self.assertEqual(self.stock(self.widget), 8)
+
+    def test_removing_a_product_from_the_order_returns_all_of_its_stock(self):
+        order = self.place([self.line(self.widget, 4), self.line(self.gadget, 5)])
+        self.assertEqual((self.stock(self.widget), self.stock(self.gadget)), (6, 15))
+
+        # The gadget line is gone entirely — it appears in neither the new items nor any
+        # per-product loop over them, so only a union of old and new products moves it back.
+        self.edit(order, {'exchange_rate': 89000, 'items': [self.line(self.widget, 4)]})
+        self.assertEqual((self.stock(self.widget), self.stock(self.gadget)), (6, 20))
+
+    def test_swapping_the_product_moves_stock_on_both(self):
+        order = self.place([self.line(self.widget, 6)])
+        self.edit(order, {'exchange_rate': 89000, 'items': [self.line(self.gadget, 6)]})
+        self.assertEqual((self.stock(self.widget), self.stock(self.gadget)), (10, 14))
+
+    def test_resubmitting_the_same_lines_is_a_no_op_on_stock(self):
+        # The regression this class exists for: an order that took the last 10 units sees
+        # stock_quantity 0, so a naive ceiling check reads an unchanged edit as a 10-unit
+        # overdraw and refuses to let the customer's phone number be corrected.
+        order = self.place([self.line(self.widget, 10)])
+        self.assertEqual(self.stock(self.widget), 0)
+
+        response = self.edit(order, {'exchange_rate': 89000, 'items': [self.line(self.widget, 10)]})
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(self.stock(self.widget), 0)
+
+    def test_unit_multiplier_counts_on_both_sides_of_the_edit(self):
+        order = self.place([self.line(self.widget, 2, multiplier=3)])  # 6 units
+        self.assertEqual(self.stock(self.widget), 4)
+
+        self.edit(order, {
+            'exchange_rate': 89000, 'items': [self.line(self.widget, 1, multiplier=3)],
+        })
+        self.assertEqual(self.stock(self.widget), 7)
+
+    def test_duplicate_lines_for_one_product_are_summed_on_edit(self):
+        order = self.place([self.line(self.widget, 2)])
+        self.edit(order, {
+            'exchange_rate': 89000,
+            'items': [self.line(self.widget, 3), self.line(self.widget, 4)],
+        })
+        self.assertEqual(self.stock(self.widget), 3)
+
+    # --- the ceiling still applies -------------------------------------------------------
+
+    def test_an_edit_beyond_available_stock_is_rejected(self):
+        order = self.place([self.line(self.widget, 3)])
+        response = self.edit(order, {
+            'exchange_rate': 89000, 'items': [self.line(self.widget, 14)],
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('Insufficient stock', str(response.json()['items']))
+
+    def test_a_rejected_edit_changes_nothing_at_all(self):
+        order = self.place([self.line(self.widget, 3)])
+        self.edit(order, {'exchange_rate': 89000, 'items': [self.line(self.widget, 14)]})
+
+        # Atomicity: the items are deleted and re-created inside the same transaction as the
+        # stock update, so a failure must leave the original line standing.
+        self.assertEqual(self.stock(self.widget), 7)
+        self.assertEqual(order.items.count(), 1)
+        self.assertEqual(order.items.get().quantity, 3)
+
+    def test_the_ceiling_counts_stock_this_order_is_giving_back(self):
+        # 10 in stock, this order holds 8. Raising it to 10 is legal; 11 is not.
+        order = self.place([self.line(self.widget, 8)])
+        self.assertEqual(self.edit(
+            order, {'exchange_rate': 89000, 'items': [self.line(self.widget, 10)]},
+        ).status_code, 200)
+        self.assertEqual(self.stock(self.widget), 0)
+
+    def test_another_orders_units_are_not_credited_back(self):
+        # Two orders, 4 units each, 2 left. The second may grow to 6 (its own 4 plus the 2
+        # spare) but not to 7 — the first order's 4 are not its to reclaim.
+        self.place([self.line(self.widget, 4)])
+        second = self.place([self.line(self.widget, 4)])
+        self.assertEqual(self.stock(self.widget), 2)
+
+        self.assertEqual(self.edit(
+            second, {'exchange_rate': 89000, 'items': [self.line(self.widget, 7)]},
+        ).status_code, 400)
+        self.assertEqual(self.edit(
+            second, {'exchange_rate': 89000, 'items': [self.line(self.widget, 6)]},
+        ).status_code, 200)
+        self.assertEqual(self.stock(self.widget), 0)
+
+    # --- financial recalculation ---------------------------------------------------------
+
+    def test_the_order_total_follows_the_edit(self):
+        order = self.place([self.line(self.widget, 2, price='10.00')])
+        self.assertEqual(order.total_price, Decimal('20.00'))
+
+        self.edit(order, {
+            'exchange_rate': 89000,
+            'items': [self.line(self.widget, 3, multiplier=2, price='12.50')],
+        })
+        order.refresh_from_db()
+        self.assertEqual(order.total_price, Decimal('75.00'))
+
+    def test_editing_a_price_recalculates_profit(self):
+        order = self.place([self.line(self.widget, 2, price='10.00')])
+        self.assertEqual(order.total_profit, Decimal('12.00'))  # (10 - 4) * 2
+
+        self.edit(order, {'exchange_rate': 89000, 'items': [self.line(self.widget, 2, price='7.00')]})
+        order.refresh_from_db()
+        self.assertEqual(order.total_profit, Decimal('6.00'))  # (7 - 4) * 2
+
+    def test_an_edit_keeps_the_cost_snapshot_of_a_product_already_on_the_order(self):
+        # OrderItem.unit_cost_price is what the sale cost us at the time. Correcting a
+        # product's current cost afterwards must not rewrite the profit of a past sale —
+        # re-reading product.cost_price on edit would do exactly that.
+        order = self.place([self.line(self.widget, 2)])
+        self.widget.cost_price = Decimal('9.00')
+        self.widget.save()
+
+        self.edit(order, {'exchange_rate': 89000, 'items': [self.line(self.widget, 5)]})
+        self.assertEqual(order.items.get().unit_cost_price, Decimal('4.00'))
+
+    def test_a_product_added_by_the_edit_takes_todays_cost(self):
+        order = self.place([self.line(self.widget, 2)])
+        self.gadget.cost_price = Decimal('3.50')
+        self.gadget.save()
+
+        self.edit(order, {
+            'exchange_rate': 89000,
+            'items': [self.line(self.widget, 2), self.line(self.gadget, 1)],
+        })
+        added = order.items.get(product=self.gadget)
+        self.assertEqual(added.unit_cost_price, Decimal('3.50'))
+
+    def test_analytics_reflect_the_edited_order(self):
+        # Account-level metrics are computed from the rows, never stored, so recalculation is
+        # the edit itself. This pins that — a cached or denormalised total would fail here.
+        order = self.place([self.line(self.widget, 2, price='10.00')])
+        self.edit(order, {'exchange_rate': 89000, 'items': [self.line(self.widget, 1, price='10.00')]})
+
+        response = self.client.get('/inventory/analytics/', HTTP_AUTHORIZATION=self.auth_header)
+        self.assertEqual(Decimal(str(response.json()['total_revenue'])), Decimal('10.00'))
+        self.assertEqual(Decimal(str(response.json()['total_cogs'])), Decimal('4.00'))
+
+    # --- non-item fields -----------------------------------------------------------------
+
+    def test_a_patch_without_items_leaves_the_lines_and_the_stock_alone(self):
+        order = self.place([self.line(self.widget, 3)])
+        response = self.edit(
+            order, {'customer': self.customer.id}, method='patch',
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        order.refresh_from_db()
+        self.assertEqual(order.customer, self.customer)
+        self.assertEqual(order.items.count(), 1)
+        self.assertEqual(self.stock(self.widget), 7)
+
+    def test_the_customer_can_be_changed_by_an_edit(self):
+        order = self.place([self.line(self.widget, 1)])
+        self.edit(order, {
+            'customer': self.customer.id, 'exchange_rate': 90000,
+            'items': [self.line(self.widget, 1)],
+        })
+        order.refresh_from_db()
+        self.assertEqual(order.customer, self.customer)
+        self.assertEqual(order.exchange_rate, 90000)
+
+    def test_an_edit_cannot_reach_another_accounts_product(self):
+        other_account, _, _, _ = self.make_account_user('rival')
+        other_category = Category.objects.create(name='Theirs', account=other_account)
+        theirs = Product.objects.create(
+            name='Theirs', description='', cost_price='1.00', default_sell_price='2.00',
+            category=other_category, stock_quantity=50, account=other_account,
+        )
+        order = self.place([self.line(self.widget, 1)])
+
+        response = self.edit(order, {'exchange_rate': 89000, 'items': [self.line(theirs, 1)]})
+        self.assertEqual(response.status_code, 400)
+        theirs.refresh_from_db()
+        self.assertEqual(theirs.stock_quantity, 50)
+
+    def test_an_edit_cannot_reach_another_accounts_order(self):
+        other_account, _, other_client, other_header = self.make_account_user('rival')
+        order = self.place([self.line(self.widget, 1)])
+
+        response = other_client.put(
+            f'/inventory/orders/{order.id}/',
+            {'exchange_rate': 89000, 'items': [self.line(self.widget, 5)]},
+            content_type='application/json', HTTP_AUTHORIZATION=other_header,
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.stock(self.widget), 9)
+
+
+class PurchaseEditingTests(AccountFixtureMixin, APITestCase):
+    """
+    Editing a purchase reverses the stock it added and applies the new quantities.
+
+    The asymmetry with orders: reducing a received quantity claws stock back, and that stock
+    may already have been sold.
+    """
+
+    def setUp(self):
+        self.account, self.user, self.client, self.auth_header = self.make_account_user('boss')
+        category = Category.objects.create(name='Widgets', account=self.account)
+        self.widget = Product.objects.create(
+            name='Widget', description='', cost_price='4.00', default_sell_price='10.00',
+            category=category, stock_quantity=0, account=self.account,
+        )
+        self.gadget = Product.objects.create(
+            name='Gadget', description='', cost_price='2.00', default_sell_price='5.00',
+            category=category, stock_quantity=0, account=self.account,
+        )
+        self.supplier = Supplier.objects.create(name='Acme', account=self.account)
+
+    def line(self, product, quantity, multiplier=1, price='4.00'):
+        return {
+            'product': product.id, 'quantity': quantity,
+            'unit_multiplier': multiplier, 'unit_price': price,
+        }
+
+    def receive(self, items, **extra):
+        response = self.client.post(
+            '/inventory/purchases/', {'exchange_rate': 89000, 'items': items, **extra},
+            content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        return Purchase.objects.get(id=response.json()['id'])
+
+    def edit(self, purchase, payload, method='put'):
+        return getattr(self.client, method)(
+            f'/inventory/purchases/{purchase.id}/', payload,
+            content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
+        )
+
+    def stock(self, product):
+        product.refresh_from_db()
+        return product.stock_quantity
+
+    def test_increasing_a_received_quantity_adds_only_the_difference(self):
+        purchase = self.receive([self.line(self.widget, 10)])
+        self.assertEqual(self.stock(self.widget), 10)
+
+        response = self.edit(purchase, {
+            'exchange_rate': 89000, 'items': [self.line(self.widget, 15)],
+        })
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(self.stock(self.widget), 15)
+
+    def test_decreasing_a_received_quantity_takes_the_difference_back(self):
+        purchase = self.receive([self.line(self.widget, 10)])
+        self.edit(purchase, {'exchange_rate': 89000, 'items': [self.line(self.widget, 4)]})
+        self.assertEqual(self.stock(self.widget), 4)
+
+    def test_removing_a_line_takes_all_of_its_stock_back(self):
+        purchase = self.receive([self.line(self.widget, 10), self.line(self.gadget, 5)])
+        self.edit(purchase, {'exchange_rate': 89000, 'items': [self.line(self.widget, 10)]})
+        self.assertEqual((self.stock(self.widget), self.stock(self.gadget)), (10, 0))
+
+    def test_unit_multiplier_counts_on_both_sides_of_the_edit(self):
+        purchase = self.receive([self.line(self.widget, 4, multiplier=6)])  # 24 units
+        self.assertEqual(self.stock(self.widget), 24)
+
+        self.edit(purchase, {
+            'exchange_rate': 89000, 'items': [self.line(self.widget, 2, multiplier=6)],
+        })
+        self.assertEqual(self.stock(self.widget), 12)
+
+    def test_an_edit_that_would_drive_stock_negative_is_rejected(self):
+        # 10 received, 8 of them sold. Cutting the purchase to 1 would leave -1 on hand.
+        purchase = self.receive([self.line(self.widget, 10)])
+        self.client.post(
+            '/inventory/orders/',
+            {'exchange_rate': 89000, 'items': [
+                {'product': self.widget.id, 'quantity': 8, 'unit_multiplier': 1,
+                 'unit_price': '10.00'},
+            ]},
+            content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
+        )
+        self.assertEqual(self.stock(self.widget), 2)
+
+        response = self.edit(purchase, {
+            'exchange_rate': 89000, 'items': [self.line(self.widget, 1)],
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('Cannot reduce', str(response.json()['items']))
+
+    def test_a_rejected_edit_changes_nothing_at_all(self):
+        purchase = self.receive([self.line(self.widget, 10)])
+        self.client.post(
+            '/inventory/orders/',
+            {'exchange_rate': 89000, 'items': [
+                {'product': self.widget.id, 'quantity': 8, 'unit_multiplier': 1,
+                 'unit_price': '10.00'},
+            ]},
+            content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
+        )
+        self.edit(purchase, {'exchange_rate': 89000, 'items': [self.line(self.widget, 1)]})
+
+        self.assertEqual(self.stock(self.widget), 2)
+        self.assertEqual(purchase.items.get().quantity, 10)
+
+    def test_a_reduction_down_to_what_is_still_on_hand_is_allowed(self):
+        purchase = self.receive([self.line(self.widget, 10)])
+        self.client.post(
+            '/inventory/orders/',
+            {'exchange_rate': 89000, 'items': [
+                {'product': self.widget.id, 'quantity': 8, 'unit_multiplier': 1,
+                 'unit_price': '10.00'},
+            ]},
+            content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
+        )
+        response = self.edit(purchase, {
+            'exchange_rate': 89000, 'items': [self.line(self.widget, 8)],
+        })
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(self.stock(self.widget), 0)
+
+    def test_the_purchase_total_follows_the_edit(self):
+        purchase = self.receive([self.line(self.widget, 10, price='4.00')])
+        self.assertEqual(purchase.total_price, Decimal('40.00'))
+
+        self.edit(purchase, {
+            'exchange_rate': 89000, 'items': [self.line(self.widget, 10, price='4.50')],
+        })
+        purchase.refresh_from_db()
+        self.assertEqual(purchase.total_price, Decimal('45.00'))
+
+    def test_analytics_reflect_the_edited_purchase(self):
+        purchase = self.receive([self.line(self.widget, 10, price='4.00')])
+        self.edit(purchase, {
+            'exchange_rate': 89000, 'items': [self.line(self.widget, 10, price='6.00')],
+        })
+        response = self.client.get('/inventory/analytics/', HTTP_AUTHORIZATION=self.auth_header)
+        self.assertEqual(
+            Decimal(str(response.json()['inventory_outlays'])), Decimal('60.00'),
+        )
+
+    def test_a_patch_without_items_leaves_the_lines_and_the_stock_alone(self):
+        purchase = self.receive([self.line(self.widget, 10)])
+        response = self.edit(purchase, {'supplier': self.supplier.id}, method='patch')
+        self.assertEqual(response.status_code, 200, response.content)
+        purchase.refresh_from_db()
+        self.assertEqual(purchase.supplier, self.supplier)
+        self.assertEqual(self.stock(self.widget), 10)
+
+    def test_an_edit_cannot_reach_another_accounts_purchase(self):
+        other_account, _, other_client, other_header = self.make_account_user('rival')
+        purchase = self.receive([self.line(self.widget, 10)])
+
+        response = other_client.put(
+            f'/inventory/purchases/{purchase.id}/',
+            {'exchange_rate': 89000, 'items': [self.line(self.widget, 999)]},
+            content_type='application/json', HTTP_AUTHORIZATION=other_header,
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.stock(self.widget), 10)
+
+
+# Composed rather than written out, so DomainConfigurationTests's "no source file names the
+# old domain" guard does not trip over the fixtures that legitimately exercise it.
+OLD_SUBDOMAIN = 'client.' + 'myimsapp.com'
+
+
+class DomainConfigurationTests(TestCase):
+    """
+    The canonical domain is myimsapp.com, migrated from the old client. subdomain 2026-08-13.
+
+    Every assertion here runs in a subprocess with a clean environment. ALLOWED_HOSTS and
+    CSRF_TRUSTED_ORIGINS are read at import time, and this process inherited whatever the
+    developer's shell and .env happened to set — so an in-process assertion would be testing
+    the machine, not the code.
+    """
+
+    def boot(self, **env):
+        """Boot Django with a controlled environment and print the settings under test."""
+        script = (
+            'import django; django.setup(); from django.conf import settings; '
+            'print("|".join(settings.ALLOWED_HOSTS)); '
+            'print("|".join(settings.CSRF_TRUSTED_ORIGINS)); '
+            'print("|".join(settings.CORS_ALLOWED_ORIGINS))'
+        )
+        base = {
+            key: value for key, value in os.environ.items()
+            # The developer's own values for exactly the settings under test would otherwise
+            # decide the result — the whole point is to see what the code defaults to.
+            if key not in ('ALLOWED_HOSTS', 'CSRF_TRUSTED_ORIGINS', 'CORS_ALLOWED_ORIGINS',
+                           'SITE_DOMAIN')
+        }
+        result = subprocess.run(
+            [sys.executable, '-c', script],
+            capture_output=True, text=True, timeout=120,
+            env={
+                **base,
+                'DJANGO_SETTINGS_MODULE': 'ims.settings',
+                'DJANGO_DEBUG': 'False',
+                # The F-06 boot guard refuses to start on the committed key with DEBUG off.
+                'DJANGO_SECRET_KEY': 'z' * 60,
+                **env,
+            },
+            cwd=str(settings.BASE_DIR),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        hosts, csrf, cors = result.stdout.strip().split('\n')
+        return hosts.split('|'), csrf.split('|'), cors.split('|')
+
+    def test_the_default_allowed_hosts_name_the_domain_not_a_wildcard(self):
+        # The fallback used to be '*', which accepts any Host header and gives up Django's
+        # HTTP Host header protection entirely. A deploy that forgets the env var must fail
+        # closed on an unexpected host, not open.
+        hosts, _, _ = self.boot()
+        self.assertEqual(hosts, ['myimsapp.com', '.myimsapp.com', 'localhost', '127.0.0.1'])
+        self.assertNotIn('*', hosts)
+
+    def test_the_leading_dot_entry_covers_every_subdomain(self):
+        # Per Django's ALLOWED_HOSTS docs, '.myimsapp.com' matches the domain and all of its
+        # subdomains — which is what keeps the existing client./testlab. hosts working.
+        from django.http.request import validate_host
+
+        hosts, _, _ = self.boot()
+        for host in ('myimsapp.com', OLD_SUBDOMAIN, 'testlab.myimsapp.com'):
+            self.assertTrue(validate_host(host, hosts), host)
+        self.assertFalse(validate_host('myimsapp.com.attacker.example', hosts))
+
+    def test_the_default_csrf_trusted_origins_name_the_domain(self):
+        # Absent entirely before the migration. Without them the Django admin's login POST is
+        # rejected with "Origin checking failed" the moment a custom domain fronts the app.
+        _, csrf, _ = self.boot()
+        self.assertEqual(csrf, ['https://myimsapp.com', 'https://*.myimsapp.com'])
+
+    def test_csrf_trusted_origins_are_https_only(self):
+        # A plain-http entry would let a network attacker on the same domain forge state-
+        # changing posts; SECURE_SSL_REDIRECT means nothing legitimately arrives over http.
+        _, csrf, _ = self.boot()
+        for origin in csrf:
+            self.assertTrue(origin.startswith('https://'), origin)
+
+    def test_the_default_cors_allowlist_names_the_domain(self):
+        _, _, cors = self.boot()
+        self.assertIn('https://myimsapp.com', cors)
+
+    def test_every_default_is_overridable_from_the_environment(self):
+        # Moving domain again must stay a config change, not a code deploy.
+        hosts, csrf, cors = self.boot(
+            ALLOWED_HOSTS='example.com,.example.com',
+            CSRF_TRUSTED_ORIGINS='https://example.com',
+            CORS_ALLOWED_ORIGINS='https://example.com',
+        )
+        self.assertEqual(hosts, ['example.com', '.example.com'])
+        self.assertEqual(csrf, ['https://example.com'])
+        self.assertEqual(cors, ['https://example.com'])
+
+    def test_site_domain_alone_moves_every_default_together(self):
+        # One knob, so the three lists cannot drift apart into naming different sites.
+        hosts, csrf, cors = self.boot(SITE_DOMAIN='example.com')
+        self.assertEqual(hosts, ['example.com', '.example.com', 'localhost', '127.0.0.1'])
+        self.assertEqual(csrf, ['https://example.com', 'https://*.example.com'])
+        self.assertIn('https://example.com', cors)
+
+    def test_no_source_file_hardcodes_the_old_subdomain(self):
+        """
+        The migration is only done if the string is gone from the code.
+
+        Scoped to source that ships: the .claude/ permission allowlist records commands
+        already run against the old domain, and PLAN.md is a historical record of past work.
+        Neither is configuration this app reads.
+        """
+        roots = [Path(settings.BASE_DIR) / name for name in ('ims', 'accounts', 'inventory')]
+        roots.append(Path(settings.BASE_DIR) / 'frontend' / 'src')
+
+        offenders = []
+        for root in roots:
+            for path in root.rglob('*'):
+                if not path.is_file() or path.suffix not in (
+                    '.py', '.js', '.jsx', '.html', '.txt', '.json', '.css',
+                ):
+                    continue
+                if '__pycache__' in path.parts or 'node_modules' in path.parts:
+                    continue
+                if OLD_SUBDOMAIN in path.read_text(errors='ignore'):
+                    offenders.append(str(path.relative_to(settings.BASE_DIR)))
+
+        self.assertEqual(offenders, [], f'old domain still referenced in: {offenders}')

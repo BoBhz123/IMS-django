@@ -1,7 +1,10 @@
 import { createContext, useContext, useEffect, useState } from 'react'
 import { api, tokenStore } from '@/lib/api'
 
-const AuthContext = createContext(null)
+// Exported so a consumer that must tolerate having no session — useSellerIdentity, which
+// renders an invoice's letterhead — can read it with useContext and fall back, rather than
+// going through useAuth, which throws outside a provider.
+export const AuthContext = createContext(null)
 
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null)

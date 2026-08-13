@@ -1,4 +1,5 @@
 import json
+import re
 import smtplib
 from datetime import date, datetime, timedelta
 from datetime import timezone as dt_timezone
@@ -9,6 +10,7 @@ from unittest.mock import patch
 from django.contrib import admin
 from django.contrib.auth.models import Permission, User
 from django.core import mail
+from django.core.cache import cache
 from django.core.mail import EmailMultiAlternatives
 from django.core.management import call_command
 from django.core.management.base import CommandError
@@ -17,7 +19,7 @@ from django.db import IntegrityError, transaction
 from django.test import Client, RequestFactory, TestCase, override_settings
 from django.utils import timezone
 
-from accounts import emails, verification
+from accounts import emails, registration, verification
 from accounts.billing import get_provider
 from accounts.billing.activation import (
     TrialAlreadyUsed, activate_account, add_months, start_trial,
@@ -1732,17 +1734,26 @@ class AdminPermissionBoundaryTests(TestCase):
 
     # --- account subscription overrides -------------------------------------------------
 
-    def test_staff_may_still_look_an_account_up(self):
-        # Deliberately not hidden: name and phone are ordinary support data, and a support
-        # user who cannot find the customer cannot help them.
+    def test_staff_can_no_longer_look_an_account_up(self):
+        # Reversed deliberately. This used to allow it — name and phone read as ordinary
+        # support data — but SuperuserOnlyAdminSite now closes /admin/ to every
+        # non-superuser, and a customer lookup is not worth a hole in that. Support reads
+        # accounts through the API or a shell, not through a site that also exposes every
+        # other account's business data.
         client = self.client_for(self.staff)
-        self.assertEqual(client.get('/admin/accounts/account/').status_code, 200)
+        self.assertEqual(client.get('/admin/accounts/account/').status_code, 302)
 
     def test_staff_get_no_subscription_actions(self):
-        response = self.client_for(self.staff).get('/admin/accounts/account/')
-        body = response.content.decode()
+        # Asked of the ModelAdmin rather than over HTTP: the site now bounces staff before
+        # any view runs, so an HTTP assertion here would pass against an empty redirect body
+        # and stop testing get_actions at all. This gate is the layer underneath the site —
+        # it is what still holds if the site check is ever loosened.
+        admin_instance = admin.site._registry[Account]
+        request = RequestFactory().get('/')
+        request.user = self.staff
+        actions = admin_instance.get_actions(request)
         for action in ('activate_monthly', 'activate_annual', 'revoke_subscription'):
-            self.assertNotIn(f'value="{action}"', body, action)
+            self.assertNotIn(action, actions, action)
 
     def test_a_superuser_gets_every_subscription_action(self):
         body = self.client_for(self.superuser).get('/admin/accounts/account/').content.decode()
@@ -1751,6 +1762,20 @@ class AdminPermissionBoundaryTests(TestCase):
             'reset_trial', 'revoke_subscription',
         ):
             self.assertIn(f'value="{action}"', body, action)
+
+    def test_a_staff_post_to_an_admin_action_never_reaches_the_view(self):
+        # The site-level check runs before dispatch, so the POST is a redirect to the SPA,
+        # not a filtered action list. Distinct from
+        # test_a_staff_post_cannot_run_a_revoke_it_cannot_see below, which pins the
+        # ModelAdmin gate underneath it.
+        activate_account(self.account, plan_type=Account.ANNUAL)
+        response = self.client_for(self.staff).post(
+            '/admin/accounts/account/',
+            {'action': 'revoke_subscription', '_selected_action': [str(self.account.pk)]},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.account.refresh_from_db()
+        self.assertTrue(self.account.has_active_subscription)
 
     def test_staff_see_the_subscription_fields_read_only(self):
         admin_instance = admin.site._registry[Account]
@@ -1939,6 +1964,7 @@ class SubscriptionPayloadContractTests(TestCase):
     EXPECTED_FIELDS = {
         'id', 'subscription_status', 'plan_type', 'expires_at', 'trial_ends_at',
         'subscription_live', 'is_trial', 'trial_days_remaining', 'payment_method',
+        'registration_expires_at', 'registration_session_expired',
         'business_name', 'phone', 'email',
     }
 
@@ -3011,3 +3037,516 @@ class SendTestEmailTemplateTests(TestCase):
         before = User.objects.count()
         call_command('send_test_email', 'someone@example.com', stdout=StringIO(), stderr=StringIO())
         self.assertEqual(User.objects.count(), before)
+
+
+class RegistrationSessionTests(TestCase):
+    """
+    The lifetime rules for an unverified sign-up, tested against the module rather than
+    through HTTP — the destructive half of this feature deserves its guard tested directly.
+    """
+
+    def make_pending(self, *, email='pending@example.com', minutes_left=30):
+        user = User.objects.create_user(
+            username=email, email=email, password='pw-12345',
+        )
+        account = Account.objects.create(
+            name='Pending Shop',
+            subscription_status=Account.PENDING_VERIFICATION,
+            trial_ends_at=timezone.now() + timedelta(days=Account.TRIAL_DAYS),
+            registration_expires_at=timezone.now() + timedelta(minutes=minutes_left),
+        )
+        Membership.objects.create(user=user, account=account, is_owner=True)
+        return user, account
+
+    def test_the_session_window_is_an_hour(self):
+        # Pinned rather than left implicit: it has to stay above the resend budget in
+        # accounts.verification, or a user is cut off with codes still owed to them.
+        self.assertEqual(registration.REGISTRATION_SESSION_TTL, timedelta(minutes=60))
+        self.assertGreater(
+            registration.REGISTRATION_SESSION_TTL,
+            verification.CODE_TTL * verification.MAX_SENDS_PER_HOUR / 2,
+        )
+
+    def test_a_fresh_registration_is_live(self):
+        _, account = self.make_pending()
+        self.assertTrue(registration.is_pending_registration(account))
+        self.assertFalse(registration.is_expired(account))
+        self.assertFalse(account.registration_session_expired)
+
+    def test_an_elapsed_registration_reads_expired(self):
+        _, account = self.make_pending(minutes_left=-1)
+        self.assertTrue(registration.is_expired(account))
+        self.assertTrue(account.registration_session_expired)
+
+    def test_a_verified_account_is_never_a_pending_registration(self):
+        # The timestamp is cleared at verification, and that is what makes the hard delete
+        # safe forever after.
+        _, account = self.make_pending(minutes_left=-1)
+        account.registration_expires_at = None
+        account.subscription_status = Account.TRIALING
+        account.save()
+
+        self.assertFalse(registration.is_pending_registration(account))
+        self.assertFalse(registration.is_expired(account))
+        self.assertFalse(account.registration_session_expired)
+
+    def test_an_admin_reset_to_pending_verification_is_not_swept(self):
+        """
+        The failure this whole design is shaped around.
+
+        An admin can put a real, paying customer back to pending_verification. If the
+        deadline were derived from created_at, that account would read as an hour-old
+        registration and be deleted along with the customer's login.
+        """
+        _, account = self.make_pending()
+        account.registration_expires_at = None
+        account.subscription_status = Account.ACTIVE
+        account.save()
+        activate_account(account, plan_type=Account.MONTHLY)
+
+        account.subscription_status = Account.PENDING_VERIFICATION
+        account.save(update_fields=['subscription_status'])
+
+        self.assertFalse(registration.is_expired(account))
+        with self.assertRaises(registration.NotDiscardable):
+            registration.discard(account, reason='test')
+        self.assertTrue(Account.objects.filter(pk=account.pk).exists())
+
+    def test_discarding_removes_the_user_the_membership_and_the_account(self):
+        user, account = self.make_pending()
+        verification.issue_code(user)
+        user_pk, account_pk = user.pk, account.pk
+
+        registration.discard(account, reason='test')
+
+        self.assertFalse(User.objects.filter(pk=user_pk).exists())
+        self.assertFalse(Account.objects.filter(pk=account_pk).exists())
+        self.assertFalse(Membership.objects.filter(account_id=account_pk).exists())
+        # The outstanding code dies with its user, so an emailed code cannot outlive the
+        # registration it was issued for.
+        self.assertFalse(EmailVerification.objects.filter(user_id=user_pk).exists())
+
+    def test_a_live_account_refuses_to_be_discarded(self):
+        _, account = self.make_pending()
+        account.subscription_status = Account.ACTIVE
+        account.save(update_fields=['subscription_status'])
+
+        with self.assertRaises(registration.NotDiscardable):
+            registration.discard(account, reason='test')
+        self.assertTrue(Account.objects.filter(pk=account.pk).exists())
+
+    def test_billing_history_refuses_to_be_discarded(self):
+        # Belt and braces over the status check: a row that has taken money is not a
+        # registration whatever its status column says.
+        _, account = self.make_pending()
+        account.has_used_trial = True
+        account.save(update_fields=['has_used_trial'])
+
+        with self.assertRaises(registration.NotDiscardable):
+            registration.discard(account, reason='test')
+
+    def test_discard_if_expired_is_a_no_op_while_the_session_is_live(self):
+        _, account = self.make_pending(minutes_left=30)
+        self.assertFalse(registration.discard_if_expired(account))
+        self.assertTrue(Account.objects.filter(pk=account.pk).exists())
+
+    def test_discard_if_expired_closes_out_an_elapsed_session(self):
+        _, account = self.make_pending(minutes_left=-1)
+        self.assertTrue(registration.discard_if_expired(account))
+        self.assertFalse(Account.objects.filter(pk=account.pk).exists())
+
+
+@override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')
+class RegistrationSessionEndpointTests(TestCase):
+    """The sign-up session as a user meets it: verify, resend, and backing out."""
+
+    SIGNUP = {
+        'email': 'owner@example.com',
+        'password': 'sTr0ng-pw-2026',
+        'phone': '+961 70 123 456',
+        'business_name': 'Corner Shop',
+    }
+
+    def setUp(self):
+        # The abandon throttle is keyed on the client address, not the user, so its bucket
+        # is shared by every test in this process. Clearing keeps one test from 429ing the
+        # next for reasons that have nothing to do with what it asserts.
+        cache.clear()
+        self.client = APIClient()
+        mail.outbox = []
+
+    def signup(self, **overrides):
+        with self.captureOnCommitCallbacks(execute=True):
+            return self.client.post(
+                '/auth/users/', {**self.SIGNUP, **overrides}, format='json',
+            )
+
+    def authed(self, user):
+        client = APIClient()
+        client.force_authenticate(User.objects.get(pk=user.pk))
+        return client
+
+    def register(self, **overrides):
+        """Sign up and return (user, account, authenticated client, plaintext code)."""
+        self.signup(**overrides)
+        user = User.objects.get(email__iexact=overrides.get('email', self.SIGNUP['email']))
+        account = user.membership.account
+        return user, account, self.authed(user)
+
+    def current_code(self, user):
+        """
+        The plaintext code, read out of the message that was actually sent.
+
+        The database holds only an HMAC, so the email is the one place the plaintext exists —
+        and it is the right place for a test to read it from anyway, since it is the code the
+        user receives rather than one the test was handed. The hash comparison is what makes
+        this an assertion and not just a convenience: the emailed code *is* the stored code.
+        """
+        message = next(sent for sent in reversed(mail.outbox) if sent.to == [user.email])
+        found = re.search(r'\b(\d{6})\b', message.body)
+        self.assertIsNotNone(found, 'no six-digit code in the message body')
+        code = found.group(1)
+        row = EmailVerification.objects.filter(user=user, consumed_at__isnull=True).first()
+        self.assertEqual(verification.hash_code(code), row.code_hash)
+        return code
+
+    # --- the code itself ---------------------------------------------------------------
+
+    def test_the_emailed_code_is_generated_not_fixed(self):
+        """
+        No fixed sample, no fallback: the code in the inbox is the one in the database, and
+        it is drawn from `secrets`.
+        """
+        codes = set()
+        for index in range(5):
+            email = f'owner{index}@example.com'
+            self.signup(email=email)
+            user = User.objects.get(email=email)
+            code = self.current_code(user)
+            self.assertRegex(code, r'^\d{6}$')
+            self.assertIn(code, mail.outbox[-1].body)
+            codes.add(code)
+        # Five identical codes would be a 1-in-10^24 accident, so this fails loudly if a
+        # constant is ever reintroduced.
+        self.assertGreater(len(codes), 1)
+
+    def test_a_valid_code_verifies_and_is_consumed(self):
+        user, account, client = self.register()
+        code = self.current_code(user)
+
+        response = client.post('/accounts/verify-email/', {'code': code}, format='json')
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['subscription_status'], Account.TRIALING)
+        row = EmailVerification.objects.get(user=user)
+        self.assertIsNotNone(row.consumed_at)
+        # Spending it twice must not work, whatever the code says.
+        again = client.post('/accounts/verify-email/', {'code': code}, format='json')
+        self.assertEqual(again.status_code, 400)
+        self.assertEqual(again.data['code'], 'no_code')
+
+    def test_verification_closes_the_session_for_good(self):
+        user, account, client = self.register()
+        client.post(
+            '/accounts/verify-email/', {'code': self.current_code(user)}, format='json',
+        )
+
+        account.refresh_from_db()
+        self.assertIsNone(account.registration_expires_at)
+        self.assertFalse(account.is_pending_registration)
+
+    # --- session expiry ------------------------------------------------------------------
+
+    def test_signup_stamps_an_hour_long_session(self):
+        _, account, _ = self.register()
+        remaining = account.registration_expires_at - timezone.now()
+        self.assertAlmostEqual(
+            remaining.total_seconds(),
+            registration.REGISTRATION_SESSION_TTL.total_seconds(),
+            delta=30,
+        )
+
+    def expire_session(self, account):
+        account.registration_expires_at = timezone.now() - timedelta(seconds=1)
+        account.save(update_fields=['registration_expires_at'])
+
+    def test_a_correct_code_is_refused_once_the_session_has_closed(self):
+        user, account, client = self.register()
+        code = self.current_code(user)
+        self.expire_session(account)
+
+        response = client.post('/accounts/verify-email/', {'code': code}, format='json')
+
+        # 410, not 400: the account this request was about has been destroyed, which is a
+        # different thing from a code that was mistyped.
+        self.assertEqual(response.status_code, 410)
+        self.assertEqual(response.data['code'], 'registration_expired')
+        self.assertIn('start the sign-up process again', response.data['detail'])
+        self.assertFalse(User.objects.filter(pk=user.pk).exists())
+        self.assertFalse(Account.objects.filter(pk=account.pk).exists())
+
+    def test_resending_after_the_session_has_closed_discards_it_too(self):
+        user, account, client = self.register()
+        self.expire_session(account)
+        mail.outbox = []
+
+        response = client.post('/accounts/resend-code/')
+
+        self.assertEqual(response.status_code, 410)
+        self.assertEqual(response.data['code'], 'registration_expired')
+        # No new code goes out for an account that is being deleted in the same request.
+        self.assertEqual(mail.outbox, [])
+        self.assertFalse(Account.objects.filter(pk=account.pk).exists())
+
+    def test_the_address_is_free_again_after_the_session_closes(self):
+        """The point of hard-deleting: 'start over from scratch' has to actually work."""
+        user, account, client = self.register()
+        self.expire_session(account)
+        client.post('/accounts/verify-email/', {'code': '000000'}, format='json')
+
+        response = self.signup()
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(User.objects.filter(email__iexact='owner@example.com').count(), 1)
+
+    def test_an_expired_code_inside_a_live_session_is_recoverable(self):
+        """
+        A code that timed out is *not* an expired session. It asks for a new code and the
+        sign-up carries on — collapsing the two would throw away a registration over a
+        ten-minute-old email, which is the opposite of the intent.
+        """
+        user, account, client = self.register()
+        code = self.current_code(user)
+        EmailVerification.objects.filter(user=user).update(
+            expires_at=timezone.now() - timedelta(seconds=1),
+        )
+
+        response = client.post('/accounts/verify-email/', {'code': code}, format='json')
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['code'], 'code_expired')
+        self.assertTrue(Account.objects.filter(pk=account.pk).exists())
+
+    def test_the_status_payload_reports_the_session(self):
+        user, account, client = self.register()
+
+        live = client.get('/accounts/subscription/').data
+        self.assertIsNotNone(live['registration_expires_at'])
+        self.assertFalse(live['registration_session_expired'])
+
+        self.expire_session(account)
+        # Reading the status must not delete anything — only the endpoints that act on the
+        # registration do that, or a poll would destroy the account under the screen.
+        expired = self.authed(user).get('/accounts/subscription/').data
+        self.assertTrue(expired['registration_session_expired'])
+        self.assertTrue(Account.objects.filter(pk=account.pk).exists())
+
+    # --- back to sign up -----------------------------------------------------------------
+
+    def test_abandoning_discards_the_registration(self):
+        user, account, client = self.register()
+
+        response = client.post('/accounts/abandon-registration/')
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertFalse(User.objects.filter(pk=user.pk).exists())
+        self.assertFalse(Account.objects.filter(pk=account.pk).exists())
+
+    def test_abandoning_frees_the_email_to_sign_up_again(self):
+        # The typo case, which is the reason the button exists.
+        _, _, client = self.register(email='typo@example.com')
+        client.post('/accounts/abandon-registration/')
+
+        response = self.signup(email='typo@example.com')
+
+        self.assertEqual(response.status_code, 201, response.data)
+
+    def test_abandoning_works_on_a_session_that_has_already_lapsed(self):
+        user, account, client = self.register()
+        self.expire_session(account)
+
+        response = client.post('/accounts/abandon-registration/')
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertFalse(Account.objects.filter(pk=account.pk).exists())
+
+    def test_a_verified_account_cannot_be_abandoned(self):
+        """
+        The endpoint deletes accounts, so its guard is the security control. Being
+        authenticated must never be enough to destroy an account that has been through
+        verification.
+        """
+        user, account, client = self.register()
+        client.post(
+            '/accounts/verify-email/', {'code': self.current_code(user)}, format='json',
+        )
+
+        response = self.authed(user).post('/accounts/abandon-registration/')
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data['code'], 'not_pending_registration')
+        self.assertTrue(User.objects.filter(pk=user.pk).exists())
+        self.assertTrue(Account.objects.filter(pk=account.pk).exists())
+
+    def test_a_paying_account_cannot_be_abandoned(self):
+        user, account, client = self.register()
+        client.post(
+            '/accounts/verify-email/', {'code': self.current_code(user)}, format='json',
+        )
+        account.refresh_from_db()
+        activate_account(account, plan_type=Account.ANNUAL)
+
+        response = self.authed(user).post('/accounts/abandon-registration/')
+
+        self.assertEqual(response.status_code, 409)
+        self.assertTrue(Account.objects.filter(pk=account.pk).exists())
+
+    def test_abandoning_needs_authentication(self):
+        response = APIClient().post('/accounts/abandon-registration/')
+        self.assertEqual(response.status_code, 401)
+
+    def test_one_account_cannot_abandon_another(self):
+        """Scoping, stated as a test: the endpoint takes no id and reads only the caller's."""
+        _, victim_account, _ = self.register(email='victim@example.com')
+        _, _, attacker = self.register(email='attacker@example.com')
+
+        attacker.post('/accounts/abandon-registration/')
+
+        self.assertTrue(Account.objects.filter(pk=victim_account.pk).exists())
+
+
+class PurgeExpiredRegistrationsCommandTests(TestCase):
+    """Housekeeping for rows nobody comes back to. Enforcement lives in the endpoints."""
+
+    def make(self, *, email, minutes_left, status=Account.PENDING_VERIFICATION, stamped=True):
+        user = User.objects.create_user(username=email, email=email, password='pw-12345')
+        account = Account.objects.create(
+            name=email,
+            subscription_status=status,
+            registration_expires_at=(
+                timezone.now() + timedelta(minutes=minutes_left) if stamped else None
+            ),
+        )
+        Membership.objects.create(user=user, account=account, is_owner=True)
+        return account
+
+    def run_command(self, *args):
+        out = StringIO()
+        call_command('purge_expired_registrations', *args, stdout=out, stderr=StringIO())
+        return out.getvalue()
+
+    def test_it_discards_only_the_expired_registrations(self):
+        stale = self.make(email='stale@example.com', minutes_left=-5)
+        fresh = self.make(email='fresh@example.com', minutes_left=30)
+        verified = self.make(
+            email='paid@example.com', minutes_left=-500,
+            status=Account.ACTIVE, stamped=False,
+        )
+
+        self.run_command()
+
+        self.assertFalse(Account.objects.filter(pk=stale.pk).exists())
+        self.assertTrue(Account.objects.filter(pk=fresh.pk).exists())
+        self.assertTrue(Account.objects.filter(pk=verified.pk).exists())
+        self.assertFalse(User.objects.filter(email='stale@example.com').exists())
+
+    def test_dry_run_deletes_nothing(self):
+        stale = self.make(email='stale@example.com', minutes_left=-5)
+
+        output = self.run_command('--dry-run')
+
+        self.assertIn('would discard', output)
+        self.assertTrue(Account.objects.filter(pk=stale.pk).exists())
+
+    def test_it_is_quiet_when_there_is_nothing_to_do(self):
+        self.assertIn('No expired registrations', self.run_command())
+
+
+class SuperuserOnlyAdminSiteTests(TestCase):
+    """
+    /admin/ is closed to everyone but active superusers.
+
+    Django gates the admin on `is_staff`, which under this app's role model means "platform
+    support", while the admin exposes every account's business data and the actions that
+    decide what a customer has paid for. The site-level check is the boundary; the per-model
+    gates in AdminPermissionBoundaryTests are the layer underneath it.
+    """
+
+    def setUp(self):
+        self.superuser = User.objects.create_superuser(
+            username='root', email='root@example.com', password='pw-12345',
+        )
+        self.staff = User.objects.create_user(
+            username='staff', email='staff@example.com', password='pw-12345', is_staff=True,
+        )
+        # Every permission the permission system can express — the strongest possible
+        # non-superuser. If this one is out, no staff configuration gets in.
+        self.staff.user_permissions.set(Permission.objects.all())
+        self.subscriber = User.objects.create_user(
+            username='shop', email='shop@example.com', password='pw-12345',
+        )
+
+    def client_for(self, user):
+        client = Client()
+        client.force_login(user)
+        return client
+
+    def test_a_superuser_reaches_the_admin_index(self):
+        self.assertEqual(self.client_for(self.superuser).get('/admin/').status_code, 200)
+
+    def test_staff_are_turned_away_from_the_admin(self):
+        response = self.client_for(self.staff).get('/admin/')
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.url, '/admin/login/?next=/admin/')
+
+    def test_an_ordinary_subscriber_is_turned_away_from_the_admin(self):
+        self.assertEqual(self.client_for(self.subscriber).get('/admin/').status_code, 302)
+
+    def test_an_authenticated_non_superuser_lands_on_the_dashboard_not_a_login_form(self):
+        # admin_view bounces to the login view; the login view sends an already-authenticated
+        # caller to the SPA. Without the second hop a logged-in staff user is shown a login
+        # form for the session they are already in, which reads as a loop rather than a
+        # boundary. Asserted here rather than with follow=True so the assertion is about the
+        # admin, not about whether the SPA bundle happens to be built in this checkout.
+        for user in (self.staff, self.subscriber):
+            with self.subTest(user=user.username):
+                response = self.client_for(user).get('/admin/login/?next=/admin/')
+                self.assertEqual(response.status_code, 302)
+                self.assertEqual(response.url, '/')
+
+    def test_a_deactivated_superuser_is_refused(self):
+        self.superuser.is_active = False
+        self.superuser.save()
+        client = Client()
+        client.force_login(self.superuser)
+        self.assertEqual(client.get('/admin/').status_code, 302)
+
+    def test_an_anonymous_visitor_still_gets_the_login_form(self):
+        # Not redirected to the SPA — an anonymous caller may yet be a superuser who has not
+        # logged in, and taking the form away would leave no way to reach the admin at all.
+        response = Client().get('/admin/', follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'name="username"')
+
+    def test_every_admin_url_is_closed_to_staff_not_just_the_index(self):
+        # has_permission is what admin_view calls, so this holds for views added later too.
+        # Sampled across an app index, a changelist, an add form and the password change.
+        for path in (
+            '/admin/accounts/',
+            '/admin/accounts/account/',
+            '/admin/inventory/product/',
+            '/admin/inventory/product/add/',
+            '/admin/auth/user/',
+            '/admin/password_change/',
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self.client_for(self.staff).get(path).status_code, 302)
+
+    def test_the_admin_site_class_is_the_restricted_one(self):
+        # AdminConfig.default_site is read before autodiscover(), so every
+        # admin.site.register in the codebase lands on this site. If the INSTALLED_APPS entry
+        # is ever reverted to 'django.contrib.admin', nothing else in this class would
+        # necessarily fail loudly — is_staff users would simply be let back in.
+        from ims.admin_site import SuperuserOnlyAdminSite
+
+        self.assertIsInstance(admin.site, SuperuserOnlyAdminSite)

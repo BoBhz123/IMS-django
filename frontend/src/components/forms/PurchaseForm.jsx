@@ -7,31 +7,57 @@ import { BarcodeScannerModal } from '@/components/ui/BarcodeScannerModal'
 import { CurrencyInput } from '@/components/ui/CurrencyInput'
 import { ProductPicker } from '@/components/forms/ProductPicker'
 import { lookupByBarcode } from '@/hooks/useBarcodeLookup'
+import { useAllProducts } from '@/hooks/useAllProducts'
 import { useOpenSession } from '@/hooks/useOpenSession'
+import { partyIdByName, toFormLines } from '@/lib/transactionEdit'
 
 function emptyItem() {
   return { product: '', quantity: 1, unit_multiplier: 1, unit_price: 0, product_name: '' }
 }
 
-export function PurchaseForm({ open, onClose, ...rest }) {
+export function PurchaseForm({ open, onClose, purchase = null, ...rest }) {
   // Keyed body: every opening remounts it, so a created purchase does not leave its supplier,
-  // exchange rate and line items behind for the next one. See useOpenSession.
+  // exchange rate and line items behind for the next one — and switching between two
+  // purchases being edited re-hydrates rather than showing the first one's lines. See
+  // useOpenSession.
   const session = useOpenSession(open)
   return (
-    <SlideOver open={open} onClose={onClose} title="Add purchase">
-      <PurchaseFormBody key={session} onClose={onClose} {...rest} />
+    <SlideOver open={open} onClose={onClose} title={purchase ? 'Edit purchase' : 'Add purchase'}>
+      <PurchaseFormBody
+        key={`${session}:${purchase?.id ?? 'new'}`}
+        onClose={onClose}
+        purchase={purchase}
+        {...rest}
+      />
     </SlideOver>
   )
 }
 
-function PurchaseFormBody({ onClose, onSaved, suppliers }) {
+function PurchaseFormBody({ onClose, onSaved, suppliers, purchase = null }) {
   const { formatAmount } = useCurrency()
+  const editing = Boolean(purchase)
 
-  const [supplier, setSupplier] = useState('')
-  const [exchangeRate, setExchangeRate] = useState(DEFAULT_EXCHANGE_RATE)
-  const [items, setItems] = useState([emptyItem()])
+  // PurchaseItem.product is a *name* on the wire, not an id (PurchaseItemSerializer declares
+  // it as a StringRelatedField), so editing has to resolve each line back to a product id
+  // through the catalog before it can post anything.
+  const { products: catalog, status: catalogStatus } = useAllProducts(editing)
+
+  const [supplier, setSupplier] = useState(() =>
+    editing ? partyIdByName(purchase.supplier, suppliers) : '',
+  )
+  const [exchangeRate, setExchangeRate] = useState(
+    () => (editing ? purchase.exchange_rate : DEFAULT_EXCHANGE_RATE),
+  )
+  const [items, setItems] = useState(() => (editing ? [] : [emptyItem()]))
+  const [hydrated, setHydrated] = useState(!editing)
   const [errors, setErrors] = useState({})
   const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    if (hydrated || catalogStatus !== 'ready') return
+    setItems(toFormLines(purchase.items, catalog, { productKey: 'name' }))
+    setHydrated(true)
+  }, [hydrated, catalogStatus, purchase, catalog])
 
   const [scannerOpen, setScannerOpen] = useState(false)
   const [scanMessage, setScanMessage] = useState(null)
@@ -152,7 +178,13 @@ function PurchaseFormBody({ onClose, onSaved, suppliers }) {
     }
 
     try {
-      await api.post('/inventory/purchases/', payload)
+      if (editing) {
+        // PUT for the same reason as OrderForm: the server replaces the lines wholesale, and
+        // a PATCH omitting `items` would leave the originals standing.
+        await api.put(`/inventory/purchases/${purchase.id}/`, payload)
+      } else {
+        await api.post('/inventory/purchases/', payload)
+      }
       onSaved()
       onClose()
     } catch (error) {
@@ -166,9 +198,31 @@ function PurchaseFormBody({ onClose, onSaved, suppliers }) {
     }
   }
 
+  if (!hydrated) {
+    return (
+      <div className="flex flex-col items-center gap-2 py-12 text-[13px] text-text-secondary">
+        {catalogStatus === 'error' ? (
+          <p className="text-accent-red">Couldn't load this purchase for editing. Close and retry.</p>
+        ) : (
+          <>
+            <Loader2 size={18} className="animate-spin text-accent-blue" />
+            <p>Loading purchase…</p>
+          </>
+        )}
+      </div>
+    )
+  }
+
   return (
     <>
       <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+        {editing && (
+          <p className="rounded-xl bg-accent-blue/10 px-3 py-2 text-[12px] text-text-secondary">
+            Saving replaces every line on this purchase. Stock moves by the difference —
+            reducing a quantity below what is still on the shelf will be refused.
+          </p>
+        )}
+
         <Field label="Supplier">
           <select
             value={supplier}
@@ -283,8 +337,15 @@ function PurchaseFormBody({ onClose, onSaved, suppliers }) {
         </div>
 
         {errors.detail && <p className="text-[13px] text-accent-red">{errors.detail[0]}</p>}
-        {errors.items && typeof errors.items === 'string' && (
-          <p className="text-[13px] text-accent-red">{errors.items}</p>
+        {errors.items && (
+          // An edit that would drive stock negative comes back as a list of per-product
+          // messages, so a string-only branch would render nothing and the save would look
+          // like it silently failed.
+          <div className="text-[13px] text-accent-red">
+            {(Array.isArray(errors.items) ? errors.items : [errors.items]).map((message) => (
+              <p key={String(message)}>{String(message)}</p>
+            ))}
+          </div>
         )}
 
         <button
@@ -293,7 +354,7 @@ function PurchaseFormBody({ onClose, onSaved, suppliers }) {
           className="mt-1 flex items-center justify-center gap-2 rounded-xl bg-accent-blue py-2.5 text-[14px] font-semibold text-white hover:opacity-90 disabled:opacity-60"
         >
           {saving && <Loader2 size={14} className="animate-spin" />}
-          Create purchase
+          {editing ? 'Save changes' : 'Create purchase'}
         </button>
       </form>
 

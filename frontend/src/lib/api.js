@@ -2,12 +2,16 @@ import axios from 'axios'
 import { toast } from './toast'
 
 // No VITE_API_BASE_URL override -> derive it from wherever the page was actually loaded
-// from, not a value baked into the JS bundle at build time. This matters a lot in the
-// multi-tenant deployment: the SAME built bundle is served from every *.myimsapp.com
-// subdomain (django-tenants resolves the tenant from the request's Host header), so a
-// hardcoded API origin would send every tenant's frontend to the SAME backend schema
-// regardless of which subdomain the browser is actually on — which is exactly the bug
-// this was rewritten to fix (see docs/superpowers/specs, "cross-tenant data leakage").
+// from, not a value baked into the JS bundle at build time.
+//
+// Deliberately NOT hardcoded to https://myimsapp.com, even though that is where production
+// serves from. The same built bundle is served from every host the app answers on — the
+// canonical domain, any subdomain, the *.herokuapp.com dyno hostname during a DNS cutover,
+// and a LAN or tunnel URL in development. A baked-in origin sends all of them at one host:
+// it breaks local dev outright, and during a cutover it makes the copy of the app served
+// from one domain issue credentialed calls to another, which is a cross-origin request that
+// either fails CORS or succeeds against the wrong host. Same-origin derivation is already
+// exactly `https://myimsapp.com` when the page came from there.
 //
 // import.meta.env.DEV is true only under `vite dev`, never in a production build: the dev
 // server runs on a different port (5173) than the Django API (8000), so it needs the

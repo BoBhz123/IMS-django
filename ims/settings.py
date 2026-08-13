@@ -72,10 +72,44 @@ if not DEBUG and SECRET_KEY.startswith('django-insecure-'):
         'value, or set DJANGO_DEBUG=True if this is local development.'
     )
 
-# Comma-separated list via ALLOWED_HOSTS env var (e.g. "client.myimsapp.com,testlab.myimsapp.com").
-# Falls back to '*' (unchanged local-dev/current-prod behavior) when unset. '.myimsapp.com' as a
-# leading-dot entry matches that domain and all its subdomains, per Django's ALLOWED_HOSTS docs.
-ALLOWED_HOSTS = [h.strip() for h in os.environ.get('ALLOWED_HOSTS', '*').split(',') if h.strip()]
+# The canonical domain, 2026-08-13. Everything below that needs to name the site reads from
+# here, so a future move is one edit rather than a hunt through settings.
+SITE_DOMAIN = os.environ.get('SITE_DOMAIN', 'myimsapp.com').strip()
+SITE_URL = f'https://{SITE_DOMAIN}'
+
+# Comma-separated list via the ALLOWED_HOSTS env var (e.g. "myimsapp.com,.myimsapp.com").
+#
+# The fallback used to be '*', which accepts any Host header and gives up Django's
+# HTTP Host header protection entirely — it was a placeholder from before this app had a
+# domain. It is now the real domain, so a deploy that forgets the env var fails closed on an
+# unexpected host instead of open.
+#
+# '.myimsapp.com' is a leading-dot entry: per Django's ALLOWED_HOSTS docs it matches the
+# domain *and* every subdomain, so it alone would cover 'myimsapp.com'. Both are listed
+# because the bare domain is the one people look for when reading this file.
+#
+# NOTE: this list deliberately does not include the *.herokuapp.com dyno hostname. Requests
+# arriving on it 400 unless ALLOWED_HOSTS names it — which is correct for a domain that has
+# cut over, and a live-site outage for one that has not. Keep it in the Heroku config var
+# until DNS for myimsapp.com actually resolves to the app.
+ALLOWED_HOSTS = [
+    h.strip() for h in os.environ.get(
+        'ALLOWED_HOSTS', f'{SITE_DOMAIN},.{SITE_DOMAIN},localhost,127.0.0.1',
+    ).split(',') if h.strip()
+]
+
+# Required for any cookie-authenticated POST from the browser — the Django admin's login and
+# every one of its change forms. Django rejects those with a 403 "Origin checking failed"
+# unless the Origin header matches an entry here, and behind Heroku's TLS termination the
+# scheme has to be spelled out. Absent entirely until now, which worked only because the
+# admin was reached over the *.herokuapp.com domain Django was already trusting implicitly
+# through ALLOWED_HOSTS; the moment a custom domain fronts it, the admin stops accepting
+# logins. The wildcard form is what CsrfViewMiddleware expects for subdomains.
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip() for origin in os.environ.get(
+        'CSRF_TRUSTED_ORIGINS', f'{SITE_URL},https://*.{SITE_DOMAIN}',
+    ).split(',') if origin.strip()
+]
 
 # Heroku terminates TLS at its edge and forwards plain HTTP to the dyno — without this,
 # SECURE_SSL_REDIRECT (further down, active when DEBUG=False) sees every request as
@@ -91,7 +125,10 @@ SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 # docs/superpowers/specs/2026-08-07-saas-single-db-migration-design.md for why the
 # schema-per-tenant setup was removed.
 INSTALLED_APPS = [
-    'django.contrib.admin',
+    # Not 'django.contrib.admin' — this config subclasses it only to point `default_site` at
+    # ims.admin_site.SuperuserOnlyAdminSite, which restricts /admin/ to is_superuser rather
+    # than Django's default is_staff. Everything else about the admin app is unchanged.
+    'ims.apps.IMSAdminConfig',
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
@@ -191,13 +228,24 @@ if _database_url_config:
 CORS_ALLOW_ALL_ORIGINS = DEBUG
 
 # The production contract. Read from the environment so adding a domain is a config change
-# rather than a code deploy; the literals are the local dev fallback — the Vite dev server
-# both un-tenanted and via the subdomain used for local testing.
+# rather than a code deploy; the literals are the fallback.
+#
+# The deployed SPA and the API are same-origin — WhiteNoise serves the built bundle from the
+# same Heroku app — so nothing in normal operation is actually a cross-origin request and
+# this list is belt-and-braces. It names the site anyway so that a browser reaching the API
+# from the canonical domain is never the thing that breaks, and so a future split (a separate
+# static host, a mobile web wrapper) is a config change.
+#
+# The localhost entries are the Vite dev server, kept in the fallback because CORS_ALLOW_ALL_
+# ORIGINS follows DEBUG and a developer running with DEBUG=False locally would otherwise be
+# blocked by their own backend.
 CORS_ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',')
     if origin.strip()
 ] or [
+    SITE_URL,
+    f'https://www.{SITE_DOMAIN}',
     'http://localhost:5173',
     'http://tenant1.localhost:5173',
 ]
@@ -272,6 +320,11 @@ REST_FRAMEWORK = {
         # check and the confirm endpoint together, since both take the same code.
         'password_reset_request': '10/hour',
         'password_reset_verify': '30/hour',
+        # Counted per client address rather than per user — see AbandonRegistrationThrottle.
+        # Abandoning frees the email address, so the sign-up/abandon loop is a way to mail one
+        # victim repeatedly, and each pass gets a fresh per-user budget. A human fixing a typo
+        # needs one or two.
+        'abandon_registration': '10/hour',
         # The CSV exports walk every line item an account has ever recorded — the most
         # expensive request an authenticated caller can make, and the cheapest to repeat in
         # a loop. 30/hour is far above any real use (the SPA exports on a button press) and

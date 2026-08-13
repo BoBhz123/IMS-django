@@ -387,6 +387,121 @@ initially kept for saved formulas, then removed outright at the owner's directio
 it was judged the larger risk. That redesign also made all money numeric, added `Barcode` and
 `Total Units`, and moved dates to ISO 8601. See `HISTORY.md`.
 
+### Phase 9 — Admin lockdown, editable transactions, invoice redesign — **done (2026-08-13)**
+
+Three unrelated pieces of work, done together.
+
+**1. `/admin/` is superuser-only.** `ims/admin_site.py::SuperuserOnlyAdminSite` overrides
+`has_permission` (`is_active and is_superuser`, dropping Django's `is_staff` test) and `login`
+(an already-authenticated non-superuser is redirected to `/`, the SPA, instead of being shown a
+login form for the session they are already in). Wired through `ims/apps.py::IMSAdminConfig`'s
+`default_site` and the `INSTALLED_APPS` entry — *not* `'django.contrib.admin'` any more — because
+that hook is read before `autodiscover()`, so every existing `admin.site.register` lands on the
+restricted site with no edits.
+
+This **reverses** the earlier "staff may still look a customer up" decision (`AccountAdmin`
+deliberately not using `SuperuserOnlyAdmin`). A customer lookup is not worth a hole in a site that
+also exposes every other account's business data. The per-model gates
+(`SuperuserOnlyAdmin`, `get_actions`, `get_readonly_fields`) all stay — they are the layer
+underneath, and `AdminPermissionBoundaryTests` now asks them directly rather than over HTTP,
+because the site bounces staff before any view runs.
+
+**2. Orders and purchases are editable.** `CreateOrderSerializer`/`CreatePurchaseSerializer` gained
+`update()`, and both viewsets route `PUT`/`PATCH` to them — left on the read serializers an edit
+returns 200 having silently discarded every line change, since their `items` is read-only. Names
+keep the `Create*` prefix; they are the write serializers for all three verbs now.
+
+Editing **replaces** the line items wholesale rather than diffing them: a line has no
+client-visible id, so "the second line" is a position and positions do not survive a reorder.
+Stock moves by the *net delta* under `select_for_update()` inside the existing `@transaction.atomic`
+— lock the union of old and new products, validate, then apply `old − new` (orders) or `new − old`
+(purchases). A `PATCH` without `items` leaves lines and stock untouched.
+
+What the obvious implementation gets wrong:
+- **An order's own units are already out of stock.** Comparing new lines against the bare
+  `stock_quantity` rejects an order for units it is itself holding — an order that sold the last 10
+  cannot even have its customer corrected. `_insufficient_stock_errors(credited_units=…)` credits
+  them back first. The frontend has the same rule in `lib/transactionEdit.js`, or every line of such
+  an order renders as "over stock" and the save button stays disabled.
+- **A dropped product appears on only one side.** Iterating the new items alone never returns the
+  stock of a line that was deleted. `_stock_deltas` works over the union.
+- **Reducing a purchase can drive stock negative** — the goods may already be sold. Refused with a
+  400, not clamped: clamping leaves the books saying goods were never received while the sale that
+  consumed them stands.
+- **An edit must not restate COGS.** A product already on the order keeps its
+  `OrderItem.unit_cost_price` snapshot; only a genuinely new line takes today's `product.cost_price`.
+  Re-reading it for every line would rewrite the profit of a past sale each time a supplier price is
+  corrected.
+- **Nothing is denormalised, so nothing needs recalculating.** Totals, profit and analytics are all
+  computed from the rows — `total_price`, `total_profit`, `AnalyticsView`. There is no ledger,
+  balance or metrics table to reverse. `OrderEditingTests.test_analytics_reflect_the_edited_order`
+  pins that.
+
+Out of scope, and absent from the data model: per-line or per-order **discounts**, and
+**customer/supplier balances**. Neither exists as a field anywhere; adding either is its own
+decision.
+
+**3. Invoice redesign.** `Invoice.jsx` rebuilt to the reference layout: letterhead with the real
+business name/phone/email (from `useSellerIdentity`, reading the account off `AuthContext` — no
+logo, no seller address, neither is stored), a `BILL TO` block with the customer's name, location
+and phone, a `# / ITEMS / UNIT / QTY / UNIT COST / TOTAL` table, subtotal and total with their LBP
+conversions, a `PAID` badge, and a configurable tagline in `lib/invoiceConfig.js`.
+
+`UNIT` is `unit_multiplier` and `QTY` is `quantity`, in separate columns — the two multiply to the
+units stock is deducted by, and merging them loses that. The `PAID` badge is static and carries the
+transaction date: there is no payment-status column, and these are cash-sale records written after
+the money moved.
+
+The `@media print` block in `index.css` was reworked for mobile printing: `@page { size: auto;
+margin: 0 }` (which is also the only lever CSS has over the browser's own URL/timestamp headers —
+Chrome and Safari suppress them at zero margin, Firefox honours its own preference regardless), the
+invoice sized `width: 100%; max-width: 800px` with its own `12mm` padding instead of a fixed
+`210mm`, `html`/`body` forced white to kill the dark margin bars, and `table-layout: fixed` so no
+column can be clipped off a narrow sheet.
+
+### Domain migration — client.myimsapp.com → myimsapp.com — **done (2026-08-13)**
+
+The canonical domain is **`myimsapp.com`**. `ims/settings.py` grew a `SITE_DOMAIN` /
+`SITE_URL` pair that `ALLOWED_HOSTS`, `CSRF_TRUSTED_ORIGINS` and the `CORS_ALLOWED_ORIGINS`
+fallback all derive from, so moving domain again is one edit (or one `SITE_DOMAIN` env var),
+not a hunt through settings. Every default stays overridable from the environment.
+
+Two changes of substance, beyond the string swap:
+
+- **`ALLOWED_HOSTS` no longer falls back to `'*'`.** The wildcard accepted any Host header and
+  gave up Django's Host-header protection entirely — a placeholder from before this app had a
+  domain. The fallback is now `myimsapp.com,.myimsapp.com,localhost,127.0.0.1`, so a deploy
+  that forgets the env var fails closed.
+- **`CSRF_TRUSTED_ORIGINS` did not exist.** It has to name the site or the Django admin's
+  login POST is rejected with "Origin checking failed" the moment a custom domain fronts the
+  app — it only worked before because the admin was reached over the `*.herokuapp.com` host.
+
+`.myimsapp.com` is a leading-dot entry: per Django's docs it matches the domain *and* every
+subdomain, which is what keeps the existing `client.` and `testlab.` hosts serving.
+
+**Production state after the cutover** (`ims-tenant-app`, config v46):
+- Domains registered: `myimsapp.com` (ALIAS/ANAME → `curly-parrot-w6pzgej6b6zwtm2b66ynh1zp.herokudns.com`),
+  `*.myimsapp.com` (CNAME → `darwinian-pheasant-5sravvq7x6t5lxt0dklt42l9.herokudns.com`), plus
+  the pre-existing `client.` and `testlab.` hosts.
+- `ALLOWED_HOSTS=myimsapp.com,.myimsapp.com` — **the `*.herokuapp.com` dyno hostname was
+  deliberately dropped** at the owner's direction, having been warned. That URL no longer
+  serves the app.
+- `CSRF_TRUSTED_ORIGINS=https://myimsapp.com,https://*.myimsapp.com`.
+
+**Still outstanding, and it is DNS, not code:** `myimsapp.com` has no A/CNAME record at all, so
+the apex does not resolve. DNS is on Cloudflare, which supports CNAME flattening, so the
+ALIAS/ANAME target above can be entered as a proxied CNAME at the root. Until that record
+exists the site is reachable only at `client.myimsapp.com`.
+
+**The frontend API base URL is deliberately not hardcoded to the domain.** `lib/api.js`
+derives it from `window.location.origin`; baking in `https://myimsapp.com` breaks local dev
+outright and, during a cutover, makes the copy of the app served from one host issue
+credentialed calls to another. Same-origin derivation already *is* `https://myimsapp.com`
+when the page came from there.
+
+`DomainConfigurationTests` (`inventory/tests.py`) pins all of this, including a guard that
+fails if the old subdomain reappears in `ims/`, `accounts/`, `inventory/` or `frontend/src/`.
+
 ---
 
 # Working Log — mistakes, gotchas, anti-patterns
@@ -397,6 +512,26 @@ Append here when something bites. Do not repeat these.
   on it, or a code issued for one flow becomes spendable in another and the two flows start expiring
   each other's outstanding codes and sharing one hourly send budget. `issue_code`/`verify_code` both
   take `purpose`; the default is `email_verification` only because that flow predates the field.
+- **There has never been a hardcoded `123456` fallback.** `verification.generate_code` uses
+  `secrets.randbelow`; every `123456` in the tree is test data. If a report says otherwise,
+  check `RegistrationSessionEndpointTests.test_the_emailed_code_is_generated_not_fixed`
+  before changing anything — it signs up five times and fails if two codes ever match.
+- **Two clocks, and they are not the same clock.** `verification.CODE_TTL` (10 min) expires a
+  *code* and is recoverable by resending. `registration.REGISTRATION_SESSION_TTL` (60 min)
+  expires the whole unverified *sign-up* and hard-deletes it. Collapsing them throws away a
+  registration over a ten-minute-old email; the endpoints return `code_expired` and
+  `registration_expired` respectively, and the SPA branches on the slug, never the wording.
+- **`Account.registration_expires_at` is what makes deleting an account safe, and it must
+  stay a stored column.** Deriving the deadline from `created_at` would sweep any paying
+  customer an admin has put back to `pending_verification`. It is stamped once at signup and
+  cleared for good at the first verification, so NULL means "verified at least once" and
+  `is_pending_registration` requires both halves. `registration.discard` raises
+  `NotDiscardable` for anything else — never bypass it to delete an account.
+- **Discarding a registration frees the email address, so the abandon endpoint is throttled
+  per client address, not per user.** Sign-up → code → abandon → sign-up mails one victim
+  repeatedly, and each pass creates a new user row with a fresh per-user budget, so a
+  user-keyed throttle counts nothing. Any new endpoint that can delete an unverified account
+  needs the same treatment.
 - **A multi-step OTP flow must not spread its decision across steps.** If the endpoint that changes
   something trusts an earlier "verify" call, being authenticated is enough to skip the code entirely
   and the extra screens are theatre. `PasswordResetConfirmView` takes the code and the new password in
@@ -632,6 +767,46 @@ Append here when something bites. Do not repeat these.
   emptied field is not refilled with the `0` that emptying it reported. Widening that effect makes
   the field fight the user mid-keystroke; narrowing it back to mount-only reintroduces the bug where
   picking or scanning a product left the price showing `0` beside a correct total.
+- **`ALLOWED_HOSTS` on Heroku no longer lists the `*.herokuapp.com` dyno hostname.** Dropped
+  during the 2026-08-13 domain cutover at the owner's direction. Requests arriving on that
+  URL no longer serve the app, so it is not a fallback and not a way to check whether a
+  deploy is healthy — use `client.myimsapp.com` (or the apex, once its DNS record exists).
+- **`.myimsapp.com` with the leading dot already matches the bare domain.** Django's docs are
+  explicit: a leading-dot entry matches the domain and every subdomain. Listing both is for
+  the human reading settings.py, not because either is redundant to add.
+- **Never hardcode the API base URL in `frontend/src/lib/api.js`.** It derives from
+  `window.location.origin` on purpose — the same bundle is served from the apex, every
+  subdomain, and a LAN/tunnel URL in dev. A baked-in origin breaks local development and,
+  mid-cutover, makes one host's copy of the app call another host with credentials.
+- **The Django admin is superuser-only, and the check is at the AdminSite.**
+  `ims/admin_site.py` overrides `has_permission`; `INSTALLED_APPS` names
+  `ims.apps.IMSAdminConfig`, not `django.contrib.admin`. Reverting that one line lets every
+  `is_staff` user back into every account's data, and no per-model test would fail — which is
+  why `SuperuserOnlyAdminSiteTests` asserts `admin.site`'s class directly.
+- **`Create*Serializer` handles PUT and PATCH too, not just POST.** Routing an edit to
+  `OrderSerializer`/`PurchaseSerializer` instead returns 200 having changed nothing but the
+  exchange rate — their `items` and party fields are read-only representations. A silent
+  discard, not an error.
+- **An edit's stock check must credit back the transaction's own units.** The rows are already
+  deducted, so `new_units > stock_quantity` rejects an order for stock it is itself holding.
+  Server: `_insufficient_stock_errors(credited_units=…)`. Browser:
+  `lib/transactionEdit.js::availableStock`. Both, or the two disagree and the form blocks a save
+  the API would have accepted.
+- **Stock deltas on an edit are computed over the *union* of old and new products.** A product
+  removed from the transaction appears in neither the new items nor any loop over them, so its
+  stock never comes back. `_stock_deltas` in `inventory/serializers.py`.
+- **Editing must not re-read `product.cost_price` for a line that was already there.**
+  `OrderItem.unit_cost_price` is a snapshot of what the sale cost at the time; re-stamping it
+  restates the profit of a past sale whenever a cost is corrected. Only genuinely new lines take
+  today's cost.
+- **`PurchaseItem.product` is a product *name* on the wire, `OrderItem.product` is an id.**
+  PurchaseItemSerializer declares it as a StringRelatedField. Any code turning saved items back
+  into form state has to know which — `toFormLines(..., {productKey})` does.
+- **Print rules hang off `.invoice-print` in `index.css`, and `@page { margin: 0 }` is
+  load-bearing.** It is the only CSS lever over the browser's own print headers/footers, and with
+  it the invoice must supply its own padding or the content runs to the paper edge. Don't
+  reintroduce a fixed `210mm` width — it overflows Letter's printable area and forces a scale-down
+  on mobile print renderers.
 - **`ProductPicker` only learns a product's name by being clicked.** Any code path that sets a line's
   `product` id some other way must also pass `selectedName`, or the picker reads "Select product"
   while holding a real id.

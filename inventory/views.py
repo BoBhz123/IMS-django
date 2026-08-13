@@ -141,7 +141,7 @@ class _TotalAnnotationMixin:
 
 
 class PurchaseViewSet(AccountScopedMixin, _TotalAnnotationMixin, ModelViewSet):
-    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+    http_method_names = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options']
     queryset = Purchase.objects.select_related('supplier').prefetch_related(
         Prefetch(
             'items',
@@ -155,7 +155,11 @@ class PurchaseViewSet(AccountScopedMixin, _TotalAnnotationMixin, ModelViewSet):
     ordering_fields = ['annotated_total', 'placed_at']
 
     def get_serializer_class(self):
-        if self.request.method == 'POST':
+        # PUT/PATCH belong on the write serializer too. Left on PurchaseSerializer they
+        # appear to work and do almost nothing: its `items` and `supplier` are read-only
+        # representations, so an edit would silently drop every line change and save only
+        # the exchange rate — a 200 that discarded the request.
+        if self.request.method in ('POST', 'PUT', 'PATCH'):
             return CreatePurchaseSerializer
         return PurchaseSerializer
 
@@ -174,7 +178,9 @@ class OrderViewSet(AccountScopedMixin, _TotalAnnotationMixin, ModelViewSet):
     ordering_fields = ['annotated_total', 'placed_at']
 
     def get_serializer_class(self):
-        if self.request.method == 'POST':
+        # See PurchaseViewSet.get_serializer_class — OrderSerializer's `items` is
+        # read_only=True, so editing through it would return 200 having changed nothing.
+        if self.request.method in ('POST', 'PUT', 'PATCH'):
             return CreateOrderSerializer
         return OrderSerializer
 
