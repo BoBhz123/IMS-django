@@ -80,6 +80,18 @@ class Account(models.Model):
         default=False,
         help_text='Set the first time a trial starts. Blocks a second free trial.',
     )
+    # When the whole unverified sign-up closes out. Stamped at registration and cleared the
+    # moment the email is verified, which is what makes it safe to hard-delete on: a NULL
+    # here means "this account has been through verification at least once", so an admin who
+    # puts a real customer back to pending_verification can never have their rows swept.
+    # Deriving the deadline from created_at instead would delete exactly that customer.
+    registration_expires_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text=(
+            'Deadline for an unverified sign-up. Cleared on verification; a NULL value '
+            'means this account is not a pending registration.'
+        ),
+    )
 
     # Set by the Paddle webhook so a renewal or cancellation can find its way back to the
     # right row. Blank for accounts activated by discount key, cash, or the admin.
@@ -118,6 +130,33 @@ class Account(models.Model):
     @property
     def is_trialing(self):
         return self.subscription_status == self.TRIALING and self.has_active_subscription
+
+    @property
+    def is_pending_registration(self):
+        """
+        Whether this row is an unverified sign-up that has never completed.
+
+        Both halves matter. The status alone is not enough — an admin can put a paying
+        customer back to pending_verification — and the timestamp alone is not enough
+        either, since it is only cleared on the *first* verification.
+        """
+        return (
+            self.subscription_status == self.PENDING_VERIFICATION
+            and self.registration_expires_at is not None
+        )
+
+    @property
+    def registration_session_expired(self):
+        """
+        Computed, for the same reason `has_active_subscription` is: nothing sweeps this
+        column on a schedule, so the row survives its own deadline until something asks.
+
+        False for anything that is not a pending registration, so a verified or paid account
+        can never read as an expired sign-up.
+        """
+        if not self.is_pending_registration:
+            return False
+        return self.registration_expires_at <= timezone.now()
 
     @property
     def payment_method(self):

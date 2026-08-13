@@ -230,19 +230,27 @@ class AccountAdmin(admin.ModelAdmin):
     # sanctioned way to give an account a second trial is the reset action, which forces it
     # deliberately and says so in the message. A hand-editable checkbox is the same power
     # with none of that signal.
-    readonly_fields = ['has_used_trial']
+    # Both read-only for everyone, superusers included, and for the same reason: they are
+    # latches rather than settings. `registration_expires_at` decides whether an unverified
+    # row may be hard-deleted, so hand-editing it is either extending a sign-up session
+    # arbitrarily or arming a delete on a row that should keep its address.
+    readonly_fields = ['has_used_trial', 'registration_expires_at']
     fieldsets = [
         (None, {'fields': ['name', 'phone']}),
         ('Subscription', {
             'fields': [
                 'subscription_status', 'plan_type', 'expires_at', 'trial_ends_at',
-                'has_used_trial',
+                'has_used_trial', 'registration_expires_at',
             ],
             'description': (
                 'expires_at and trial_ends_at are directly editable by superusers so a cash '
                 'or Whish sale can be dated by hand. Access is computed from these two '
                 'columns plus the status — setting the status to active without an expiry '
-                'grants unlimited access, which is what the lifetime plan is for.'
+                'grants unlimited access, which is what the lifetime plan is for. '
+                'registration_expires_at is set only for a sign-up that has never been '
+                'verified: once it passes, that account and its user are hard-deleted so '
+                'the email address is free to sign up again. It is cleared for good the '
+                'first time the address is verified.'
             ),
         }),
         ('Paddle', {

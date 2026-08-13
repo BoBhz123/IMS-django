@@ -8,6 +8,86 @@ the diff. Plans live in `CLAUDE.md`; this file is only for work that is done.
 
 ---
 
+## 2026-08-12 — The sign-up session: a deadline, a hard delete, and a way back
+
+Registration is now a *session* with an hour-long deadline of its own, and backing out of it
+is a button rather than a support ticket.
+
+**The premise it was requested under was wrong, and that is worth recording.** There was no
+hardcoded `123456` anywhere in the application — `verification.generate_code` has drawn from
+`secrets.randbelow` since Phase 2.5a, the code is stored as an HMAC and the templates render
+whatever was issued. Every `123456` in the tree is test data. `CODE_TTL` was already the
+requested 10 minutes. So nothing was removed; what was missing was everything *around* the
+code. `RegistrationSessionEndpointTests.test_the_emailed_code_is_generated_not_fixed` now
+signs up five times, reads the code out of each message, and fails if two ever match — a
+constant reintroduced here becomes a failing test rather than a belief about the code.
+
+**`registration_expires_at` is a separate column, not `created_at` plus an hour.** That
+choice is the whole safety argument. An admin can put a paying customer back to
+`pending_verification` — `VerifyEmailView` has handled that case since the trial work — and a
+derived deadline would read that customer as an hour-old sign-up and delete their login. The
+column is stamped once at registration and cleared for good at the first verification, so
+`is_pending_registration` needs the status *and* the timestamp, and a NULL means "this has
+been through verification at least once". There is a test for exactly that resurrection path.
+
+**Closing a session is a hard delete, because a soft one does not solve the problem.** There
+is a case-insensitive unique index on `auth_user.email` (migration 0004), so a row left
+behind keeps the address taken and "start over from scratch" fails with "an account with this
+email already exists" — the one error the user cannot fix themselves. `registration.discard`
+deletes the users, which cascades their memberships, their outstanding `EmailVerification`
+rows and their JWTs, then the account. It raises `NotDiscardable` rather than returning
+quietly, matching `start_trial`: a caller that believes it deleted an account and did not is
+worse than a loud failure, and this guard is what stands between an endpoint and a customer's
+data. Belt and braces beyond the status check — `has_used_trial`, `expires_at`, a Paddle
+customer id — because a row that has taken money is not a registration whatever its status
+column says.
+
+**A 410, deliberately, and not a 400.** An expired session and a mistyped digit are the two
+things this flow most needs to keep apart: one is recoverable by typing again, the other has
+destroyed the account the request was about. The response carries `code:
+'registration_expired'` and the SPA branches on that slug, never on the wording. An expired
+*code* inside a live session still returns `code_expired` and still asks for a resend — the
+two clocks are not the same clock, and collapsing them would throw away a registration over a
+ten-minute-old email.
+
+**Expiry is acted on at the endpoints, not by a job.** Nothing in this project runs on a
+schedule, which is the same reason trial liveness is computed rather than swept, so
+`verify-email/` and `resend-code/` both discard an expired registration before doing anything
+else. Verifying with a *correct* code after the deadline is refused, or the deadline would be
+advisory and one old email could hold an account open indefinitely.
+`purge_expired_registrations` is housekeeping for rows nobody ever comes back to, and reading
+`/accounts/subscription/` deliberately deletes nothing — a status poll that destroyed the
+account under the screen would be a very strange bug to diagnose.
+
+**"Back to sign up" exists for the typo.** Someone who mistyped their address cannot receive
+the code, cannot verify, and cannot re-register with the address they meant while the wrong
+row still holds it. Waiting an hour is not a fix a user should have to discover.
+`POST /accounts/abandon-registration/` discards the caller's own pending row and 409s on
+anything verified; the frontend clears its tokens whatever the server answers, because the
+row may already be gone and a token for a deleted user leaves the router bouncing back to a
+verification screen for an account that no longer exists.
+
+**The abandon endpoint's throttle is keyed on the client address, not the user — that is a
+hole this feature opened and closed in the same change.** Abandoning frees the email address,
+so sign-up → code → abandon → sign-up is a loop that mails the *same* victim repeatedly, and
+the per-user caps in `accounts.verification` cannot see it because every pass creates a new
+user row with a fresh budget. The address is the only identifier that survives the loop.
+
+The verify screen gains a live countdown (recomputed from the deadline each tick, so a
+backgrounded tab tells the truth when it wakes) and an expired state seeded from the server's
+computed `registration_session_expired` — the same reason `trial_days_remaining` is computed
+server-side, since a device with a wrong clock would otherwise either strand someone whose
+codes still work or show a live form for an account already deleted.
+
+Password reset needed no change and got none: it shares `issue_code`/`verify_code`, so it has
+always had dynamic codes, and it already blacklists every outstanding refresh token on
+confirm. It has no registration session to close.
+
+Verified: `manage.py test` 549 passed; `npm test` 269 passed; lint and build clean;
+`makemigrations --check` reports no drift.
+
+---
+
 ## 2026-08-12 — HTML transactional email
 
 Codes now go out as `multipart/alternative` — a table-based HTML part and a real plain-text

@@ -10,6 +10,7 @@ from rest_framework import serializers
 
 from .emails import send_verification_code
 from .models import Account, Membership, get_account
+from .registration import registration_deadline
 from .verification import issue_code
 
 
@@ -83,6 +84,10 @@ class UserCreateWithAccountSerializer(UserCreateSerializer):
             # trial days to a slow inbox.
             subscription_status=Account.PENDING_VERIFICATION,
             trial_ends_at=timezone.now() + timedelta(days=Account.TRIAL_DAYS),
+            # The sign-up session's own deadline, separate from the code's 10-minute TTL. A
+            # code can be re-sent; this one cannot be extended, and when it passes the whole
+            # registration is discarded so the address is free to sign up again.
+            registration_expires_at=registration_deadline(),
         )
         Membership.objects.create(user=user, account=account, is_owner=True)
 
@@ -159,6 +164,11 @@ class SubscriptionStatusSerializer(serializers.ModelSerializer):
     trial_days_remaining = serializers.IntegerField(read_only=True, allow_null=True)
     # 'card' | 'manual' | 'trial' | '' — inferred, see Account.payment_method.
     payment_method = serializers.CharField(read_only=True)
+    # Computed here for the same reason trial_days_remaining is: the verify screen must not
+    # decide the session is over against the device's clock while the server is still
+    # accepting codes, or the reverse. `registration_expires_at` ships alongside it only so
+    # the screen can render a countdown, never so it can make the decision itself.
+    registration_session_expired = serializers.BooleanField(read_only=True)
     email = serializers.SerializerMethodField()
 
     class Meta:
@@ -166,6 +176,7 @@ class SubscriptionStatusSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'subscription_status', 'plan_type', 'expires_at', 'trial_ends_at',
             'subscription_live', 'is_trial', 'trial_days_remaining', 'payment_method',
+            'registration_expires_at', 'registration_session_expired',
             'business_name', 'phone', 'email',
         ]
 
@@ -196,6 +207,8 @@ def subscription_payload(user):
         'is_trial': False,
         'trial_days_remaining': None,
         'payment_method': '',
+        'registration_expires_at': None,
+        'registration_session_expired': False,
         'business_name': '',
         'phone': '',
         'email': user.email,
