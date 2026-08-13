@@ -22,8 +22,17 @@ export function Login() {
     try {
       await login(email, password)
       navigate(location.state?.from?.pathname ?? '/', { replace: true })
-    } catch {
-      setError('Incorrect email or password.')
+    } catch (err) {
+      // The server's message when it has a real one, not a blanket "wrong password". A
+      // brute-force lockout comes back as 429 `account_locked`, and telling someone to check
+      // credentials that are already correct is why a locked-out account looked like a bug
+      // in the login form. Branch on the code, never the prose.
+      const data = err.response?.data
+      setError(
+        data?.code === 'account_locked' && typeof data.detail === 'string'
+          ? data.detail
+          : 'Incorrect email or password.',
+      )
     } finally {
       setSubmitting(false)
     }

@@ -155,7 +155,10 @@ if DEBUG:
     INSTALLED_APPS.append('debug_toolbar')
 
 AUTHENTICATION_BACKENDS = [
-    'axes.backends.AxesStandaloneBackend',
+    # Must stay first: it is what refuses a locked-out user before any credential is checked.
+    # Our subclass rather than axes' own, so the lockout reaches the caller as a 429 instead
+    # of a bare 401 that reads as a wrong password — see accounts/lockout.py.
+    'accounts.lockout.VisibleLockoutBackend',
     'django.contrib.auth.backends.ModelBackend',
 ]
 
@@ -366,6 +369,14 @@ CSRF_COOKIE_SECURE = not DEBUG
 AXES_FAILURE_LIMIT = 5
 AXES_COOLOFF_TIME = 1  # hour
 AXES_LOCKOUT_PARAMETERS = ['username', 'ip_address']
+# Without this axes returns a bare 401 for a lockout — indistinguishable from a wrong
+# password. The user is then told to check credentials that are already correct, and an
+# admin "fixing" it by toggling is_active sees nothing change, because AxesStandaloneBackend
+# rejects before the credential check ever runs. See accounts/lockout.py.
+#
+# Clearing a lockout is an operator action, not a flag: `manage.py axes_reset_username <u>`,
+# `axes_reset_ip <ip>`, or `axes_reset` for all of them.
+AXES_LOCKOUT_CALLABLE = 'accounts.lockout.lockout_response'
 # Heroku's router sits in front of every request as a single reverse proxy, so without this,
 # axes (via django-ipware) reads REMOTE_ADDR — Heroku's internal, per-request router-hop
 # address (10.x.x.x), not the real client IP. That makes the ['username', 'ip_address']

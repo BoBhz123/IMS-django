@@ -16,6 +16,7 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db import IntegrityError, transaction
+from django.conf import settings
 from django.test import Client, RequestFactory, TestCase, override_settings
 from django.utils import timezone
 
@@ -3550,3 +3551,184 @@ class SuperuserOnlyAdminSiteTests(TestCase):
         from ims.admin_site import SuperuserOnlyAdminSite
 
         self.assertIsInstance(admin.site, SuperuserOnlyAdminSite)
+
+
+class LockoutResponseTests(TestCase):
+    """
+    A lockout must not look like a wrong password.
+
+    django-axes rejects in AxesStandaloneBackend, which sits *first* in
+    AUTHENTICATION_BACKENDS — before credentials, before is_active, before anything the
+    Django admin can toggle. With no AXES_LOCKOUT_CALLABLE configured the rejection came back
+    as a bare 401, identical to a bad password, so a locked-out user was told to check
+    credentials that were already correct and an admin flipping is_active saw no effect and
+    no explanation. That is the whole defect: not that axes locks people out, which is the
+    point of it, but that it did so silently.
+    """
+
+    LIMIT = settings.AXES_FAILURE_LIMIT
+
+    def setUp(self):
+        # axes keys its counters per username+IP; a stale counter from another test would
+        # start this one already part-way to the limit.
+        cache.clear()
+        self.user = User.objects.create_user(
+            username='locktarget@example.com', email='locktarget@example.com',
+            password='correct-horse-battery',
+        )
+        self.client = APIClient()
+
+    def tearDown(self):
+        cache.clear()
+
+    def fail_login(self, times):
+        for _ in range(times):
+            self.client.post(
+                '/auth/jwt/create/',
+                {'username': self.user.username, 'password': 'wrong-password'},
+            )
+
+    def attempt(self, password):
+        return self.client.post(
+            '/auth/jwt/create/', {'username': self.user.username, 'password': password},
+        )
+
+    def test_a_wrong_password_below_the_limit_is_a_plain_401(self):
+        response = self.attempt('wrong-password')
+        self.assertEqual(response.status_code, 401)
+        self.assertNotEqual(response.json().get('code'), 'account_locked')
+
+    def test_a_lockout_is_429_and_says_so(self):
+        self.fail_login(self.LIMIT)
+        response = self.attempt('correct-horse-battery')
+
+        self.assertEqual(response.status_code, 429)
+        body = response.json()
+        self.assertEqual(body['code'], 'account_locked')
+        self.assertIn('too many', body['detail'].lower())
+
+    def test_the_lockout_response_carries_a_retry_after_header(self):
+        # The correct HTTP semantic for "come back later", and what tells the caller how long
+        # the cooloff actually is rather than making them guess.
+        self.fail_login(self.LIMIT)
+        response = self.attempt('correct-horse-battery')
+
+        self.assertIn('Retry-After', response)
+        self.assertEqual(int(response['Retry-After']), int(settings.AXES_COOLOFF_TIME * 3600))
+
+    def test_a_locked_out_user_is_refused_even_with_the_right_password(self):
+        # The behaviour itself is unchanged and must stay that way — this pins that making
+        # the lockout visible did not make it toothless.
+        self.fail_login(self.LIMIT)
+        self.assertNotEqual(self.attempt('correct-horse-battery').status_code, 200)
+
+    def test_activating_the_user_in_admin_does_not_lift_a_lockout(self):
+        """
+        The reported symptom, pinned as expected behaviour rather than fixed.
+
+        Axes rejects before the credential check, so is_active is never consulted — toggling
+        it cannot and should not clear a brute-force lockout. The fix is that the caller is
+        now told this instead of being shown a password error.
+        """
+        self.fail_login(self.LIMIT)
+        self.user.is_active = True
+        self.user.save(update_fields=['is_active'])
+
+        response = self.attempt('correct-horse-battery')
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.json()['code'], 'account_locked')
+
+    def test_axes_reset_username_clears_the_lockout(self):
+        # The documented operator remedy. If this ever stops working there is no way back in
+        # for a locked-out customer short of waiting out the cooloff.
+        self.fail_login(self.LIMIT)
+        self.assertEqual(self.attempt('correct-horse-battery').status_code, 429)
+
+        call_command('axes_reset_username', self.user.username)
+        self.assertEqual(self.attempt('correct-horse-battery').status_code, 200)
+
+
+class SignupEmailFailureTests(TestCase):
+    """
+    A failing OTP email must leave a clean, usable account behind.
+
+    Verified rather than changed: `UserCreateWithAccountSerializer.create` is already
+    @transaction.atomic and already sends through transaction.on_commit, so the send happens
+    after the rows are committed and cannot roll them back — and `emails._send_code` catches
+    everything and returns False rather than raising. These tests exist because that is a
+    designed behaviour nobody had pinned, and it is one refactor away from becoming an
+    orphaned-row bug.
+    """
+
+    PAYLOAD = {
+        'email': 'newsignup@example.com', 'password': 'sufficiently-long-pw-42',
+        'phone': '+961 70 123 456', 'business_name': 'Test Shop',
+    }
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+
+    def post_signup(self, **overrides):
+        return self.client.post('/auth/users/', {**self.PAYLOAD, **overrides})
+
+    def test_signup_succeeds_when_the_mail_server_is_unreachable(self):
+        # The exact production failure: ConnectionRefusedError from smtplib because no mail
+        # host was configured on the dyno.
+        with patch(
+            'accounts.emails.EmailMultiAlternatives.send',
+            side_effect=ConnectionRefusedError(111, 'Connection refused'),
+        ):
+            response = self.post_signup()
+
+        self.assertEqual(response.status_code, 201, response.content)
+
+    def test_the_account_is_complete_and_usable_after_a_failed_send(self):
+        with patch(
+            'accounts.emails.EmailMultiAlternatives.send',
+            side_effect=SMTPException('525 Unauthorized IP address'),
+        ):
+            self.post_signup()
+
+        user = User.objects.get(username='newsignup@example.com')
+        account = get_account(user)
+        # Not a half-built row: the membership and the account both exist, so the user can
+        # sign in and reach the verify screen to ask for another code.
+        self.assertIsNotNone(account)
+        self.assertEqual(account.subscription_status, Account.PENDING_VERIFICATION)
+        self.assertIsNotNone(account.registration_expires_at)
+        # And a code was issued, so a resend is a resend rather than a first send.
+        self.assertTrue(
+            EmailVerification.objects.filter(
+                user=user, purpose=EmailVerification.EMAIL_VERIFICATION,
+            ).exists()
+        )
+
+    def test_a_failed_send_does_not_block_re_registration(self):
+        # The address must not end up permanently taken by a sign-up that never completed.
+        # Abandoning it frees the address; that is the designed recovery, and the purge
+        # command does the same thing on a timer.
+        with patch(
+            'accounts.emails.EmailMultiAlternatives.send',
+            side_effect=SMTPException('525 Unauthorized IP address'),
+        ):
+            self.post_signup()
+
+        user = User.objects.get(username='newsignup@example.com')
+        registration.discard(get_account(user), reason='abandoned')
+
+        self.assertFalse(User.objects.filter(username='newsignup@example.com').exists())
+        with patch('accounts.emails.EmailMultiAlternatives.send', return_value=1):
+            self.assertEqual(self.post_signup().status_code, 201)
+
+    def test_a_signup_that_fails_after_the_user_row_leaves_nothing_behind(self):
+        # The atomicity half. issue_code runs inside create()'s transaction, so a failure
+        # there must take the user, account and membership with it.
+        before = User.objects.count()
+        with patch('accounts.serializers.issue_code', side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError):
+                self.post_signup()
+
+        self.assertEqual(User.objects.count(), before)
+        self.assertFalse(Account.objects.filter(name='Test Shop').exists())
+        self.assertFalse(Membership.objects.filter(user__username='newsignup@example.com').exists())
