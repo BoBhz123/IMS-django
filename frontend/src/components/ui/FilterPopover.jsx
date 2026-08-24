@@ -81,9 +81,11 @@ export function FilterPopover({ activeCount = 0, onClear, children, label = 'Sho
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: -4, scale: 0.98 }}
             transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
-            // Right-aligned on wide screens so it cannot run off the edge when the trigger sits
-            // near the right of the header; full-width and left-anchored on a phone.
-            className="absolute left-0 z-40 mt-2 w-[min(20rem,calc(100vw-2rem))] origin-top-left rounded-squircle-sm border border-glass-border bg-glass-strong p-4 backdrop-blur-2xl [box-shadow:var(--shadow-glass)] sm:left-auto sm:right-0 sm:origin-top-right"
+            // Left-anchored at every width. The trigger is the leftmost thing in each page
+            // header, so aligning the panel's *right* edge to it would hang the panel off the
+            // left of the viewport. Capped against the viewport so it cannot overflow right
+            // either, which is what a narrow phone would otherwise do.
+            className="absolute left-0 z-40 mt-2 w-[min(20rem,calc(100vw-2rem))] origin-top-left rounded-squircle-sm border border-glass-border bg-glass-strong p-4 backdrop-blur-2xl [box-shadow:var(--shadow-glass)]"
           >
             <div className="mb-3 flex items-center justify-between">
               <span className="text-[12px] font-semibold text-text-primary">Filters</span>
