@@ -55,7 +55,9 @@ describe('Expenses', () => {
   it('filters by category', async () => {
     render(<Expenses />)
     await screen.findByText('Shop rent')
-    await userEvent.selectOptions(screen.getByLabelText(/category/i), 'marketing')
+    // The filters live behind "Show filters" now rather than inline in the page header.
+    await userEvent.click(screen.getByRole('button', { name: /show filters/i }))
+    await userEvent.selectOptions(await screen.findByLabelText(/category/i), 'marketing')
 
     await waitFor(() => {
       const lastCall = get.mock.calls[get.mock.calls.length - 1]

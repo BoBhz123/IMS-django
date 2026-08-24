@@ -55,12 +55,18 @@ export function FilterPopover({ activeCount = 0, onClear, children, label = 'Sho
         onClick={() => setOpen((current) => !current)}
         aria-expanded={open}
         aria-haspopup="dialog"
+        // Spelled out rather than left to the default name computation, which concatenates the
+        // label and the count badge with no separator and announces "Show filters2".
+        aria-label={activeCount > 0 ? `${label} (${activeCount} active)` : label}
         className={btnSecondary}
       >
         <SlidersHorizontal size={14} />
         {label}
         {activeCount > 0 && (
-          <span className="ml-0.5 flex h-5 min-w-5 items-center justify-center rounded-full bg-accent-blue px-1.5 text-[11px] font-semibold text-white tabular-nums">
+          <span
+            aria-hidden="true"
+            className="ml-0.5 flex h-5 min-w-5 items-center justify-center rounded-full bg-accent-blue px-1.5 text-[11px] font-semibold text-white tabular-nums"
+          >
             {activeCount}
           </span>
         )}

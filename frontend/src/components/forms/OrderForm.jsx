@@ -525,7 +525,9 @@ function OrderFormBody({ onClose, onSaved, customers: initialCustomers, order = 
           disabled={
             saving || hasBlockingStockError(items) || partialAmountMissing(paymentStatus, paidAmount)
           }
-          className="mt-1 flex items-center justify-center gap-2 rounded-xl bg-accent-blue py-2.5 text-[14px] font-semibold text-white hover:opacity-90 disabled:opacity-60"
+          // Full width and a size up from the shared primary — this is the one action the
+          // whole slide-over exists for.
+          className={`${btnPrimary} mt-1 w-full py-2.5 text-[14px]`}
         >
           {saving && <Loader2 size={14} className="animate-spin" />}
           {editing ? 'Save changes' : 'Create order'}

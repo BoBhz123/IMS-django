@@ -4252,6 +4252,143 @@ class PaymentStatusTests(AccountFixtureMixin, APITestCase):
         self.assertEqual(purchase.remaining_amount, Decimal('30.00'))
 
 
+class PaymentStatusFilterTests(AccountFixtureMixin, APITestCase):
+    """
+    `?payment_status=` on /inventory/orders/ and /inventory/purchases/.
+
+    Filtering on the stored column is safe in a way that *branching* on it is not: unlike
+    Account.subscription_status, which nothing recomputes and which therefore goes stale,
+    `_settle_payment` re-derives this one from `paid_amount` on every write.
+    """
+
+    def setUp(self):
+        self.account, self.user, self.client, self.auth_header = self.make_account_user('shopkeeper')
+        self.category = Category.objects.create(name='General', account=self.account)
+        self.customer = Customer.objects.create(name='Acme', account=self.account)
+        self.supplier = Supplier.objects.create(name='Supplier Co', account=self.account)
+        self.product = Product.objects.create(
+            name='Widget', description='', cost_price='4.00', default_sell_price='10.00',
+            category=self.category, stock_quantity=500, account=self.account,
+        )
+
+    def place_order(self, paid_amount):
+        """One order for 5 x $10 = $50, settled by `paid_amount`."""
+        response = self.client.post(
+            '/inventory/orders/',
+            {
+                'customer': self.customer.id, 'exchange_rate': 89000,
+                'paid_amount': paid_amount,
+                'items': [{'product': self.product.id, 'quantity': 5, 'unit_price': '10.00'}],
+            },
+            content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        return response.json()['id']
+
+    def place_purchase(self, paid_amount):
+        response = self.client.post(
+            '/inventory/purchases/',
+            {
+                'supplier': self.supplier.id, 'exchange_rate': 89000,
+                'paid_amount': paid_amount,
+                'items': [{'product': self.product.id, 'quantity': 10, 'unit_price': '4.00'}],
+            },
+            content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        return response.json()['id']
+
+    def filtered_ids(self, path, status):
+        response = self.client.get(
+            path, {'payment_status': status}, HTTP_AUTHORIZATION=self.auth_header,
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        return {str(row['id']) for row in response.json()['results']}
+
+    def test_orders_can_be_narrowed_to_each_settlement_state(self):
+        unpaid = self.place_order('0.00')
+        partial = self.place_order('20.00')
+        paid = self.place_order('50.00')
+
+        self.assertEqual(self.filtered_ids('/inventory/orders/', 'UNPAID'), {str(unpaid)})
+        self.assertEqual(self.filtered_ids('/inventory/orders/', 'PARTIALLY_PAID'), {str(partial)})
+        self.assertEqual(self.filtered_ids('/inventory/orders/', 'PAID'), {str(paid)})
+
+    def test_purchases_can_be_narrowed_to_each_settlement_state(self):
+        unpaid = self.place_purchase('0.00')
+        partial = self.place_purchase('10.00')
+        paid = self.place_purchase('40.00')
+
+        self.assertEqual(self.filtered_ids('/inventory/purchases/', 'UNPAID'), {str(unpaid)})
+        self.assertEqual(
+            self.filtered_ids('/inventory/purchases/', 'PARTIALLY_PAID'), {str(partial)},
+        )
+        self.assertEqual(self.filtered_ids('/inventory/purchases/', 'PAID'), {str(paid)})
+
+    def test_the_filter_follows_an_edit_that_changed_the_settlement(self):
+        # The whole reason filtering on this column is defensible: it is re-derived on write.
+        order = self.place_order('0.00')
+        self.assertEqual(self.filtered_ids('/inventory/orders/', 'UNPAID'), {str(order)})
+
+        response = self.client.put(
+            f'/inventory/orders/{order}/',
+            {
+                'customer': self.customer.id, 'exchange_rate': 89000,
+                'paid_amount': '50.00',
+                'items': [{'product': self.product.id, 'quantity': 5, 'unit_price': '10.00'}],
+            },
+            content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+
+        self.assertEqual(self.filtered_ids('/inventory/orders/', 'UNPAID'), set())
+        self.assertEqual(self.filtered_ids('/inventory/orders/', 'PAID'), {str(order)})
+
+    def test_the_filter_never_reaches_another_accounts_rows(self):
+        # A filter is a queryset method, and a queryset that was not scoped first would happily
+        # return every account's unpaid orders. AccountScopedMixin runs before the FilterSet;
+        # this is the test that says so.
+        mine = self.place_order('0.00')
+
+        other_account, _, other_client, other_header = self.make_account_user('intruder')
+        other_category = Category.objects.create(name='General', account=other_account)
+        other_customer = Customer.objects.create(name='Other Co', account=other_account)
+        other_product = Product.objects.create(
+            name='Their Widget', description='', cost_price='1.00', default_sell_price='2.00',
+            category=other_category, stock_quantity=50, account=other_account,
+        )
+        response = other_client.post(
+            '/inventory/orders/',
+            {
+                'customer': other_customer.id, 'exchange_rate': 89000,
+                'items': [{'product': other_product.id, 'quantity': 1, 'unit_price': '2.00'}],
+            },
+            content_type='application/json', HTTP_AUTHORIZATION=other_header,
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        theirs = response.json()['id']
+
+        # Both orders are UNPAID; each account sees only its own.
+        self.assertEqual(self.filtered_ids('/inventory/orders/', 'UNPAID'), {str(mine)})
+        other_response = other_client.get(
+            '/inventory/orders/', {'payment_status': 'UNPAID'}, HTTP_AUTHORIZATION=other_header,
+        )
+        self.assertEqual(
+            {str(row['id']) for row in other_response.json()['results']}, {str(theirs)},
+        )
+
+    def test_an_unknown_status_is_rejected_rather_than_ignored(self):
+        # django-filter validates a model ChoiceField, so a typo is a 400. Silently returning
+        # everything would read as "no orders are settled that way" when the truth is that the
+        # caller asked a question the server did not understand.
+        self.place_order('0.00')
+        response = self.client.get(
+            '/inventory/orders/', {'payment_status': 'SORT_OF_PAID'},
+            HTTP_AUTHORIZATION=self.auth_header,
+        )
+        self.assertEqual(response.status_code, 400, response.content)
+
+
 class SingleCurrencyExportTests(AccountFixtureMixin, APITestCase):
     """
     With dual currency off, the CSV exports carry no conversion column.

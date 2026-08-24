@@ -10,7 +10,6 @@ import {
   Pencil,
   Plus,
   Search,
-  X,
 } from 'lucide-react'
 import axios from 'axios'
 import { api } from '@/lib/api'
@@ -19,6 +18,8 @@ import { GlassCard } from '@/components/ui/GlassCard'
 import { StockBadge } from '@/components/ui/StockBadge'
 import { ProductForm } from '@/components/forms/ProductForm'
 import { ExportButton } from '@/components/ui/ExportButton'
+import { FilterField, FilterPopover, filterControlClass } from '@/components/ui/FilterPopover'
+import { btnIcon, btnPrimary } from '@/lib/buttonStyles'
 
 export function Products() {
   const [searchInput, setSearchInput] = useState('')
@@ -104,7 +105,15 @@ export function Products() {
     }
   }
 
-  const hasFilters = search || category !== 'all' || supplier !== 'all' || minPrice || maxPrice
+  // A count rather than the old boolean: the popover badge says how many. Min and max price
+  // are one range but two independently-set filters, which is what the user sees.
+  const activeFilters = [
+    search,
+    category !== 'all' ? category : '',
+    supplier !== 'all' ? supplier : '',
+    minPrice,
+    maxPrice,
+  ].filter(Boolean).length
 
   function clearFilters() {
     setSearchInput('')
@@ -140,7 +149,7 @@ export function Products() {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center gap-2">
-        <div className="flex-1">
+        <FilterPopover activeCount={activeFilters} onClear={clearFilters}>
           <FilterBar
             searchInput={searchInput}
             onSearchChange={setSearchInput}
@@ -154,19 +163,16 @@ export function Products() {
             onMaxPriceChange={updateFilter(setMaxPrice)}
             categories={lookups.categories}
             suppliers={lookups.suppliers}
-            hasFilters={hasFilters}
-            onClear={clearFilters}
           />
+        </FilterPopover>
+
+        <div className="ml-auto flex items-center gap-2">
+          <ExportButton url="/inventory/products/export/csv/" params={exportParams} filename="products.csv" />
+          <button type="button" onClick={openAdd} className={btnPrimary}>
+            <Plus size={14} />
+            Add product
+          </button>
         </div>
-        <ExportButton url="/inventory/products/export/csv/" params={exportParams} filename="products.csv" />
-        <button
-          type="button"
-          onClick={openAdd}
-          className="flex shrink-0 items-center gap-1.5 rounded-xl bg-accent-blue px-3 py-2 text-[13px] font-semibold text-white hover:opacity-90"
-        >
-          <Plus size={14} />
-          Add product
-        </button>
       </div>
 
       {status === 'error' && (
@@ -230,6 +236,12 @@ export function Products() {
   )
 }
 
+/**
+ * The filter controls, stacked for the popover.
+ *
+ * "Clear all" moved up to FilterPopover, which owns it for every page — this component no
+ * longer takes `hasFilters`/`onClear`.
+ */
 function FilterBar({
   searchInput,
   onSearchChange,
@@ -243,72 +255,64 @@ function FilterBar({
   onMaxPriceChange,
   categories,
   suppliers,
-  hasFilters,
-  onClear,
 }) {
   return (
-    <div className="flex flex-wrap items-center gap-2">
-      <div className="flex min-w-[200px] flex-1 items-center gap-2 rounded-xl border border-hairline bg-canvas-2 px-3 py-2">
-        <Search size={15} className="shrink-0 text-text-tertiary" />
-        <input
-          type="text"
-          value={searchInput}
-          onChange={(event) => onSearchChange(event.target.value)}
-          placeholder="Search name or barcode…"
-          className="w-full bg-transparent text-[13px] text-text-primary placeholder:text-text-tertiary focus:outline-none"
-        />
-      </div>
+    <>
+      <FilterField label="Search">
+        <div className="flex items-center gap-2 rounded-xl border border-hairline bg-canvas-2 px-3 py-2">
+          <Search size={15} className="shrink-0 text-text-tertiary" />
+          <input
+            type="text"
+            value={searchInput}
+            onChange={(event) => onSearchChange(event.target.value)}
+            placeholder="Search name or barcode…"
+            className="w-full bg-transparent text-[13px] text-text-primary placeholder:text-text-tertiary focus:outline-none"
+          />
+        </div>
+      </FilterField>
 
-      <FilterSelect value={category} onChange={onCategoryChange} label="All categories">
-        {categories.map((c) => (
-          <option key={c.id} value={c.id}>
-            {c.name}
-          </option>
-        ))}
-      </FilterSelect>
-
-      <FilterSelect value={supplier} onChange={onSupplierChange} label="All suppliers">
-        {suppliers.map((s) => (
-          <option key={s.id} value={s.id}>
-            {s.name}
-          </option>
-        ))}
-      </FilterSelect>
-
-      <div className="flex items-center gap-1.5">
-        <PriceInput value={minPrice} onChange={onMinPriceChange} placeholder="Min $" />
-        <span className="text-text-tertiary">–</span>
-        <PriceInput value={maxPrice} onChange={onMaxPriceChange} placeholder="Max $" />
-      </div>
-
-      {hasFilters && (
-        <button
-          type="button"
-          onClick={onClear}
-          className="flex items-center gap-1 rounded-xl px-2.5 py-2 text-[13px] font-medium text-text-secondary hover:bg-canvas-2 hover:text-text-primary"
+      <FilterField label="Category">
+        <select
+          value={category}
+          onChange={(event) => onCategoryChange(event.target.value)}
+          className={filterControlClass}
         >
-          <X size={14} />
-          Clear
-        </button>
-      )}
-    </div>
+          <option value="all">All categories</option>
+          {categories.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.name}
+            </option>
+          ))}
+        </select>
+      </FilterField>
+
+      <FilterField label="Supplier">
+        <select
+          value={supplier}
+          onChange={(event) => onSupplierChange(event.target.value)}
+          className={filterControlClass}
+        >
+          <option value="all">All suppliers</option>
+          {suppliers.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.name}
+            </option>
+          ))}
+        </select>
+      </FilterField>
+
+      <FilterField label="Sell price range">
+        <div className="flex items-center gap-1.5">
+          <PriceInput value={minPrice} onChange={onMinPriceChange} placeholder="Min $" label="Minimum price" />
+          <span className="text-text-tertiary">–</span>
+          <PriceInput value={maxPrice} onChange={onMaxPriceChange} placeholder="Max $" label="Maximum price" />
+        </div>
+      </FilterField>
+    </>
   )
 }
 
-function FilterSelect({ value, onChange, label, children }) {
-  return (
-    <select
-      value={value}
-      onChange={(event) => onChange(event.target.value)}
-      className="rounded-xl border border-hairline bg-canvas-2 px-3 py-2 text-[13px] text-text-primary focus:outline-none"
-    >
-      <option value="all">{label}</option>
-      {children}
-    </select>
-  )
-}
-
-function PriceInput({ value, onChange, placeholder }) {
+function PriceInput({ value, onChange, placeholder, label }) {
   return (
     <input
       type="number"
@@ -316,7 +320,10 @@ function PriceInput({ value, onChange, placeholder }) {
       value={value}
       onChange={(event) => onChange(event.target.value)}
       placeholder={placeholder}
-      className="w-20 rounded-xl border border-hairline bg-canvas-2 px-2.5 py-2 text-[13px] text-text-primary placeholder:text-text-tertiary focus:outline-none"
+      // Both boxes render the same UA spinner and the same placeholder shape; without a label
+      // a screen reader cannot tell which end of the range it is on.
+      aria-label={label}
+      className="w-full min-w-0 rounded-xl border border-hairline bg-canvas-2 px-2.5 py-2 text-[13px] text-text-primary placeholder:text-text-tertiary focus:outline-none"
     />
   )
 }
@@ -493,7 +500,7 @@ function PageButton({ disabled, onClick, children }) {
       type="button"
       disabled={disabled}
       onClick={onClick}
-      className="flex h-8 w-8 items-center justify-center rounded-lg border border-hairline text-text-secondary hover:bg-canvas-2 hover:text-text-primary disabled:pointer-events-none disabled:opacity-30"
+      className={btnIcon}
     >
       {children}
     </button>

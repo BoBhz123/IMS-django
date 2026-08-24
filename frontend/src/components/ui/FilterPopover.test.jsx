@@ -59,6 +59,12 @@ describe('FilterPopover', () => {
     expect(screen.getByText('3')).toBeInTheDocument()
   })
 
+  it('announces the count rather than running it into the label', () => {
+    // The default name computation concatenates with no separator — "Show filters3".
+    render(<FilterPopover activeCount={3}><input aria-label="Search" /></FilterPopover>)
+    expect(screen.getByRole('button', { name: 'Show filters (3 active)' })).toBeInTheDocument()
+  })
+
   it('hides the count badge when nothing is filtered', () => {
     render(<FilterPopover activeCount={0}><input aria-label="Search" /></FilterPopover>)
     expect(screen.queryByText('0')).not.toBeInTheDocument()

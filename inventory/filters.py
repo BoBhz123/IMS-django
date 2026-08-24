@@ -25,9 +25,13 @@ class PurchaseFilter(FilterSet):
             'id':['exact'],
             'supplier':['exact'],
             'placed_at': ['exact', 'year', 'month', 'day'],
+            # Filtering on the stored column is safe here, unlike branching on it in code:
+            # `_settle_payment` recomputes it from `paid_amount` on every write, so it cannot go
+            # stale the way `Account.subscription_status` does (nothing there recomputes on read).
+            'payment_status': ['exact'],
         }
-     
-     
+
+
 class OrderFilter(FilterSet):
     class Meta:
         model = Order
@@ -35,6 +39,8 @@ class OrderFilter(FilterSet):
             'id':['exact'],
             'customer':['exact'],
             'placed_at': ['exact', 'year', 'month', 'day'],
+            # See PurchaseFilter.
+            'payment_status': ['exact'],
         }
        
      

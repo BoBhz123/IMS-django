@@ -14,6 +14,7 @@ import { useAllProducts } from '@/hooks/useAllProducts'
 import { useOpenSession } from '@/hooks/useOpenSession'
 import { PaymentSection } from '@/components/forms/PaymentSection'
 import { PAYMENT_STATUS, partialAmountMissing, paymentPayload } from '@/lib/payment'
+import { btnPrimary } from '@/lib/buttonStyles'
 import { partyIdByName, toFormLines } from '@/lib/transactionEdit'
 
 function emptyItem() {
@@ -430,7 +431,9 @@ function PurchaseFormBody({ onClose, onSaved, suppliers: initialSuppliers, purch
         <button
           type="submit"
           disabled={saving || partialAmountMissing(paymentStatus, paidAmount)}
-          className="mt-1 flex items-center justify-center gap-2 rounded-xl bg-accent-blue py-2.5 text-[14px] font-semibold text-white hover:opacity-90 disabled:opacity-60"
+          // Full width and a size up from the shared primary — this is the one action the
+          // whole slide-over exists for.
+          className={`${btnPrimary} mt-1 w-full py-2.5 text-[14px]`}
         >
           {saving && <Loader2 size={14} className="animate-spin" />}
           {editing ? 'Save changes' : 'Create purchase'}

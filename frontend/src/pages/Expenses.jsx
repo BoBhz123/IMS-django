@@ -13,6 +13,8 @@ import { useCurrency } from '@/context/CurrencyContext'
 import { GlassCard } from '@/components/ui/GlassCard'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { ExpenseForm } from '@/components/forms/ExpenseForm'
+import { FilterField, FilterPopover, filterControlClass } from '@/components/ui/FilterPopover'
+import { btnPrimary } from '@/lib/buttonStyles'
 import { EXPENSE_CATEGORIES, categoryLabel } from '@/lib/expenses'
 
 const PAGE_SIZE = 10
@@ -88,6 +90,24 @@ export function Expenses() {
     }
   }
 
+  // `searchInput`, not the debounced `search`: the badge should react as the user types rather
+  // than 350ms later, which would read as the control being broken.
+  const activeFilters = [
+    searchInput,
+    category !== 'all' ? category : '',
+    spentAfter,
+    spentBefore,
+  ].filter(Boolean).length
+
+  function clearFilters() {
+    setSearchInput('')
+    setSearch('')
+    setCategory('all')
+    setSpentAfter('')
+    setSpentBefore('')
+    setPage(1)
+  }
+
   function openAdd() {
     setEditing(null)
     setFormOpen(true)
@@ -106,56 +126,60 @@ export function Expenses() {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center gap-2">
-        <div className="flex min-w-[180px] flex-1 items-center gap-2 rounded-xl border border-hairline bg-canvas-2 px-3 py-2">
-          <Search size={15} className="shrink-0 text-text-tertiary" />
-          <input
-            type="text"
-            value={searchInput}
-            onChange={(event) => setSearchInput(event.target.value)}
-            placeholder="Search expenses…"
-            className="w-full bg-transparent text-[13px] text-text-primary placeholder:text-text-tertiary focus:outline-none"
-          />
+        <FilterPopover activeCount={activeFilters} onClear={clearFilters}>
+          <FilterField label="Search">
+            <div className="flex items-center gap-2 rounded-xl border border-hairline bg-canvas-2 px-3 py-2">
+              <Search size={15} className="shrink-0 text-text-tertiary" />
+              <input
+                type="text"
+                value={searchInput}
+                onChange={(event) => setSearchInput(event.target.value)}
+                placeholder="Search expenses…"
+                aria-label="Search expenses"
+                className="w-full bg-transparent text-[13px] text-text-primary placeholder:text-text-tertiary focus:outline-none"
+              />
+            </div>
+          </FilterField>
+
+          <FilterField label="Category">
+            <select
+              aria-label="Category"
+              value={category}
+              onChange={(event) => updateFilter(setCategory)(event.target.value)}
+              className={filterControlClass}
+            >
+              <option value="all">All categories</option>
+              {EXPENSE_CATEGORIES.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </FilterField>
+
+          {/* Both boxes render the UA's identical mm/dd/yyyy hint, which says nothing about
+              which end of the range it is — hence a visible label on each, not just an
+              aria-label. */}
+          <div className="grid grid-cols-2 gap-2">
+            <DateFilter
+              label="Start date"
+              value={spentAfter}
+              onChange={updateFilter(setSpentAfter)}
+            />
+            <DateFilter
+              label="End date"
+              value={spentBefore}
+              onChange={updateFilter(setSpentBefore)}
+            />
+          </div>
+        </FilterPopover>
+
+        <div className="ml-auto flex items-center gap-2">
+          <button type="button" onClick={openAdd} className={btnPrimary}>
+            <Plus size={14} />
+            Add expense
+          </button>
         </div>
-
-        <label className="flex items-center gap-1.5 text-[12px] text-text-secondary">
-          <span className="sr-only sm:not-sr-only">Category</span>
-          <select
-            aria-label="Category"
-            value={category}
-            onChange={(event) => updateFilter(setCategory)(event.target.value)}
-            className={FILTER_CLASS}
-          >
-            <option value="all">All categories</option>
-            {EXPENSE_CATEGORIES.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        {/* Labelled visibly, not just for screen readers: an empty date input renders the
-            UA's own mm/dd/yyyy hint, which is identical in both boxes and says nothing about
-            which end of the range it is. */}
-        <DateFilter
-          label="Start date"
-          value={spentAfter}
-          onChange={updateFilter(setSpentAfter)}
-        />
-        <DateFilter
-          label="End date"
-          value={spentBefore}
-          onChange={updateFilter(setSpentBefore)}
-        />
-
-        <button
-          type="button"
-          onClick={openAdd}
-          className="flex shrink-0 items-center gap-1.5 rounded-xl bg-accent-blue px-3 py-2 text-[13px] font-semibold text-white hover:opacity-90"
-        >
-          <Plus size={14} />
-          Add expense
-        </button>
       </div>
 
       {status === 'error' && (
@@ -221,19 +245,16 @@ export function Expenses() {
   )
 }
 
-const FILTER_CLASS =
-  'rounded-xl border border-hairline bg-canvas-2 px-2.5 py-2 text-[13px] text-text-primary focus:outline-none'
-
 // color-scheme is inherited from :root / .dark in index.css, so the native picker and its
 // calendar glyph already follow the theme. Restating it here — tied to the theme, never
 // hardcoded to dark — keeps that true if this input is ever moved inside a container that
 // resets it, and is what stops a light-on-light glyph in dark mode.
-const DATE_FILTER_CLASS = `${FILTER_CLASS} scheme-light dark:scheme-dark [&::-webkit-calendar-picker-indicator]:cursor-pointer [&::-webkit-calendar-picker-indicator]:opacity-60 [&::-webkit-calendar-picker-indicator]:hover:opacity-100`
+const DATE_FILTER_CLASS = `${filterControlClass} scheme-light dark:scheme-dark [&::-webkit-calendar-picker-indicator]:cursor-pointer [&::-webkit-calendar-picker-indicator]:opacity-60 [&::-webkit-calendar-picker-indicator]:hover:opacity-100`
 
 function DateFilter({ label, value, onChange }) {
   return (
-    <label className="flex items-center gap-1.5 text-[12px] text-text-secondary">
-      <span className="whitespace-nowrap">{label}</span>
+    <label className="flex flex-col gap-1">
+      <span className="text-[11px] font-medium text-text-tertiary">{label}</span>
       <input
         type="date"
         aria-label={label}

@@ -557,6 +557,37 @@ when the page came from there.
 `DomainConfigurationTests` (`inventory/tests.py`) pins all of this, including a guard that
 fails if the old subdomain reappears in `ims/`, `accounts/`, `inventory/` or `frontend/src/`.
 
+### UX polish, payment controls, filter consolidation — **done (2026-08-24)**
+
+**Design:** `docs/superpowers/specs/2026-08-24-ux-polish-payment-controls-filters-design.md` ·
+**Plan:** `docs/superpowers/plans/2026-08-24-ux-polish-payment-controls-filters.md`
+
+Seven pieces of frontend work plus one additive backend filter, grouped because they all land in
+the same six files. What shipped:
+
+- **`FilterPopover`** — one "Show filters" button per list page (Orders, Purchases, Products,
+  Expenses) with an active-filter count and "Clear all". The primary action and the export button
+  deliberately stay outside it; burying the thing the user came to do is not a tidier header.
+- **Payment controls** on both transaction forms (`components/forms/PaymentSection.jsx`,
+  `lib/payment.js`) and **payment badges** with the outstanding balance on both list pages.
+- **Fluid product selection**: no seeded blank row, picker closes on select, quick-create works.
+- **`?payment_status=`** on `OrderFilter`/`PurchaseFilter`. No model change, no migration.
+
+Two defects were fixed behind the reported "modal freeze", and both are recorded in the Working
+Log below: `ProductForm` crashing when quick-created without lookup props, and nested overlays
+fighting over `document.body.style.overflow`.
+
+**Requirement 3 (default price pre-fill) was already implemented** before this work started —
+`applyScannedProduct` and `handleProductChange` in both forms already read `default_sell_price` /
+`cost_price`. It was discharged by adding tests that pin it rather than by writing it twice.
+
+Also fixed in passing: `Orders.jsx::openInvoice` built its invoice object without
+`payment_status`/`paid_amount`/`remaining_amount` and then passed all three to `<Invoice>`, so
+every invoice printed as unpaid with a zero balance regardless of what had been settled.
+
+Out of scope by decision: per-line or per-order discounts, customer/supplier balances, and a
+whole-SPA restyle (Dashboard, Settings, Subscription, Login and Signup are untouched).
+
 ---
 
 # Working Log — mistakes, gotchas, anti-patterns
@@ -602,7 +633,22 @@ Append here when something bites. Do not repeat these.
 - **Escape closes the topmost overlay only** (`lib/overlayStack.js` + `hooks/useOverlayLayer.js`).
   Modal and SlideOver each bind their own document listener; before the stack existed, one Escape
   inside a quick-create modal also closed the order form underneath it and discarded every entered
-  line item. Any new overlay primitive must go through `useOverlayLayer` or it reintroduces that.
+  line item. Any new overlay primitive must go through `useOverlayLayer` or it reintroduces that —
+  `FilterPopover` does, which is why it is safe to open one over a slide-over.
+- **Body-scroll locking is a refcount in `overlayStack`, not a line in each overlay** (2026-08-24).
+  Modal and SlideOver each used to set `document.body.style.overflow = 'hidden'` and blank it on
+  close, independently. With the order form → picker → quick-create stack the app actually
+  produces, closing the *inner* overlay handed page scrolling back while two were still open; the
+  reverse unmount order left the page locked with nothing on screen to explain it. `acquire`/
+  `releaseScrollLock` save and restore the page's own value rather than assuming `''`, and
+  `resetOverlayStack()` zeroes the count — without that a test that unmounts untidily leaves every
+  later test in the file running against a locked body.
+- **A component that spreads a list prop must be given the list, or fetch it.** `ProductForm`
+  spreads `categories`, and the order/purchase forms rendered it as a quick-create with no
+  `categories` and no `suppliers` — spreading `undefined` threw, React unmounted the tree, and the
+  user saw a backdrop with nothing on it. That is the "modal freeze" that was reported. Defaulting
+  to `[]` is *not* the fix: the category select is `required`, so an empty list is a form that can
+  never be submitted. `hooks/useProductLookups.js` fetches both when the props are absent.
 - **Quick-create forms return the created record**: `onSaved(created)` on Customer/Supplier/
   Category/ProductForm. That is what lets the order and purchase forms select the new row without a
   refetch. Existing callers ignore the argument, so it stayed backward compatible.
@@ -613,6 +659,35 @@ Append here when something bites. Do not repeat these.
   server and `lib/stock.js` still aggregate them because older orders have them.
 - **`ProductSearchModal` takes `disableOutOfStock`**: true for orders (cannot sell what is absent),
   false for purchases (a zero-stock product is exactly the one being restocked).
+- **The picker closes on select, and there is no seeded blank line** (owner's decision,
+  2026-08-24). This *reverses* the earlier "stays open so three items is three taps" optimisation.
+  Closing is the caller's job — both call sites do it — so the modal itself assumes neither
+  behaviour. `applyScannedProduct` keeps its "reuse the first blank line" branch even though the UI
+  no longer creates one: editing a saved transaction can still hydrate a blank, and dropping the
+  branch would append a duplicate line beside it.
+- **`payment_status` filtering is safe; `payment_status` *branching* is not.** `?payment_status=`
+  exists on `OrderFilter`/`PurchaseFilter` because `_settle_payment` re-derives the column on every
+  write, so unlike `Account.subscription_status` it cannot go stale. That is a statement about this
+  column only — the rule that `paid_amount` decides and the status is derived still holds.
+- **The payment controls send a status, and only sometimes an amount.** `lib/payment.js`:
+  `PAID`/`UNPAID` go over the wire as `payment_status` alone so the server settles them against the
+  total it computed from the rows it just wrote — a browser-side `paid_amount` would let a stale
+  form total overwrite the real one. `PARTIALLY_PAID` must carry `paid_amount`; the server 400s
+  without it, and the submit button is disabled on the same condition so the message lands beside
+  the field instead of after a round trip.
+- **`SegmentedControl`'s pill `layoutId` is per instance.** It was the constant `'segmented-pill'`,
+  and framer-motion treats one layoutId as one element *moving* — with two controls mounted the
+  pill flew across the screen between them. Reachable on the dashboard already; adding the payment
+  selector would have put a third on top.
+- **A trigger with a count badge needs an explicit `aria-label`.** The default name computation
+  concatenates with no separator, so `FilterPopover`'s button announced "Show filters2". It sets
+  `aria-label={...(N active)}` and marks the visual badge `aria-hidden`.
+- **List pages render every row twice** — a table (`hidden sm:block`) and cards (`sm:hidden`).
+  jsdom has no viewport to resolve the breakpoint, so both are in the DOM and every row assertion
+  in `Orders.test.jsx`/`Purchases.test.jsx` has to use a `*All` query. A `getByText` on a row value
+  fails with "found multiple elements", which looks like a duplicate-render bug and is not one.
+- **`border-hairline-strong` is not a token.** `index.css` defines `--hairline` only, so that class
+  emitted no border colour at all. Check `index.css` before inventing a variant name.
 - **`CurrencyProvider` is mounted INSIDE `AuthProvider`** (changed 2026-08-24). The settings belong to
   the signed-in account, so the provider has to know when that changes. It reads `AuthContext` through
   `useContext`, not `useAuth()`, so a component test that renders a consumer without an auth provider

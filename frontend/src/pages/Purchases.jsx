@@ -6,6 +6,10 @@ import { computeItemsTotal, formatDate, shortId } from '@/lib/format'
 import { useCurrency } from '@/context/CurrencyContext'
 import { GlassCard } from '@/components/ui/GlassCard'
 import { ExportButton } from '@/components/ui/ExportButton'
+import { FilterField, FilterPopover, filterControlClass } from '@/components/ui/FilterPopover'
+import { PaymentBadge } from '@/components/ui/PaymentBadge'
+import { PAYMENT_OPTIONS } from '@/lib/payment'
+import { btnGhost, btnGhostAccent, btnIcon, btnPrimary } from '@/lib/buttonStyles'
 import { Invoice } from '@/components/invoice/Invoice'
 import { TransactionDetail } from '@/components/transactions/TransactionDetail'
 import { PurchaseForm } from '@/components/forms/PurchaseForm'
@@ -23,6 +27,7 @@ export function Purchases() {
   const [supplier, setSupplier] = useState('all')
   const [year, setYear] = useState('all')
   const [month, setMonth] = useState('all')
+  const [paymentStatus, setPaymentStatus] = useState('all')
   const [sort, setSort] = useState({ field: 'placed_at', direction: 'desc' })
   const [page, setPage] = useState(1)
 
@@ -53,6 +58,7 @@ export function Purchases() {
     if (supplier !== 'all') params.supplier = supplier
     if (year !== 'all') params.placed_at__year = year
     if (month !== 'all') params.placed_at__month = month
+    if (paymentStatus !== 'all') params.payment_status = paymentStatus
 
     api
       .get('/inventory/purchases/', { params, signal: controller.signal })
@@ -65,7 +71,7 @@ export function Purchases() {
       })
 
     return () => controller.abort()
-  }, [supplier, year, month, sort, page, refreshKey])
+  }, [supplier, year, month, paymentStatus, sort, page, refreshKey])
 
   const purchases = result.results
 
@@ -115,38 +121,86 @@ export function Purchases() {
   if (year !== 'all') exportParams.year = year
   if (month !== 'all') exportParams.month = month
 
+  // See Orders — 'all' means "not filtered", which only this component knows.
+  const activeFilters = [supplier, year, month, paymentStatus].filter((v) => v !== 'all').length
+
+  function clearFilters() {
+    setSupplier('all')
+    setYear('all')
+    setMonth('all')
+    setPaymentStatus('all')
+    setPage(1)
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center gap-2">
-        <FilterSelect value={supplier} onChange={resetToFirstPage(setSupplier)} label="All suppliers">
-          {suppliers.map((s) => (
-            <option key={s.id} value={s.id}>
-              {s.name}
-            </option>
-          ))}
-        </FilterSelect>
-        <FilterSelect value={year} onChange={resetToFirstPage(setYear)} label="All years">
-          {YEAR_OPTIONS.map((y) => (
-            <option key={y} value={y}>
-              {y}
-            </option>
-          ))}
-        </FilterSelect>
-        <FilterSelect value={month} onChange={resetToFirstPage(setMonth)} label="All months">
-          {MONTH_OPTIONS.map((m) => (
-            <option key={m.value} value={m.value}>
-              {m.label}
-            </option>
-          ))}
-        </FilterSelect>
+        <FilterPopover activeCount={activeFilters} onClear={clearFilters}>
+          <FilterField label="Supplier">
+            <select
+              value={supplier}
+              onChange={(event) => resetToFirstPage(setSupplier)(event.target.value)}
+              className={filterControlClass}
+            >
+              <option value="all">All suppliers</option>
+              {suppliers.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.name}
+                </option>
+              ))}
+            </select>
+          </FilterField>
+
+          <FilterField label="Payment">
+            <select
+              value={paymentStatus}
+              onChange={(event) => resetToFirstPage(setPaymentStatus)(event.target.value)}
+              className={filterControlClass}
+            >
+              <option value="all">Any payment status</option>
+              {PAYMENT_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </FilterField>
+
+          <div className="grid grid-cols-2 gap-2">
+            <FilterField label="Year">
+              <select
+                value={year}
+                onChange={(event) => resetToFirstPage(setYear)(event.target.value)}
+                className={filterControlClass}
+              >
+                <option value="all">All years</option>
+                {YEAR_OPTIONS.map((y) => (
+                  <option key={y} value={y}>
+                    {y}
+                  </option>
+                ))}
+              </select>
+            </FilterField>
+            <FilterField label="Month">
+              <select
+                value={month}
+                onChange={(event) => resetToFirstPage(setMonth)(event.target.value)}
+                className={filterControlClass}
+              >
+                <option value="all">All months</option>
+                {MONTH_OPTIONS.map((m) => (
+                  <option key={m.value} value={m.value}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            </FilterField>
+          </div>
+        </FilterPopover>
 
         <div className="ml-auto flex items-center gap-2">
           <ExportButton url="/inventory/purchases/export/csv/" params={exportParams} filename="purchases.csv" />
-          <button
-            type="button"
-            onClick={() => setAddOpen(true)}
-            className="flex items-center gap-1.5 rounded-xl bg-accent-blue px-3 py-2 text-[13px] font-semibold text-white hover:opacity-90"
-          >
+          <button type="button" onClick={() => setAddOpen(true)} className={btnPrimary}>
             <Plus size={14} />
             Add purchase
           </button>
@@ -218,6 +272,11 @@ export function Purchases() {
           items={invoicePurchase.items}
           primaryCurrency={primaryCurrency}
           showSecondaryCurrency={enableDualCurrency}
+          // Passed through, like the order invoice. Invoice defaults these to null/0, so
+          // omitting them printed every purchase order as unpaid with a zero balance.
+          paymentStatus={invoicePurchase.payment_status}
+          paidAmount={Number(invoicePurchase.paid_amount) || 0}
+          remainingAmount={Number(invoicePurchase.remaining_amount) || 0}
         />
       )}
 
@@ -258,19 +317,6 @@ export function Purchases() {
   )
 }
 
-function FilterSelect({ value, onChange, label, children }) {
-  return (
-    <select
-      value={value}
-      onChange={(event) => onChange(event.target.value)}
-      className="rounded-xl border border-hairline bg-canvas-2 px-3 py-2 text-[13px] text-text-primary focus:outline-none"
-    >
-      <option value="all">{label}</option>
-      {children}
-    </select>
-  )
-}
-
 function SortHeader({ field, label, sort, onSort }) {
   const isActive = sort.field === field
   const Icon = isActive ? (sort.direction === 'asc' ? ArrowUp : ArrowDown) : ArrowUpDown
@@ -292,7 +338,7 @@ function InvoiceButton({ purchase, onViewInvoice }) {
     <button
       type="button"
       onClick={() => onViewInvoice(purchase)}
-      className="flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] font-medium text-accent-blue hover:bg-accent-blue/10"
+      className={btnGhostAccent}
     >
       <FileText size={12} />
       Invoice
@@ -305,7 +351,7 @@ function EditButton({ onClick }) {
     <button
       type="button"
       onClick={onClick}
-      className="flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] font-medium text-text-secondary hover:bg-canvas-2 hover:text-text-primary"
+      className={btnGhost}
     >
       <Pencil size={12} />
       Edit
@@ -318,7 +364,7 @@ function ViewButton({ onClick }) {
     <button
       type="button"
       onClick={onClick}
-      className="flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] font-medium text-text-secondary hover:bg-canvas-2 hover:text-text-primary"
+      className={btnGhost}
     >
       <Eye size={12} />
       View
@@ -341,6 +387,7 @@ function PurchasesTable({ purchases, sort, onSort, loading, onViewInvoice, onVie
                 <SortHeader field="placed_at" label="Date" sort={sort} onSort={onSort} />
               </th>
               <th className="px-4 py-3 font-medium">Items</th>
+              <th className="px-4 py-3 font-medium">Payment</th>
               <th className="px-4 py-3 text-right">
                 <div className="flex justify-end">
                   <SortHeader field="annotated_total" label="Total" sort={sort} onSort={onSort} />
@@ -353,7 +400,7 @@ function PurchasesTable({ purchases, sort, onSort, loading, onViewInvoice, onVie
             {loading
               ? Array.from({ length: 6 }).map((_, i) => (
                   <tr key={i} className="border-b border-hairline/60 last:border-0">
-                    <td className="px-5 py-2.5" colSpan={6}>
+                    <td className="px-5 py-2.5" colSpan={7}>
                       <div className="h-8 animate-pulse rounded-lg bg-canvas-2" />
                     </td>
                   </tr>
@@ -370,6 +417,13 @@ function PurchasesTable({ purchases, sort, onSort, loading, onViewInvoice, onVie
                         {formatDate(purchase.placed_at)}
                       </td>
                       <td className="px-4 py-2.5 text-text-secondary tabular-nums">{purchase.items.length}</td>
+                      <td className="px-4 py-2.5">
+                        <PaymentBadge
+                          status={purchase.payment_status}
+                          remaining={purchase.remaining_amount}
+                          formatAmount={formatAmount}
+                        />
+                      </td>
                       <td className="px-4 py-2.5 text-right font-medium text-text-primary tabular-nums">
                         {formatAmount(total, purchase.exchange_rate)}
                       </td>
@@ -414,10 +468,15 @@ function PurchasesCards({ purchases, loading, onViewInvoice, onViewDetail, onEdi
                 <p className="font-medium text-text-primary tabular-nums">{shortId(purchase.id)}</p>
                 <p className="text-[12px] text-text-secondary">{purchase.supplier ?? 'No supplier'}</p>
               </div>
-              <div className="text-right">
+              <div className="flex flex-col items-end gap-1">
                 <p className="font-medium text-text-primary tabular-nums">
                   {formatAmount(total, purchase.exchange_rate)}
                 </p>
+                <PaymentBadge
+                  status={purchase.payment_status}
+                  remaining={purchase.remaining_amount}
+                  formatAmount={formatAmount}
+                />
               </div>
             </div>
             <div className="flex items-center justify-between text-[12px] text-text-secondary">
@@ -443,7 +502,7 @@ function PageButton({ disabled, onClick, children }) {
       type="button"
       disabled={disabled}
       onClick={onClick}
-      className="flex h-8 w-8 items-center justify-center rounded-lg border border-hairline text-text-secondary hover:bg-canvas-2 hover:text-text-primary disabled:pointer-events-none disabled:opacity-30"
+      className={btnIcon}
     >
       {children}
     </button>
