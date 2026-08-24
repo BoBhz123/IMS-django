@@ -686,6 +686,25 @@ Append here when something bites. Do not repeat these.
   jsdom has no viewport to resolve the breakpoint, so both are in the DOM and every row assertion
   in `Orders.test.jsx`/`Purchases.test.jsx` has to use a `*All` query. A `getByText` on a row value
   fails with "found multiple elements", which looks like a duplicate-render bug and is not one.
+- **`AppShell`'s window card must never be `overflow-hidden`.** Every page renders inside
+  `<div className="mx-auto max-w-6xl ...">`, so a clipping context there slices anything a page
+  floats outside its own flow — it cut the filter popover off at the card's bottom border
+  whenever the table underneath was shorter than the open panel. Border-radius already clips the
+  card's own background and border, and nothing inside paints a background of its own, so
+  overflow-hidden bought nothing there. The AppShell root is `overflow-x-hidden` for the same
+  reason: the ambient blobs are wider than the viewport and must not scroll, but the vertical
+  axis has to stay open. `AppShell.test.jsx` guards both.
+- **The table cards' `overflow-hidden` is NOT the popover bug and must stay.** `GlassCard >
+  div.overflow-x-auto > table` is the correct arrangement on all five list pages: the card clips
+  row hover backgrounds to its rounded corners, the inner div is what scrolls a wide table. Those
+  cards are *siblings* of the page header, never ancestors of the popover, so removing their
+  clipping fixes nothing and lets rows paint over the card's corners.
+- **jsdom implements no layout, so a clipping bug cannot be caught by rendering.**
+  `getBoundingClientRect` returns zeroes and nothing is ever painted or clipped; a test that
+  rendered the shell and asserted "the popover is visible" passes just as happily with the bug
+  present. `AppShell.test.jsx` asserts the structural invariant against the source instead, the
+  same way `DomainConfigurationTests` greps the tree. Browser automation is forbidden here, so
+  the visual check across viewports is the owner's.
 - **`border-hairline-strong` is not a token.** `index.css` defines `--hairline` only, so that class
   emitted no border colour at all. Check `index.css` before inventing a variant name.
 - **`CurrencyProvider` is mounted INSIDE `AuthProvider`** (changed 2026-08-24). The settings belong to

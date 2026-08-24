@@ -23,7 +23,13 @@ import { btnGhost, btnSecondary } from '@/lib/buttonStyles'
  * knows which of its filter values count as "set" — 'all' and '' are both empty here, and the
  * markup cannot tell.
  */
-export function FilterPopover({ activeCount = 0, onClear, children, label = 'Show filters' }) {
+export function FilterPopover({
+  activeCount = 0,
+  onClear,
+  children,
+  label = 'Show filters',
+  align = 'left',
+}) {
   const [open, setOpen] = useState(false)
   const containerRef = useRef(null)
   const { isTop } = useOverlayLayer(open)
@@ -81,11 +87,20 @@ export function FilterPopover({ activeCount = 0, onClear, children, label = 'Sho
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: -4, scale: 0.98 }}
             transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
-            // Left-anchored at every width. The trigger is the leftmost thing in each page
-            // header, so aligning the panel's *right* edge to it would hang the panel off the
-            // left of the viewport. Capped against the viewport so it cannot overflow right
-            // either, which is what a narrow phone would otherwise do.
-            className="absolute left-0 z-40 mt-2 w-[min(20rem,calc(100vw-2rem))] origin-top-left rounded-squircle-sm border border-glass-border bg-glass-strong p-4 backdrop-blur-2xl [box-shadow:var(--shadow-glass)]"
+            // Anchored to whichever edge of the trigger keeps the panel on screen. `align`
+            // defaults to left because the trigger is the leftmost thing in all four page
+            // headers today; a trigger placed at the right of a header needs align="right", or
+            // the panel grows rightwards off the viewport.
+            //
+            // w-full up to 20rem, then capped again at the viewport: the width cap alone is not
+            // enough on a narrow phone, where 20rem plus the shell's own padding already
+            // exceeds the screen.
+            //
+            // z-50 rather than z-40 — table rows, sticky headers and the glass cards around
+            // them all stack in the page's own context, and the panel has to clear every one.
+            className={`absolute z-50 mt-2 w-[20rem] max-w-[calc(100vw-2rem)] rounded-squircle-sm border border-glass-border bg-glass-strong p-4 backdrop-blur-2xl [box-shadow:var(--shadow-glass)] ${
+              align === 'right' ? 'right-0 origin-top-right' : 'left-0 origin-top-left'
+            }`}
           >
             <div className="mb-3 flex items-center justify-between">
               <span className="text-[12px] font-semibold text-text-primary">Filters</span>

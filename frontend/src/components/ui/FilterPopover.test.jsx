@@ -70,6 +70,41 @@ describe('FilterPopover', () => {
     expect(screen.queryByText('0')).not.toBeInTheDocument()
   })
 
+  it('floats above the page and stays inside the viewport', async () => {
+    // The panel used to be clipped by an overflow-hidden ancestor in AppShell; these are the
+    // panel's own half of that fix. jsdom does no layout, so this asserts the contract the
+    // stylesheet expresses rather than a measured position — see AppShell.test.jsx.
+    const user = userEvent.setup()
+    render(<FilterPopover><input aria-label="Search" /></FilterPopover>)
+    await user.click(screen.getByRole('button', { name: /show filters/i }))
+
+    const panel = await screen.findByRole('dialog')
+    expect(panel.className).toMatch(/\bz-50\b/)
+    // Without the viewport cap, 20rem plus the shell's padding overflows a narrow phone.
+    expect(panel.className).toMatch(/max-w-\[calc\(100vw-2rem\)\]/)
+  })
+
+  it('anchors to the left of the trigger by default', async () => {
+    const user = userEvent.setup()
+    render(<FilterPopover><input aria-label="Search" /></FilterPopover>)
+    await user.click(screen.getByRole('button', { name: /show filters/i }))
+
+    // The trigger is the leftmost thing in every page header, so right-anchoring would hang
+    // the panel off the left edge of the screen.
+    const panel = await screen.findByRole('dialog')
+    expect(panel.className).toMatch(/\bleft-0\b/)
+    expect(panel.className).not.toMatch(/\bright-0\b/)
+  })
+
+  it('can anchor to the right for a trigger near the right edge', async () => {
+    const user = userEvent.setup()
+    render(<FilterPopover align="right"><input aria-label="Search" /></FilterPopover>)
+    await user.click(screen.getByRole('button', { name: /show filters/i }))
+
+    const panel = await screen.findByRole('dialog')
+    expect(panel.className).toMatch(/\bright-0\b/)
+  })
+
   it('closes on Escape', async () => {
     const user = userEvent.setup()
     render(<FilterPopover><input aria-label="Search" /></FilterPopover>)
