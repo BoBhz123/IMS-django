@@ -12,6 +12,8 @@ import { ProductPicker } from '@/components/forms/ProductPicker'
 import { lookupByBarcode } from '@/hooks/useBarcodeLookup'
 import { useAllProducts } from '@/hooks/useAllProducts'
 import { useOpenSession } from '@/hooks/useOpenSession'
+import { PaymentSection } from '@/components/forms/PaymentSection'
+import { PAYMENT_STATUS, partialAmountMissing, paymentPayload } from '@/lib/payment'
 import { partyIdByName, toFormLines } from '@/lib/transactionEdit'
 
 function emptyItem() {
@@ -61,10 +63,19 @@ function PurchaseFormBody({ onClose, onSaved, suppliers: initialSuppliers, purch
   const [exchangeRate, setExchangeRate] = useState(
     () => (editing ? purchase.exchange_rate : DEFAULT_EXCHANGE_RATE),
   )
-  const [items, setItems] = useState(() => (editing ? [] : [emptyItem()]))
+  // Starts empty — see OrderFormBody. The seeded blank row was a dropdown waiting to be used,
+  // and "+ Add product" now opens the picker directly.
+  const [items, setItems] = useState([])
   const [hydrated, setHydrated] = useState(!editing)
   const [errors, setErrors] = useState({})
   const [saving, setSaving] = useState(false)
+
+  const [paymentStatus, setPaymentStatus] = useState(() =>
+    editing ? (purchase.payment_status ?? PAYMENT_STATUS.UNPAID) : PAYMENT_STATUS.PAID,
+  )
+  const [paidAmount, setPaidAmount] = useState(() =>
+    editing ? Number(purchase.paid_amount) || 0 : 0,
+  )
 
   useEffect(() => {
     if (hydrated || catalogStatus !== 'ready') return
@@ -174,6 +185,7 @@ function PurchaseFormBody({ onClose, onSaved, suppliers: initialSuppliers, purch
     const payload = {
       supplier: supplier || null,
       exchange_rate: Number(exchangeRate),
+      ...paymentPayload(paymentStatus, paidAmount),
       items: items
         .filter((item) => item.product)
         .map((item) => ({
@@ -185,6 +197,14 @@ function PurchaseFormBody({ onClose, onSaved, suppliers: initialSuppliers, purch
 
     if (payload.items.length === 0) {
       setErrors({ detail: ['Add at least one item.'] })
+      setSaving(false)
+      return
+    }
+
+    // No error is set here: PaymentSection already renders the message beside the amount field,
+    // and the submit button is disabled on the same condition. This is the backstop for a
+    // programmatic submit, not the user-facing path.
+    if (partialAmountMissing(paymentStatus, paidAmount)) {
       setSaving(false)
       return
     }
@@ -319,6 +339,19 @@ function PurchaseFormBody({ onClose, onSaved, suppliers: initialSuppliers, purch
             </div>
           )}
 
+          {items.length === 0 && (
+            <button
+              type="button"
+              onClick={() => setPickerOpen(true)}
+              className="flex flex-col items-center gap-1.5 rounded-xl border border-dashed border-hairline bg-canvas-2/40 px-3 py-8 text-center transition-colors hover:border-accent-blue/40 hover:bg-canvas-2/70"
+            >
+              <Plus size={18} className="text-text-tertiary" />
+              <span className="text-[13px] text-text-secondary">
+                No items yet — tap to add a product
+              </span>
+            </button>
+          )}
+
           {items.map((item, index) => (
             <div key={index} className="rounded-xl border border-hairline p-3">
               <div className="mb-2 flex items-center gap-2">
@@ -327,16 +360,16 @@ function PurchaseFormBody({ onClose, onSaved, suppliers: initialSuppliers, purch
                   selectedName={item.product_name}
                   onChange={(productId, product) => handleProductChange(index, productId, product)}
                 />
-                {items.length > 1 && (
-                  <button
-                    type="button"
-                    onClick={() => removeItem(index)}
-                    aria-label="Remove item"
-                    className="shrink-0 text-text-tertiary hover:text-accent-red"
-                  >
-                    <Trash2 size={15} />
-                  </button>
-                )}
+                {/* Unconditional — see OrderForm. The old length guard only protected the
+                    seeded blank row, which no longer exists. */}
+                <button
+                  type="button"
+                  onClick={() => removeItem(index)}
+                  aria-label="Remove item"
+                  className="shrink-0 text-text-tertiary transition-colors hover:text-accent-red"
+                >
+                  <Trash2 size={15} />
+                </button>
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <NumberField
@@ -356,6 +389,17 @@ function PurchaseFormBody({ onClose, onSaved, suppliers: initialSuppliers, purch
             </div>
           ))}
         </div>
+
+        <PaymentSection
+          status={paymentStatus}
+          onStatusChange={setPaymentStatus}
+          paidAmount={paidAmount}
+          onPaidAmountChange={setPaidAmount}
+          total={total}
+          exchangeRate={exchangeRate}
+          formatAmount={formatAmount}
+          formatSecondary={formatSecondary}
+        />
 
         <div className="flex items-center justify-between rounded-xl bg-canvas-2 px-3 py-2 text-[13px]">
           <span className="text-text-secondary">Purchase total</span>
@@ -385,7 +429,7 @@ function PurchaseFormBody({ onClose, onSaved, suppliers: initialSuppliers, purch
 
         <button
           type="submit"
-          disabled={saving}
+          disabled={saving || partialAmountMissing(paymentStatus, paidAmount)}
           className="mt-1 flex items-center justify-center gap-2 rounded-xl bg-accent-blue py-2.5 text-[14px] font-semibold text-white hover:opacity-90 disabled:opacity-60"
         >
           {saving && <Loader2 size={14} className="animate-spin" />}
@@ -402,7 +446,10 @@ function PurchaseFormBody({ onClose, onSaved, suppliers: initialSuppliers, purch
       <ProductSearchModal
         open={pickerOpen}
         onClose={() => setPickerOpen(false)}
-        onSelect={applyScannedProduct}
+        onSelect={(product) => {
+          applyScannedProduct(product)
+          setPickerOpen(false)
+        }}
         onCreateNew={() => setNewProductOpen(true)}
         disableOutOfStock={false}
       />
@@ -417,11 +464,16 @@ function PurchaseFormBody({ onClose, onSaved, suppliers: initialSuppliers, purch
           }
         }}
       />
+      {/* See OrderForm — mounts above the picker, and a save adds the product at its cost
+          price and closes both. */}
       <ProductForm
         open={newProductOpen}
         onClose={() => setNewProductOpen(false)}
         onSaved={(created) => {
-          if (created) applyScannedProduct(created)
+          if (created) {
+            applyScannedProduct(created)
+            setPickerOpen(false)
+          }
         }}
       />
     </>

@@ -16,6 +16,10 @@ const ORDER = {
   customer: 'Layal',
   exchange_rate: 90000,
   placed_at: '2026-08-01T10:00:00Z',
+  // The API always sends these; the fixture carries them so an edit is asserted to preserve the
+  // settlement rather than silently resetting it.
+  payment_status: 'PAID',
+  paid_amount: '40.00',
   items: [{ product: 1, quantity: 4, unit_price: '10.00' }],
 }
 
@@ -97,6 +101,9 @@ describe('OrderForm in edit mode', () => {
       {
         customer: '8',
         exchange_rate: 90000,
+        // Status alone: the server settles PAID against the total it computes from the line
+        // rows it just wrote, so no browser-side amount is sent. See lib/payment.js.
+        payment_status: 'PAID',
         items: [{ product: 1, quantity: 4, unit_price: '10.00' }],
       },
     ))

@@ -101,7 +101,8 @@ describe('OrderForm barcode scanning', () => {
     await scan(user)
 
     expect(await screen.findByText(/no product has the barcode/i)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /select product/i })).toBeInTheDocument()
+    // "adds no line" is now the empty state rather than an untouched blank row.
+    expect(screen.getByText(/no items yet/i)).toBeInTheDocument()
   })
 
   it('tells the user to retry when the lookup fails, rather than offering to add a product', async () => {
@@ -134,10 +135,14 @@ describe('OrderForm barcode scanning', () => {
     const user = userEvent.setup()
     renderForm()
 
-    await user.click(screen.getByRole('button', { name: /select product/i }))
-    await user.click(screen.getByRole('button', { name: /Widget/i }))
+    // The picker, not the old per-row dropdown — but the point stands: adding a product by hand
+    // must not go anywhere near the barcode lookup.
+    await user.click(screen.getByRole('button', { name: /^add product$/i }))
+    await user.click(await screen.findByRole('button', { name: /Widget/i }))
 
     expect(lookupByBarcode).not.toHaveBeenCalled()
-    expect(screen.getByRole('button', { name: /Widget/i })).toBeInTheDocument()
+    // Asserted on the line, not on a /Widget/ button: the picker is mid-exit-animation and its
+    // own Widget row is still mounted, so a role query matches two elements.
+    expect(lineQuantity(0)).toHaveValue(1)
   })
 })

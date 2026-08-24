@@ -16,6 +16,9 @@ const PURCHASE = {
   supplier: 'Acme',
   exchange_rate: 91000,
   placed_at: '2026-08-02T10:00:00Z',
+  // See OrderForm.edit.test.jsx — the API always sends these, and an edit must preserve them.
+  payment_status: 'PARTIALLY_PAID',
+  paid_amount: '15.00',
   items: [{ product: 'Widget', quantity: 10, unit_price: '4.00' }],
 }
 
@@ -72,6 +75,10 @@ describe('PurchaseForm in edit mode', () => {
       {
         supplier: '3',
         exchange_rate: 91000,
+        // A partial payment DOES carry its amount: the server refuses PARTIALLY_PAID without
+        // one rather than guessing what "partly" meant.
+        payment_status: 'PARTIALLY_PAID',
+        paid_amount: 15,
         items: [{ product: 1, quantity: 10, unit_price: '4.00' }],
       },
     ))

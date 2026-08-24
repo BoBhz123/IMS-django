@@ -24,19 +24,24 @@ function renderForm() {
   )
 }
 
-/** Open the line's product dropdown and choose `name`. */
-async function selectProduct(user, name) {
-  await user.click(screen.getByRole('button', { name: /select product/i }))
-  await user.click(screen.getByRole('button', { name: new RegExp(name, 'i') }))
-}
-
-/** The one-step add: open the picker and tap a product. The modal stays open by design. */
+/**
+ * The one and only way a line gets onto an order from the UI: open the picker, tap a product.
+ * The picker closes on select, so each call reopens it.
+ *
+ * There is no longer a blank seeded row with its own "Select product" dropdown — that is what
+ * the tests below used to drive.
+ */
 async function addProduct(user, name) {
   const opener = screen.queryByRole('button', { name: /^add product$/i })
   if (opener) await user.click(opener)
   await user.click(
-    screen.getByRole('button', { name: new RegExp(`${name}.*(left|out of stock)`, 'i') }),
+    await screen.findByRole('button', { name: new RegExp(`${name}.*(left|out of stock)`, 'i') }),
   )
+}
+
+/** Open the picker without choosing anything. */
+async function openPicker(user) {
+  await user.click(screen.getByRole('button', { name: /^add product$/i }))
 }
 
 const submitButton = () => screen.getByRole('button', { name: /create order/i })
@@ -45,7 +50,7 @@ describe('OrderForm stock gating', () => {
   it('shows remaining stock once a product is picked', async () => {
     const user = userEvent.setup()
     renderForm()
-    await selectProduct(user, 'Widget')
+    await addProduct(user, 'Widget')
 
     // 1 of 5 requested by default → 4 left.
     expect(screen.getByText(/4 left — low/i)).toBeInTheDocument()
@@ -54,7 +59,7 @@ describe('OrderForm stock gating', () => {
   it('flags the exact limit and still allows submitting', async () => {
     const user = userEvent.setup()
     renderForm()
-    await selectProduct(user, 'Widget')
+    await addProduct(user, 'Widget')
 
     const qty = screen.getAllByRole('spinbutton')[1] // exchange rate is [0]
     await user.clear(qty)
@@ -67,7 +72,7 @@ describe('OrderForm stock gating', () => {
   it('blocks submission once the order exceeds stock', async () => {
     const user = userEvent.setup()
     renderForm()
-    await selectProduct(user, 'Widget')
+    await addProduct(user, 'Widget')
 
     const qty = screen.getAllByRole('spinbutton')[1]
     await user.clear(qty)
@@ -81,7 +86,7 @@ describe('OrderForm stock gating', () => {
   it('flags a line that asks for more than is in stock', async () => {
     const user = userEvent.setup()
     renderForm()
-    await selectProduct(user, 'Widget')
+    await addProduct(user, 'Widget')
 
     const [, qty] = screen.getAllByRole('spinbutton')
     await user.clear(qty)
@@ -95,7 +100,7 @@ describe('OrderForm stock gating', () => {
   it('disables out-of-stock products in the picker', async () => {
     const user = userEvent.setup()
     renderForm()
-    await user.click(screen.getByRole('button', { name: /select product/i }))
+    await openPicker(user)
 
     expect(screen.getByRole('button', { name: /sold out thing/i })).toBeDisabled()
     expect(screen.getByRole('button', { name: /widget/i })).toBeEnabled()
@@ -127,7 +132,7 @@ describe('OrderForm stock gating', () => {
   it('does not offer an out-of-stock product for a sale', async () => {
     const user = userEvent.setup()
     renderForm()
-    await user.click(screen.getByRole('button', { name: /^add product$/i }))
+    await openPicker(user)
     expect(screen.getByRole('button', { name: /sold out thing/i })).toBeDisabled()
   })
 })

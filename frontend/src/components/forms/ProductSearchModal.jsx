@@ -7,9 +7,14 @@ import { useProductSearch } from '@/hooks/useProductSearch'
 /**
  * Pick a product to add straight to an order or purchase.
  *
- * This is the one-step replacement for "Add row, then open the row's dropdown": the caller
- * opens this, a tap appends the product as a line, and the modal stays open so several items
- * can be added in a row — which is what a counter actually does.
+ * This is the one-step replacement for "Add row, then open the row's dropdown": the caller opens
+ * this and a tap appends the product as a line.
+ *
+ * **Closing on select is the caller's job, and both callers do it** (owner's decision,
+ * 2026-08-24). This modal used to stay open so a counter could add several items in a row; that
+ * was reversed in favour of the picker feeling like a discrete step — tap "+ Add product", pick,
+ * you are back on the transaction seeing what you added. `onSelect` is therefore fired once per
+ * tap and the caller decides what happens next; nothing here assumes either behaviour.
  *
  * `disableOutOfStock` is the sales/receiving split. An order cannot sell what is not there, so
  * the option is disabled; a purchase is how stock arrives, so a zero-stock product is exactly
@@ -60,8 +65,6 @@ export function ProductSearchModal({
                   key={product.id}
                   type="button"
                   disabled={soldOut}
-                  // Stays open on purpose — adding three items should be three taps, not
-                  // three round trips through the "Add product" button.
                   onClick={() => onSelect(product)}
                   className="flex w-full items-center gap-3 rounded-xl px-2 py-2 text-left text-[14px] enabled:hover:bg-canvas-2 disabled:cursor-not-allowed disabled:opacity-45"
                 >
@@ -83,7 +86,9 @@ export function ProductSearchModal({
           <button
             type="button"
             onClick={onCreateNew}
-            className="flex items-center justify-center gap-1.5 rounded-xl border border-dashed border-hairline-strong px-3 py-2 text-[13px] font-medium text-accent-blue hover:bg-canvas-2"
+            // border-hairline, not border-hairline-strong: the latter is not a defined token
+            // (see index.css), so Tailwind emitted no border colour at all for it.
+            className="flex items-center justify-center gap-1.5 rounded-xl border border-dashed border-hairline px-3 py-2 text-[13px] font-medium text-accent-blue transition-colors hover:border-accent-blue/40 hover:bg-canvas-2"
           >
             <Plus size={15} />
             New product

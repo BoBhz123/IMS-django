@@ -56,6 +56,19 @@ async function reopen(Form, props, dirty, expectClean) {
 
 const textbox = (name) => screen.getByRole('textbox', { name })
 
+/**
+ * Put the Widget on the transaction the way the UI now does it: "+ Add product" opens the
+ * picker, and a tap on the product adds the line. There is no longer a blank row with its own
+ * "Select product" dropdown to go through.
+ *
+ * The anchored regex matters — the empty-state prompt reads "No items yet — tap to add a
+ * product", which an unanchored /add product/i also matches.
+ */
+async function pickWidget(user) {
+  await user.click(screen.getByRole('button', { name: /^add product$/i }))
+  await user.click(await screen.findByRole('button', { name: /Widget/i }))
+}
+
 describe('forms reset when reopened', () => {
   it('ProductForm clears the name', async () => {
     await reopen(
@@ -106,13 +119,11 @@ describe('forms reset when reopened', () => {
     await reopen(
       OrderForm,
       { customers: [] },
-      async (user) => {
-        await user.click(screen.getByRole('button', { name: /select product/i }))
-        await user.click(screen.getByRole('button', { name: /Widget/i }))
-      },
+      pickWidget,
       async () => {
-        expect(screen.getByRole('button', { name: /select product/i })).toBeInTheDocument()
-        expect(screen.queryByRole('button', { name: /Widget/i })).not.toBeInTheDocument()
+        // Back to the empty state, with no line and no leftover product picker.
+        expect(screen.getByText(/no items yet/i)).toBeInTheDocument()
+        expect(screen.queryByRole('button', { name: /select product/i })).not.toBeInTheDocument()
       },
     )
   })
@@ -121,13 +132,10 @@ describe('forms reset when reopened', () => {
     await reopen(
       PurchaseForm,
       { suppliers: [] },
-      async (user) => {
-        await user.click(screen.getByRole('button', { name: /select product/i }))
-        await user.click(screen.getByRole('button', { name: /Widget/i }))
-      },
+      pickWidget,
       async () => {
-        expect(screen.getByRole('button', { name: /select product/i })).toBeInTheDocument()
-        expect(screen.queryByRole('button', { name: /Widget/i })).not.toBeInTheDocument()
+        expect(screen.getByText(/no items yet/i)).toBeInTheDocument()
+        expect(screen.queryByRole('button', { name: /select product/i })).not.toBeInTheDocument()
       },
     )
   })
@@ -153,11 +161,6 @@ describe('forms reset when reopened', () => {
 })
 
 describe('selecting a product fills the line price', () => {
-  async function pickWidget(user) {
-    await user.click(screen.getByRole('button', { name: /select product/i }))
-    await user.click(screen.getByRole('button', { name: /Widget/i }))
-  }
-
   it('orders use the default SELL price', async () => {
     const user = userEvent.setup()
     render(
