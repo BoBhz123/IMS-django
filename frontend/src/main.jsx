@@ -23,14 +23,18 @@ if (sentryDsn) {
 
 createRoot(document.getElementById('root')).render(
   <StrictMode>
+    {/* CurrencyProvider sits INSIDE AuthProvider: the currency settings belong to the signed-in
+        account, so the provider has to know whether anyone is signed in and re-read them when
+        that changes. It used to wrap AuthProvider, back when the display currency was a purely
+        local toggle kept in localStorage. */}
     <ThemeProvider>
-      <CurrencyProvider>
-        <BrowserRouter>
-          <AuthProvider>
+      <BrowserRouter>
+        <AuthProvider>
+          <CurrencyProvider>
             <App />
-          </AuthProvider>
-        </BrowserRouter>
-      </CurrencyProvider>
+          </CurrencyProvider>
+        </AuthProvider>
+      </BrowserRouter>
     </ThemeProvider>
   </StrictMode>,
 )

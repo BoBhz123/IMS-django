@@ -28,13 +28,18 @@ function CategoryFormBody({ onClose, onSaved, category }) {
     setSaving(true)
     setErrors({})
 
+    // Handed to onSaved so an in-context caller (the order/purchase forms' quick-create) can
+    // select the new record immediately instead of re-fetching the list and guessing which
+    // row is the one that was just typed.
+    let created = null
+
     try {
       if (isEdit) {
         await api.patch(`/inventory/categories/${category.id}/`, { name })
       } else {
-        await api.post('/inventory/categories/', { name })
+        created = (await api.post('/inventory/categories/', { name })).data
       }
-      onSaved()
+      onSaved(created)
       onClose()
     } catch (error) {
       if (error.response?.status === 400) {

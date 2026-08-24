@@ -215,6 +215,27 @@ def subscription_payload(user):
     }
 
 
+class AccountCurrencySettingsSerializer(serializers.ModelSerializer):
+    """
+    The account's currency *display* settings.
+
+    Deliberately NOT folded into SubscriptionStatusSerializer. That payload is a contract
+    pinned by SubscriptionPayloadContractTests and consumed by two endpoints; it describes
+    whether the account may use the app, which has nothing to do with how it prefers to read
+    numbers. Keeping them apart also means a currency change cannot invalidate a cached
+    subscription decision.
+
+    Neither field changes a stored amount. See Account.primary_currency for why, and note that
+    nothing in accounts/billing/ reads either of them — card charges are USD unconditionally.
+    """
+
+    secondary_currency = serializers.CharField(read_only=True, allow_null=True)
+
+    class Meta:
+        model = Account
+        fields = ['primary_currency', 'enable_dual_currency', 'secondary_currency']
+
+
 class UserWithSubscriptionSerializer(UserSerializer):
     """
     djoser's /auth/users/me/, plus the subscription state.

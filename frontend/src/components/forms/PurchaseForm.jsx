@@ -1,9 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Loader2, Plus, ScanLine, Trash2 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { DEFAULT_EXCHANGE_RATE, useCurrency } from '@/context/CurrencyContext'
 import { SlideOver } from '@/components/ui/SlideOver'
 import { BarcodeScannerModal } from '@/components/ui/BarcodeScannerModal'
+import { ProductSearchModal } from '@/components/forms/ProductSearchModal'
+import { SupplierForm } from '@/components/forms/SupplierForm'
+import { ProductForm } from '@/components/forms/ProductForm'
 import { CurrencyInput } from '@/components/ui/CurrencyInput'
 import { ProductPicker } from '@/components/forms/ProductPicker'
 import { lookupByBarcode } from '@/hooks/useBarcodeLookup'
@@ -12,7 +15,7 @@ import { useOpenSession } from '@/hooks/useOpenSession'
 import { partyIdByName, toFormLines } from '@/lib/transactionEdit'
 
 function emptyItem() {
-  return { product: '', quantity: 1, unit_multiplier: 1, unit_price: 0, product_name: '' }
+  return { product: '', quantity: 1, unit_price: 0, product_name: '' }
 }
 
 export function PurchaseForm({ open, onClose, purchase = null, ...rest }) {
@@ -33,8 +36,18 @@ export function PurchaseForm({ open, onClose, purchase = null, ...rest }) {
   )
 }
 
-function PurchaseFormBody({ onClose, onSaved, suppliers, purchase = null }) {
-  const { formatAmount } = useCurrency()
+function PurchaseFormBody({ onClose, onSaved, suppliers: initialSuppliers, purchase = null }) {
+  // See OrderFormBody — suppliers created in-context are merged locally rather than refetched.
+  const [createdSuppliers, setCreatedSuppliers] = useState([])
+  const suppliers = useMemo(
+    () => [...initialSuppliers, ...createdSuppliers],
+    [initialSuppliers, createdSuppliers],
+  )
+  const onSupplierCreated = useCallback((created) => {
+    setCreatedSuppliers((current) => [...current, created])
+  }, [])
+
+  const { formatAmount, formatSecondary, showExchangeRate } = useCurrency()
   const editing = Boolean(purchase)
 
   // PurchaseItem.product is a *name* on the wire, not an id (PurchaseItemSerializer declares
@@ -60,6 +73,9 @@ function PurchaseFormBody({ onClose, onSaved, suppliers, purchase = null }) {
   }, [hydrated, catalogStatus, purchase, catalog])
 
   const [scannerOpen, setScannerOpen] = useState(false)
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const [newSupplierOpen, setNewSupplierOpen] = useState(false)
+  const [newProductOpen, setNewProductOpen] = useState(false)
   const [scanMessage, setScanMessage] = useState(null)
   const [scanChoices, setScanChoices] = useState([])
 
@@ -143,15 +159,12 @@ function PurchaseFormBody({ onClose, onSaved, suppliers, purchase = null }) {
     })
   }
 
-  function addItem() {
-    setItems((current) => [...current, emptyItem()])
-  }
 
   function removeItem(index) {
     setItems((current) => current.filter((_, i) => i !== index))
   }
 
-  const total = items.reduce((sum, item) => sum + item.quantity * item.unit_multiplier * item.unit_price, 0)
+  const total = items.reduce((sum, item) => sum + item.quantity * item.unit_price, 0)
 
   async function handleSubmit(event) {
     event.preventDefault()
@@ -166,7 +179,6 @@ function PurchaseFormBody({ onClose, onSaved, suppliers, purchase = null }) {
         .map((item) => ({
           product: Number(item.product),
           quantity: Number(item.quantity),
-          unit_multiplier: Number(item.unit_multiplier),
           unit_price: item.unit_price,
         })),
     }
@@ -224,49 +236,68 @@ function PurchaseFormBody({ onClose, onSaved, suppliers, purchase = null }) {
         )}
 
         <Field label="Supplier">
-          <select
-            value={supplier}
-            onChange={(event) => setSupplier(event.target.value)}
-            className="w-full rounded-xl border border-hairline bg-canvas-2 px-3 py-2 text-[13px] text-text-primary focus:border-accent-blue/60 focus:ring-2 focus:ring-accent-blue/20 focus:outline-none"
-          >
-            <option value="">No supplier</option>
-            {suppliers.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.name}
-              </option>
-            ))}
-          </select>
+          <div className="flex items-center gap-2">
+            <select
+              value={supplier}
+              onChange={(event) => setSupplier(event.target.value)}
+              className="min-w-0 flex-1 rounded-xl border border-hairline bg-canvas-2 px-3 py-2 text-[13px] text-text-primary focus:border-accent-blue/60 focus:ring-2 focus:ring-accent-blue/20 focus:outline-none"
+            >
+              <option value="">No supplier</option>
+              {suppliers.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.name}
+                </option>
+              ))}
+            </select>
+            {/* Secondary sizing — see OrderForm's customer control. */}
+            <button
+              type="button"
+              onClick={() => setNewSupplierOpen(true)}
+              className="flex shrink-0 items-center gap-1 rounded-lg border border-hairline p-2 text-sm font-medium text-accent-blue hover:bg-canvas-2"
+            >
+              <Plus className="h-4 w-4" />
+              New
+            </button>
+          </div>
         </Field>
 
-        <Field label="Exchange rate (LBP per $)">
-          <input
-            type="number"
-            min="1"
-            value={exchangeRate}
-            onChange={(event) => setExchangeRate(event.target.value)}
-            className="w-full rounded-xl border border-hairline bg-canvas-2 px-3 py-2 text-[13px] text-text-primary tabular-nums focus:border-accent-blue/60 focus:ring-2 focus:ring-accent-blue/20 focus:outline-none"
-          />
-        </Field>
+        {/* Hidden when the account is single-currency USD: with no conversion happening
+            anywhere, the rate is noise on the form. It is still SENT — the column is the
+            historical record of the day's rate and stays populated either way. With LBP as the
+            primary currency the field stays visible, because the rate is then what turns every
+            stored USD figure into the number on screen. See CurrencyContext.showExchangeRate. */}
+        {showExchangeRate && (
+          <Field label="Exchange rate (LBP per $)">
+            <input
+              type="number"
+              min="1"
+              value={exchangeRate}
+              onChange={(event) => setExchangeRate(event.target.value)}
+              className="w-full rounded-xl border border-hairline bg-canvas-2 px-3 py-2 text-[13px] text-text-primary tabular-nums focus:border-accent-blue/60 focus:ring-2 focus:ring-accent-blue/20 focus:outline-none"
+            />
+          </Field>
+        )}
 
         <div className="flex flex-col gap-2">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <span className="text-[12px] font-medium text-text-secondary">Items</span>
-            <div className="flex items-center gap-3">
+            {/* See OrderForm — primary sizing for the two ways stock gets onto a purchase. */}
+            <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={() => setScannerOpen(true)}
-                className="flex items-center gap-1 text-[12px] font-medium text-accent-blue hover:opacity-80"
+                onClick={() => setPickerOpen(true)}
+                className="flex items-center gap-2 rounded-xl bg-accent-blue p-3 text-base font-medium text-white hover:opacity-90"
               >
-                <ScanLine size={13} />
-                Scan barcode
+                <Plus className="h-6 w-6" />
+                Add product
               </button>
               <button
                 type="button"
-                onClick={addItem}
-                className="flex items-center gap-1 text-[12px] font-medium text-accent-blue hover:opacity-80"
+                onClick={() => setScannerOpen(true)}
+                className="flex items-center gap-2 rounded-xl bg-accent-blue/12 p-3 text-base font-medium text-accent-blue hover:bg-accent-blue/20"
               >
-                <Plus size={13} />
-                Add item
+                <ScanLine className="h-6 w-6" />
+                Scan barcode
               </button>
             </div>
           </div>
@@ -307,16 +338,11 @@ function PurchaseFormBody({ onClose, onSaved, suppliers, purchase = null }) {
                   </button>
                 )}
               </div>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-2 gap-2">
                 <NumberField
                   label="Qty"
                   value={item.quantity}
                   onChange={(v) => updateItem(index, { quantity: v })}
-                />
-                <NumberField
-                  label="× per unit"
-                  value={item.unit_multiplier}
-                  onChange={(v) => updateItem(index, { unit_multiplier: v })}
                 />
                 <div>
                   <span className="mb-1 block text-[11px] text-text-tertiary">Unit cost</span>
@@ -333,7 +359,16 @@ function PurchaseFormBody({ onClose, onSaved, suppliers, purchase = null }) {
 
         <div className="flex items-center justify-between rounded-xl bg-canvas-2 px-3 py-2 text-[13px]">
           <span className="text-text-secondary">Purchase total</span>
-          <span className="font-semibold text-text-primary tabular-nums">{formatAmount(total, exchangeRate)}</span>
+          <span className="flex flex-col items-end">
+            <span className="font-semibold text-text-primary tabular-nums">{formatAmount(total, exchangeRate)}</span>
+            {/* formatSecondary returns null with dual display off, so this line simply is not
+                rendered — the "hide every secondary total" rule lives in one place. */}
+            {formatSecondary(total, exchangeRate) && (
+              <span className="text-[11px] text-text-tertiary tabular-nums">
+                {formatSecondary(total, exchangeRate)}
+              </span>
+            )}
+          </span>
         </div>
 
         {errors.detail && <p className="text-[13px] text-accent-red">{errors.detail[0]}</p>}
@@ -360,6 +395,35 @@ function PurchaseFormBody({ onClose, onSaved, suppliers, purchase = null }) {
 
       {/* Outside the <form>: the scanner's own buttons default to type="submit". */}
       <BarcodeScannerModal open={scannerOpen} onClose={closeScanner} onScan={handleScan} />
+
+      {/* disableOutOfStock={false}: a purchase is how stock arrives, so a zero-stock product
+          is exactly the one being ordered. The order form disables those for the opposite
+          reason. */}
+      <ProductSearchModal
+        open={pickerOpen}
+        onClose={() => setPickerOpen(false)}
+        onSelect={applyScannedProduct}
+        onCreateNew={() => setNewProductOpen(true)}
+        disableOutOfStock={false}
+      />
+
+      <SupplierForm
+        open={newSupplierOpen}
+        onClose={() => setNewSupplierOpen(false)}
+        onSaved={(created) => {
+          if (created) {
+            onSupplierCreated(created)
+            setSupplier(String(created.id))
+          }
+        }}
+      />
+      <ProductForm
+        open={newProductOpen}
+        onClose={() => setNewProductOpen(false)}
+        onSaved={(created) => {
+          if (created) applyScannedProduct(created)
+        }}
+      />
     </>
   )
 }

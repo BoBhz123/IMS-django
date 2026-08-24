@@ -1,11 +1,13 @@
-import { useCallback, useRef, useState } from 'react'
-import { ImagePlus, Loader2, ScanLine, X } from 'lucide-react'
+import { useCallback, useMemo, useRef, useState } from 'react'
+import { ImagePlus, Loader2, Plus, ScanLine, X } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useCurrency } from '@/context/CurrencyContext'
 import { SlideOver } from '@/components/ui/SlideOver'
 import { BarcodeScannerModal } from '@/components/ui/BarcodeScannerModal'
+import { CategoryForm } from '@/components/forms/CategoryForm'
 import { CurrencyInput } from '@/components/ui/CurrencyInput'
 import { useOpenSession } from '@/hooks/useOpenSession'
+import { useProductLookups } from '@/hooks/useProductLookups'
 
 const emptyForm = {
   name: '',
@@ -29,7 +31,34 @@ export function ProductForm({ open, onClose, ...rest }) {
   )
 }
 
-function ProductFormBody({ onClose, onSaved, product, categories, suppliers }) {
+function ProductFormBody({
+  onClose,
+  onSaved,
+  product,
+  categories: providedCategories,
+  suppliers: providedSuppliers,
+}) {
+  // Products.jsx already holds both lists and passes them in. The order and purchase forms
+  // render this as a quick-create and pass neither — which used to throw on the spread below and
+  // take the whole tree down, reading to the user as a frozen screen. Fetching our own is not a
+  // fallback for tidiness: the category field is `required`, so an empty list would leave a form
+  // that can never be submitted. See hooks/useProductLookups.js.
+  const needsOwnLookups = providedCategories === undefined || providedSuppliers === undefined
+  const fetched = useProductLookups(needsOwnLookups)
+
+  const initialCategories = providedCategories ?? fetched.categories
+  const suppliers = providedSuppliers ?? fetched.suppliers
+
+  // See OrderFormBody — a category created from inside this form is merged locally and
+  // selected, rather than sending the user back out to the Categories screen and losing
+  // everything typed here so far.
+  const [createdCategories, setCreatedCategories] = useState([])
+  const [newCategoryOpen, setNewCategoryOpen] = useState(false)
+  const categories = useMemo(
+    () => [...initialCategories, ...createdCategories],
+    [initialCategories, createdCategories],
+  )
+
   const { formatAmount } = useCurrency()
   const isEdit = Boolean(product)
   const [form, setForm] = useState(() =>
@@ -123,10 +152,14 @@ function ProductFormBody({ onClose, onSaved, product, categories, suppliers }) {
 
     try {
       let productId = product?.id
+      // Kept so onSaved can hand the new product back — the order/purchase forms' quick-create
+      // adds it to the transaction immediately rather than making the user find it again.
+      let created = null
       if (isEdit) {
         await api.patch(`/inventory/products/${productId}/`, payload)
       } else {
         const { data } = await api.post('/inventory/products/', payload)
+        created = data
         productId = data.id
       }
 
@@ -141,7 +174,7 @@ function ProductFormBody({ onClose, onSaved, product, categories, suppliers }) {
         }
       }
 
-      onSaved()
+      onSaved(created)
       onClose()
     } catch (error) {
       if (error.response?.status === 400) {
@@ -162,13 +195,25 @@ function ProductFormBody({ onClose, onSaved, product, categories, suppliers }) {
         </Field>
 
         <Field label="Category" error={errors.category}>
-          <Select value={form.category} onChange={(v) => update('category', v)} required placeholder="Select a category">
-            {categories.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-              </option>
-            ))}
-          </Select>
+          <div className="flex items-center gap-2">
+            <div className="min-w-0 flex-1">
+              <Select value={form.category} onChange={(v) => update('category', v)} required placeholder="Select a category">
+                {categories.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </Select>
+            </div>
+            <button
+              type="button"
+              onClick={() => setNewCategoryOpen(true)}
+              className="flex shrink-0 items-center gap-1 rounded-lg border border-hairline p-2 text-sm font-medium text-accent-blue hover:bg-canvas-2"
+            >
+              <Plus className="h-4 w-4" />
+              New
+            </button>
+          </div>
         </Field>
 
         <Field label="Supplier" error={errors.supplier}>
@@ -303,6 +348,19 @@ function ProductFormBody({ onClose, onSaved, product, categories, suppliers }) {
       {/* Outside the <form> on purpose: the scanner's own buttons default to type="submit",
           and one stray click would post a half-filled product. */}
       <BarcodeScannerModal open={scannerOpen} onClose={closeScanner} onScan={handleScan} />
+
+      {/* Also outside the <form>, and for the same reason. Submitting it selects the new
+          category on this product without disturbing anything already entered. */}
+      <CategoryForm
+        open={newCategoryOpen}
+        onClose={() => setNewCategoryOpen(false)}
+        onSaved={(created) => {
+          if (created) {
+            setCreatedCategories((current) => [...current, created])
+            update('category', String(created.id))
+          }
+        }}
+      />
     </>
   )
 }

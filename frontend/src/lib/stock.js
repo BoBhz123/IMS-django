@@ -12,9 +12,10 @@ function toCount(value) {
   return Number.isFinite(n) && n > 0 ? n : 0
 }
 
-/** Units one line consumes: quantity × multiplier, matching the server's deduction. */
+/** Units one line consumes. Since unit_multiplier was removed this is just the quantity,
+ *  matching the server's deduction in CreateOrderSerializer. */
 export function lineUnits(item) {
-  return toCount(item?.quantity) * toCount(item?.unit_multiplier)
+  return toCount(item?.quantity)
 }
 
 /** Map of product id → units requested across every line, so duplicates aggregate. */

@@ -9,13 +9,13 @@ const CATALOG = [
 ]
 
 // Order items name a product by id; purchase items name it by name.
-const orderItem = (product, quantity, unit_multiplier = 1, unit_price = '10.00') => ({
-  product, quantity, unit_multiplier, unit_price,
+const orderItem = (product, quantity, unit_price = '10.00') => ({
+  product, quantity, unit_price,
 })
 
 describe('creditedUnitsByProductId', () => {
-  it('counts quantity times multiplier, the way stock is deducted', () => {
-    const credited = creditedUnitsByProductId([orderItem(1, 3, 2)], CATALOG)
+  it('counts the line quantity, the way stock is deducted', () => {
+    const credited = creditedUnitsByProductId([orderItem(1, 6)], CATALOG)
     expect(credited.get('1')).toBe(6)
   })
 
@@ -28,7 +28,7 @@ describe('creditedUnitsByProductId', () => {
 
   it('resolves purchase items by name', () => {
     const credited = creditedUnitsByProductId(
-      [{ product: 'Widget', quantity: 2, unit_multiplier: 3 }], CATALOG, 'name',
+      [{ product: 'Widget', quantity: 6 }], CATALOG, 'name',
     )
     // Keyed by id even though the item named the product — that is what the form's lines hold.
     expect(credited.get('1')).toBe(6)
@@ -59,12 +59,11 @@ describe('availableStock', () => {
 describe('toFormLines', () => {
   it('turns order items into form lines with names and credited stock', () => {
     const credited = new Map([['1', 2]])
-    const [line] = toFormLines([orderItem(1, 2, 1, '12.50')], CATALOG, { credited })
+    const [line] = toFormLines([orderItem(1, 2, '12.50')], CATALOG, { credited })
 
     expect(line).toEqual({
       product: '1',
       quantity: 2,
-      unit_multiplier: 1,
       unit_price: '12.50',
       product_name: 'Widget',
       stock_quantity: 6,
@@ -73,7 +72,7 @@ describe('toFormLines', () => {
 
   it('resolves purchase items, which carry a product name rather than an id', () => {
     const [line] = toFormLines(
-      [{ product: 'Gadget', quantity: 5, unit_multiplier: 1, unit_price: '2.00' }],
+      [{ product: 'Gadget', quantity: 5, unit_price: '2.00' }],
       CATALOG,
       { productKey: 'name' },
     )

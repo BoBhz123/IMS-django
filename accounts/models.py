@@ -102,11 +102,44 @@ class Account(models.Model):
 
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # --- Currency display settings ------------------------------------------------------
+    # DISPLAY ONLY. Every stored amount in this application is USD and stays USD:
+    # Product.cost_price, {Order,Purchase}Item.unit_price, OrderItem.unit_cost_price and
+    # Expense.amount are all USD DecimalFields, and COGS, profit and analytics are all
+    # computed from them. These two settings choose how those USD figures are *rendered*;
+    # they never change a stored value and there is no conversion on write.
+    #
+    # They also have nothing to do with billing. Card charges, plan prices and subscription
+    # renewals are USD-only and unconditionally so — see CLAUDE.md. Nothing in
+    # accounts/billing/ reads either of these fields, and a test asserts that.
+    primary_currency = models.CharField(
+        max_length=3,
+        choices=[('USD', 'US Dollar'), ('LBP', 'Lebanese Pound')],
+        default='USD',
+        help_text='Display currency for inventory figures. Does not affect stored amounts or billing.',
+    )
+    # When off, the app renders one currency and one only: no secondary equivalents, no
+    # exchange-rate inputs, no dual-currency invoice lines. The Purchase/Order.exchange_rate
+    # column still exists and is still recorded — it is the historical bookkeeping record of
+    # what the rate was that day, and dropping it would destroy that history. This flag hides
+    # the UI, it does not remove the data.
+    enable_dual_currency = models.BooleanField(
+        default=True,
+        help_text='Show secondary-currency equivalents alongside the primary currency.',
+    )
+
     class Meta:
         ordering = ['name']
 
     def __str__(self):
         return self.name
+
+    @property
+    def secondary_currency(self):
+        """The other currency, or None when dual display is off."""
+        if not self.enable_dual_currency:
+            return None
+        return 'LBP' if self.primary_currency == 'USD' else 'USD'
 
     @property
     def has_active_subscription(self):

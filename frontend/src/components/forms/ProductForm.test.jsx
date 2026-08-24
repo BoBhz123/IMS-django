@@ -139,3 +139,44 @@ describe('ProductForm barcode entry', () => {
     ).toBeInTheDocument()
   })
 })
+
+describe('ProductForm without lookup props', () => {
+  // The quick-create path. OrderForm and PurchaseForm render <ProductForm> with no `categories`
+  // and no `suppliers`, and ProductFormBody spreads `categories` — spreading undefined threw,
+  // React unmounted the tree, and the user was left looking at a backdrop with no form on it.
+  // That is the "modal freeze" this covers.
+  it('renders instead of throwing when no categories or suppliers are passed', async () => {
+    const { api } = await import('@/lib/api')
+    api.get.mockResolvedValue({ data: [] })
+
+    render(
+      <CurrencyProvider>
+        <ProductForm open onClose={vi.fn()} onSaved={vi.fn()} />
+      </CurrencyProvider>,
+    )
+
+    expect(await screen.findByRole('textbox', { name: /^name$/i })).toBeInTheDocument()
+  })
+
+  it('fetches its own categories so the required select is usable', async () => {
+    // Defaulting the prop to [] would have stopped the crash and still left a form that can
+    // never be submitted, because the category select is `required`.
+    const { api } = await import('@/lib/api')
+    api.get.mockImplementation((url) =>
+      Promise.resolve({
+        data: url.includes('categories')
+          ? [{ id: 3, name: 'Widgets' }]
+          : [{ id: 9, name: 'Acme Supply' }],
+      }),
+    )
+
+    render(
+      <CurrencyProvider>
+        <ProductForm open onClose={vi.fn()} onSaved={vi.fn()} />
+      </CurrencyProvider>,
+    )
+
+    expect(await screen.findByRole('option', { name: 'Widgets' })).toBeInTheDocument()
+    expect(await screen.findByRole('option', { name: 'Acme Supply' })).toBeInTheDocument()
+  })
+})

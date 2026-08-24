@@ -27,7 +27,19 @@ import { formatDate, planLabel, renewalInfo } from '@/lib/billing'
 export function Settings() {
   const { user, account, logout } = useAuth()
   const { theme, toggleTheme } = useTheme()
-  const { currency, toggleCurrency } = useCurrency()
+  const {
+    currency, toggleCurrency, primaryCurrency, enableDualCurrency, updateSettings,
+  } = useCurrency()
+  const [currencyBusy, setCurrencyBusy] = useState(false)
+
+  async function changeCurrencySetting(patch) {
+    setCurrencyBusy(true)
+    try {
+      await updateSettings(patch)
+    } finally {
+      setCurrencyBusy(false)
+    }
+  }
   const renewal = renewalInfo(account)
 
   const [step, setStep] = useState('request')
@@ -331,11 +343,35 @@ export function Settings() {
             onClick={toggleTheme}
           />
           <Toggle
-            label="Display currency"
-            value={currency}
-            onClick={toggleCurrency}
-            hint="Changes how amounts are shown. Stored values are always USD."
+            label="Base currency"
+            value={primaryCurrency}
+            disabled={currencyBusy}
+            onClick={() =>
+              changeCurrencySetting({
+                primary_currency: primaryCurrency === 'USD' ? 'LBP' : 'USD',
+              })
+            }
+            hint="The currency the app reads in. Stored amounts are always USD — this changes display only."
           />
+          <Toggle
+            label="Dual currency"
+            value={enableDualCurrency ? 'On' : 'Off'}
+            disabled={currencyBusy}
+            onClick={() =>
+              changeCurrencySetting({ enable_dual_currency: !enableDualCurrency })
+            }
+            hint="Off hides every secondary-currency total, conversion and exchange-rate field."
+          />
+          {/* Only offered while dual display is on: with it off there is no second currency to
+              switch to, and the Dock/WindowChrome toggles are hidden for the same reason. */}
+          {enableDualCurrency && (
+            <Toggle
+              label="Showing"
+              value={currency}
+              onClick={toggleCurrency}
+              hint="Which of the two currencies is on screen right now."
+            />
+          )}
         </div>
       </GlassCard>
     </div>
@@ -417,12 +453,13 @@ function SummaryItem({ label, value, hint }) {
   )
 }
 
-function Toggle({ label, value, onClick, hint }) {
+function Toggle({ label, value, onClick, hint, disabled = false }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className="rounded-2xl border border-hairline bg-canvas-2 p-4 text-left transition-colors hover:border-hairline-strong"
+      disabled={disabled}
+      className="rounded-2xl border border-hairline bg-canvas-2 p-4 text-left transition-colors hover:border-hairline-strong disabled:cursor-not-allowed disabled:opacity-60"
     >
       <p className="text-[12px] font-medium text-text-secondary">{label}</p>
       <p className="mt-1 text-[14px] font-medium text-text-primary">{value}</p>

@@ -16,7 +16,7 @@ const PURCHASE = {
   supplier: 'Acme',
   exchange_rate: 91000,
   placed_at: '2026-08-02T10:00:00Z',
-  items: [{ product: 'Widget', quantity: 10, unit_multiplier: 1, unit_price: '4.00' }],
+  items: [{ product: 'Widget', quantity: 10, unit_price: '4.00' }],
 }
 
 const SUPPLIERS = [{ id: 3, name: 'Acme' }, { id: 4, name: 'Other Co' }]
@@ -72,7 +72,7 @@ describe('PurchaseForm in edit mode', () => {
       {
         supplier: '3',
         exchange_rate: 91000,
-        items: [{ product: 1, quantity: 10, unit_multiplier: 1, unit_price: '4.00' }],
+        items: [{ product: 1, quantity: 10, unit_price: '4.00' }],
       },
     ))
     expect(api.post).not.toHaveBeenCalled()

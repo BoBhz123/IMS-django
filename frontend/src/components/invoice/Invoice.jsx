@@ -1,4 +1,6 @@
-import { Printer } from 'lucide-react'
+import { useState } from 'react'
+import { Check, Copy, Printer, Send, Share2, X } from 'lucide-react'
+import { buildShareMessage, paymentLabel, telegramShareUrl, whatsappShareUrl } from '@/lib/invoiceShare'
 import { Modal } from '@/components/ui/Modal'
 import { formatDate, formatLBP, formatMoney, invoiceFileName, shortId } from '@/lib/format'
 import { INVOICE_FOOTER_NOTE, INVOICE_TAGLINE } from '@/lib/invoiceConfig'
@@ -30,18 +32,71 @@ export function Invoice({
   partyPhone,
   partyLocation,
   items,
+  // Passed in rather than read from CurrencyContext on purpose: this component is a printable
+  // document, and keeping it free of context makes it renderable from anywhere (print view,
+  // a future PDF path, its own tests) without a provider. Orders/Purchases supply the account's
+  // real settings; the defaults keep a bare <Invoice> rendering as it always did.
+  primaryCurrency = 'USD',
+  showSecondaryCurrency = true,
+  // Payment state. Defaulted so a bare <Invoice> — or an older cached payload — renders
+  // without a stamp rather than crashing on an undefined status.
+  paymentStatus = null,
+  paidAmount = 0,
+  remainingAmount = 0,
+  // Sharing. `shareUrl` is null until the order has actually been shared; onShare mints it.
+  shareUrl = null,
+  onShare = null,
+  sharing = false,
 }) {
   const seller = useSellerIdentity()
 
+  const secondaryCode = primaryCurrency === 'USD' ? 'LBP' : 'USD'
+  const primary = (usd) =>
+    primaryCurrency === 'LBP' ? formatLBP(usd, exchangeRate) : formatMoney(usd)
+  /** The converted figure, or null when it must not be shown — no rate, or dual display off. */
+  const secondary = (usd) => {
+    if (!showSecondaryCurrency || !(exchangeRate > 0)) return null
+    return secondaryCode === 'LBP' ? formatLBP(usd, exchangeRate) : formatMoney(usd)
+  }
+
   const rows = items.map((item) => ({
     ...item,
-    lineTotal: item.quantity * item.unitMultiplier * item.unitPrice,
+    lineTotal: item.quantity * item.unitPrice,
   }))
   const subtotal = rows.reduce((sum, row) => sum + row.lineTotal, 0)
   // Subtotal and total are the same figure today — there is no discount, tax or shipping
   // model in this app. Both lines are printed anyway because the reference layout has both
   // and a reader looks for them; when a discount does arrive, only `total` changes.
   const total = subtotal
+
+  const [copied, setCopied] = useState(false)
+
+  const shareMessage = buildShareMessage({
+    reference: shortId(id),
+    sellerName: seller.name,
+    total,
+    paymentStatus,
+    paidAmount,
+    remainingAmount,
+    itemCount: rows.length,
+    shareUrl,
+    formatPrimary: primary,
+    formatSecondary: secondary,
+  })
+
+  async function handleCopyLink() {
+    try {
+      await navigator.clipboard.writeText(shareUrl)
+      setCopied(true)
+      // Reverts on its own — a permanently "Copied" button gives no feedback the second time.
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      // Clipboard access is denied outside a secure context and in some embedded browsers.
+      // The link is visible in the WhatsApp/Telegram targets either way, so this is a
+      // degraded copy button rather than a broken share feature.
+      setCopied(false)
+    }
+  }
 
   function handlePrint() {
     // Browsers use document.title as the suggested filename for "Save as PDF" — there's no
@@ -59,9 +114,9 @@ export function Invoice({
   }
 
   return (
-    <Modal open={open} onClose={onClose} className="max-w-3xl">
+    <Modal open={open} onClose={onClose} className="mx-auto w-full max-w-4xl overflow-x-auto shadow-lg">
       <div className="invoice-print rounded-squircle bg-white p-5 text-black sm:p-8 print:block print:fixed print:inset-0 print:top-0 print:left-0 print:z-[999] print:h-auto print:w-full print:overflow-visible print:rounded-none print:shadow-none">
-        <div className="no-print print:hidden mb-4 flex justify-end">
+        <div className="no-print print:hidden mb-4 flex flex-wrap items-center justify-end gap-2">
           <button
             type="button"
             onClick={handlePrint}
@@ -69,6 +124,61 @@ export function Invoice({
           >
             <Printer size={14} />
             Print / Save PDF
+          </button>
+
+          {/* Sharing is opt-in per invoice: the first press mints a public link (see
+              PublicInvoiceView), so it is a deliberate act rather than something that happens
+              because the invoice was opened. */}
+          {onShare && !shareUrl && (
+            <button
+              type="button"
+              onClick={onShare}
+              disabled={sharing}
+              className="flex items-center gap-1.5 rounded-xl border border-hairline px-3 py-1.5 text-[13px] font-semibold text-text-primary hover:bg-canvas-2 disabled:opacity-60"
+            >
+              <Share2 size={14} />
+              {sharing ? 'Creating link…' : 'Share invoice'}
+            </button>
+          )}
+
+          {shareUrl && (
+            <>
+              <a
+                href={whatsappShareUrl(shareMessage)}
+                target="_blank"
+                rel="noreferrer noopener"
+                className="flex items-center gap-1.5 rounded-xl bg-[#25D366] px-3 py-1.5 text-[13px] font-semibold text-white hover:opacity-90"
+              >
+                <Share2 size={14} />
+                WhatsApp
+              </a>
+              <a
+                href={telegramShareUrl(shareMessage, shareUrl)}
+                target="_blank"
+                rel="noreferrer noopener"
+                className="flex items-center gap-1.5 rounded-xl bg-[#229ED9] px-3 py-1.5 text-[13px] font-semibold text-white hover:opacity-90"
+              >
+                <Send size={14} />
+                Telegram
+              </a>
+              <button
+                type="button"
+                onClick={handleCopyLink}
+                className="flex items-center gap-1.5 rounded-xl border border-hairline px-3 py-1.5 text-[13px] font-semibold text-text-primary hover:bg-canvas-2"
+              >
+                {copied ? <Check size={14} /> : <Copy size={14} />}
+                {copied ? 'Copied' : 'Copy link'}
+              </button>
+            </>
+          )}
+
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex items-center gap-1.5 rounded-xl border border-hairline px-3 py-1.5 text-[13px] font-semibold text-text-secondary hover:bg-canvas-2"
+          >
+            <X size={14} />
+            Close
           </button>
         </div>
 
@@ -132,7 +242,6 @@ export function Invoice({
                 <tr className="bg-[#4F46E5] text-[10px] tracking-[0.06em] text-white uppercase">
                   <th className="w-8 px-2 py-2.5 text-center font-bold">#</th>
                   <th className="px-3 py-2.5 font-bold">Items</th>
-                  <th className="w-16 px-2 py-2.5 text-center font-bold">Unit</th>
                   <th className="w-14 px-2 py-2.5 text-right font-bold">Qty</th>
                   <th className="w-24 px-3 py-2.5 text-right font-bold">Unit cost</th>
                   <th className="w-24 px-3 py-2.5 text-right font-bold">Total</th>
@@ -147,20 +256,14 @@ export function Invoice({
                     <td className="border-b border-slate-200 px-3 py-2.5 text-slate-900">
                       {row.name}
                     </td>
-                    {/* Units per pack, i.e. unit_multiplier — the same number stock is
-                        deducted by. Shown as a bare count so a case of 12 reads "12", and
-                        loose goods read "1" rather than an empty cell. */}
-                    <td className="border-b border-slate-200 px-2 py-2.5 text-center text-slate-500 tabular-nums">
-                      {row.unitMultiplier}
-                    </td>
                     <td className="border-b border-slate-200 px-2 py-2.5 text-right text-slate-500 tabular-nums">
                       {row.quantity}
                     </td>
                     <td className="border-b border-slate-200 px-3 py-2.5 text-right text-slate-500 tabular-nums">
-                      {formatMoney(row.unitPrice)}
+                      {primary(row.unitPrice)}
                     </td>
                     <td className="border-b border-slate-200 px-3 py-2.5 text-right font-medium text-slate-900 tabular-nums">
-                      {formatMoney(row.lineTotal)}
+                      {primary(row.lineTotal)}
                     </td>
                   </tr>
                 ))}
@@ -173,14 +276,14 @@ export function Invoice({
               <div className="flex items-baseline justify-between py-1 text-[13px]">
                 <span className="text-slate-500">Subtotal</span>
                 <span className="font-medium text-slate-900 tabular-nums">
-                  {formatMoney(subtotal)}
+                  {primary(subtotal)}
                 </span>
               </div>
-              {exchangeRate > 0 && (
+              {secondary(subtotal) && (
                 <div className="flex items-baseline justify-between pb-2 text-[11px]">
-                  <span className="text-slate-400">Subtotal (LBP)</span>
+                  <span className="text-slate-400">Subtotal ({secondaryCode})</span>
                   <span className="text-slate-500 tabular-nums">
-                    {formatLBP(subtotal, exchangeRate)}
+                    {secondary(subtotal)}
                   </span>
                 </div>
               )}
@@ -188,22 +291,52 @@ export function Invoice({
               <div className="flex items-baseline justify-between border-t-2 border-slate-900 pt-2 text-[15px]">
                 <span className="font-bold tracking-wide text-slate-900 uppercase">Total</span>
                 <span className="font-display font-bold text-slate-900 tabular-nums">
-                  {formatMoney(total)}
+                  {primary(total)}
                 </span>
               </div>
-              {/* The secondary figure, only when a rate was recorded. LBP is presentation
-                  here and nothing else — the stored amount is USD, and this multiplies it for
-                  reading. See the USD-only rule in CLAUDE.md. */}
-              {exchangeRate > 0 && (
+              {/* The dual-currency breakdown, shown only when the account asked for one and a
+                  rate was recorded. Conversion is presentation and nothing else — the stored
+                  amount is USD either way. See the USD-only rule in CLAUDE.md. */}
+              {secondary(total) && (
                 <div className="flex items-baseline justify-between text-[12px]">
-                  <span className="text-slate-400">Total (LBP)</span>
+                  <span className="text-slate-400">Total ({secondaryCode})</span>
                   <span className="font-medium text-slate-600 tabular-nums">
-                    {formatLBP(total, exchangeRate)}
+                    {secondary(total)}
                   </span>
                 </div>
               )}
             </div>
           </div>
+
+          {/* The payment stamp. Angled and outlined like a rubber stamp because that is what
+              a reader looks for on a paper invoice, and it carries the numbers rather than
+              just a word — "PARTIALLY PAID" alone tells the customer nothing about what they
+              still owe. */}
+          {paymentStatus && (
+            <div className="avoid-break mt-6 flex justify-end">
+              <div
+                className={`-rotate-6 rounded-lg border-[3px] px-4 py-2 text-center ${
+                  paymentStatus === 'PAID'
+                    ? 'border-emerald-600 text-emerald-700'
+                    : paymentStatus === 'PARTIALLY_PAID'
+                      ? 'border-amber-600 text-amber-700'
+                      : 'border-red-600 text-red-700'
+                }`}
+              >
+                <p className="font-display text-[18px] leading-none font-extrabold tracking-widest uppercase">
+                  {paymentLabel(paymentStatus)}
+                </p>
+                {paymentStatus !== 'UNPAID' && (
+                  <p className="mt-1 text-[11px] tabular-nums">Paid {primary(paidAmount)}</p>
+                )}
+                {paymentStatus !== 'PAID' && (
+                  <p className="mt-0.5 text-[11px] font-semibold tabular-nums">
+                    Balance {primary(remainingAmount)}
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
 
           <div className="avoid-break mt-8 border-t border-slate-200 pt-4 text-center">
             <p className="text-[13px] font-semibold text-slate-700">{INVOICE_TAGLINE}</p>

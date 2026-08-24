@@ -1,5 +1,5 @@
 import { useMemo } from 'react'
-import { CheckCircle2 } from 'lucide-react'
+import { PaymentBadge } from '@/components/ui/PaymentBadge'
 import { useAllProducts } from '@/hooks/useAllProducts'
 import { useCurrency } from '@/context/CurrencyContext'
 import { SlideOver } from '@/components/ui/SlideOver'
@@ -19,6 +19,9 @@ export function TransactionDetail({
   id,
   placedAt,
   exchangeRate,
+  paymentStatus = null,
+  paidAmount = 0,
+  remainingAmount = 0,
   partyLabel,
   partyName,
   items,
@@ -43,12 +46,11 @@ export function TransactionDetail({
       name: product?.name ?? (productKey === 'name' ? item.product : `Product #${item.product}`),
       image: product?.images?.[0]?.image,
       quantity: item.quantity,
-      unitMultiplier: item.unit_multiplier,
       unitPrice: item.unit_price,
       profit: item.profit,
     }
   })
-  const total = rows.reduce((sum, row) => sum + row.quantity * row.unitMultiplier * row.unitPrice, 0)
+  const total = rows.reduce((sum, row) => sum + row.quantity * row.unitPrice, 0)
 
   return (
     <SlideOver open={open} onClose={onClose} title={documentType}>
@@ -58,10 +60,10 @@ export function TransactionDetail({
             <p className="font-display text-[15px] font-semibold text-text-primary tabular-nums">#{shortId(id)}</p>
             <p className="text-[12px] text-text-secondary">{formatDate(placedAt)}</p>
           </div>
-          <span className="inline-flex items-center gap-1 rounded-full bg-accent-green/14 px-2 py-0.5 text-[12px] font-medium text-accent-green">
-            <CheckCircle2 size={12} strokeWidth={2.5} />
-            Completed
-          </span>
+          {/* Was a static "Completed" pill, which said nothing useful — every saved
+              transaction is completed. Since payment_status landed this carries the fact a
+              reader actually wants: whether the money arrived. */}
+          <PaymentBadge status={paymentStatus} />
         </div>
 
         <div className="rounded-xl border border-hairline p-3">
@@ -79,9 +81,7 @@ export function TransactionDetail({
               <div className="min-w-0 flex-1">
                 <p className="truncate text-[13px] font-medium text-text-primary">{row.name}</p>
                 <p className="text-[12px] text-text-secondary tabular-nums">
-                  {row.quantity}
-                  {row.unitMultiplier > 1 ? ` × ${row.unitMultiplier}` : ''} @{' '}
-                  {formatAmount(row.unitPrice, exchangeRate)}
+                  {row.quantity} @ {formatAmount(row.unitPrice, exchangeRate)}
                 </p>
                 {documentType === 'Order' && (
                   <p className="text-[11px] text-accent-green tabular-nums">
@@ -90,7 +90,7 @@ export function TransactionDetail({
                 )}
               </div>
               <span className="shrink-0 text-[13px] font-medium text-text-primary tabular-nums">
-                {formatAmount(row.quantity * row.unitMultiplier * row.unitPrice, exchangeRate)}
+                {formatAmount(row.quantity * row.unitPrice, exchangeRate)}
               </span>
             </GlassCard>
           ))}
@@ -98,7 +98,17 @@ export function TransactionDetail({
 
         <div className="flex items-center justify-between rounded-xl bg-canvas-2 px-3 py-2 text-[13px]">
           <span className="text-text-secondary">Total</span>
-          <span className="font-semibold text-text-primary tabular-nums">{formatAmount(total, exchangeRate)}</span>
+          <span className="flex flex-col items-end">
+            <span className="font-semibold text-text-primary tabular-nums">{formatAmount(total, exchangeRate)}</span>
+            {/* Only when something is still owed — printing "Balance $0.00" under a settled
+                transaction is noise a reader has to stop and dismiss. */}
+            {paymentStatus && paymentStatus !== 'PAID' && (
+              <span className="text-[11px] text-accent-orange tabular-nums">
+                Paid {formatAmount(paidAmount, exchangeRate)} · Balance{' '}
+                {formatAmount(remainingAmount, exchangeRate)}
+              </span>
+            )}
+          </span>
         </div>
 
         {documentType === 'Order' && (

@@ -16,7 +16,7 @@
  */
 
 function unitsOf(item) {
-  return (Number(item.quantity) || 0) * (Number(item.unit_multiplier) || 0)
+  return Number(item.quantity) || 0
 }
 
 /**
@@ -70,7 +70,6 @@ export function toFormLines(items, catalog, { productKey = 'id', credited = null
     return {
       product: product ? String(product.id) : '',
       quantity: Number(item.quantity) || 1,
-      unit_multiplier: Number(item.unit_multiplier) || 1,
       unit_price: item.unit_price,
       product_name:
         product?.name ??

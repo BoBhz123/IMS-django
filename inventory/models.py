@@ -1,3 +1,6 @@
+import secrets
+from decimal import Decimal
+
 from django.db import models
 import uuid
 from django.core.validators import MinValueValidator
@@ -20,45 +23,123 @@ def product_image_path(instance, filename):
     return f'inventory/images/{instance.product.account_id}/{filename}'
 
 
-# The single definition of what a Purchase/Order line is worth:
-# quantity * unit_multiplier * unit_price.
+# The single definition of what a Purchase/Order line is worth: quantity * unit_price.
 #
 # This used to be written out by hand in six places (both total_price properties, both item
 # serializers, AnalyticsView, both CSV export views, and the admin's list column + CSV
-# actions) and had drifted: the total_price properties omitted unit_multiplier while
-# everything else included it, so the API's `total_price` disagreed with the per-item
-# `total_price`, with the analytics revenue, and with what the UI displayed. Import from here
-# rather than re-typing the expression.
+# actions) and had drifted. Import from here rather than re-typing the expression.
+#
+# `unit_multiplier` was removed on 2026-08-24. It used to sit in the middle of this product
+# (quantity * unit_multiplier * unit_price) to express "3 packs of 12". Migration
+# inventory/0006 folded it into quantity — quantity := quantity * unit_multiplier — so every
+# line total, stock movement and profit figure is numerically unchanged; a line that read
+# "3 x 12" now reads "36". See that migration for the arithmetic and why it is lossless.
 #
 # Both Purchase and Order name the reverse relation 'items', so this path resolves for either.
 # Wrap it at the call site: .annotate(total=Sum(LINE_TOTAL)).
-LINE_TOTAL = (
-    models.F('items__quantity')
-    * models.F('items__unit_multiplier')
-    * models.F('items__unit_price')
-)
+LINE_TOTAL = models.F('items__quantity') * models.F('items__unit_price')
 
 
 def items_total(items):
     """Python-side equivalent of Sum(LINE_TOTAL), for already-loaded (prefetched) items."""
-    return sum(item.quantity * item.unit_multiplier * item.unit_price for item in items)
+    return sum(item.quantity * item.unit_price for item in items)
 
 
 # The cost half of LINE_TOTAL. Reads the snapshot on the line, never product.cost_price —
 # joining out to the product would make every historical figure move the next time somebody
 # corrects a cost.
-LINE_COGS = (
-    models.F('items__quantity')
-    * models.F('items__unit_multiplier')
-    * models.F('items__unit_cost_price')
-)
+LINE_COGS = models.F('items__quantity') * models.F('items__unit_cost_price')
 
 
 def items_cogs(items):
     """Python-side equivalent of Sum(LINE_COGS), for already-loaded (prefetched) items."""
-    return sum(
-        item.quantity * item.unit_multiplier * item.unit_cost_price for item in items
+    return sum(item.quantity * item.unit_cost_price for item in items)
+
+
+class PaymentStatus(models.TextChoices):
+    """
+    Settlement state of a Purchase or Order.
+
+    Derived from `paid_amount` against the transaction total, never set independently — see
+    PaymentTrackedTransaction.sync_payment_status. A status column that can disagree with the
+    number beside it is the same failure mode Account.subscription_status has (a stale column
+    silently granting free service), and the cure is the same: compute it, don't trust it.
+    """
+
+    UNPAID = 'UNPAID', 'Unpaid'
+    PARTIALLY_PAID = 'PARTIALLY_PAID', 'Partially paid'
+    PAID = 'PAID', 'Paid'
+
+
+class PaymentTrackedTransaction(models.Model):
+    """
+    Payment state shared by Purchase and Order.
+
+    Abstract, so both concrete tables get their own columns — there is no shared payments
+    table and no join. `remaining_amount` is a property rather than a column for the same
+    reason `total_price` is: totals are computed from the line rows, so a stored remainder
+    would need reversing on every edit, and orders/purchases are editable (Phase 9).
+    """
+
+    payment_status = models.CharField(
+        max_length=16,
+        choices=PaymentStatus.choices,
+        default=PaymentStatus.UNPAID,
+        db_index=True,
     )
+    # max_digits deliberately wider than unit_price's 9: this holds a whole-transaction sum,
+    # not a per-unit figure.
+    paid_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal('0.00'),
+        validators=[MinValueValidator(0)],
+    )
+
+    class Meta:
+        abstract = True
+
+    @property
+    def remaining_amount(self):
+        """
+        What is still owed. Never negative: overpayment (a rounded-up cash settlement, which
+        is routine here) reads as a zero balance rather than a negative one, because a
+        negative "remaining" renders as a refund the business does not owe.
+        """
+        remaining = Decimal(self.total_price) - self.paid_amount
+        return remaining if remaining > Decimal('0.00') else Decimal('0.00')
+
+    def derive_payment_status(self, total=None):
+        """The status implied by `paid_amount`. Pure — does not write."""
+        total = Decimal(self.total_price if total is None else total)
+        paid = self.paid_amount or Decimal('0.00')
+        if paid <= Decimal('0.00'):
+            return PaymentStatus.UNPAID
+        # >= rather than ==: an overpayment is still fully paid.
+        if paid >= total:
+            return PaymentStatus.PAID
+        return PaymentStatus.PARTIALLY_PAID
+
+    def sync_payment_status(self, total=None, save=True):
+        """
+        Recompute `payment_status` from `paid_amount`.
+
+        Must run *after* the line items exist — the total is summed from them, so calling this
+        before bulk_create sees a total of 0 and marks every transaction PAID. The write
+        serializers call it at the end of create()/update() for exactly that reason.
+
+        Saves `paid_amount` alongside the status. It used to save only the status, which made
+        the obvious two-liner silently lose data:
+
+            order.paid_amount = Decimal('12.00')
+            order.sync_payment_status()      # persisted PARTIALLY_PAID, but paid_amount 0
+
+        — the row then read "partially paid" next to a zero, and the balance owing was the
+        whole total. Persisting both is the only form that cannot leave the two disagreeing,
+        which is the entire point of deriving one from the other.
+        """
+        self.payment_status = self.derive_payment_status(total)
+        if save:
+            self.save(update_fields=['paid_amount', 'payment_status'])
+        return self.payment_status
 
 
 class Supplier(models.Model):
@@ -164,7 +245,7 @@ class ProductImage(models.Model):
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='images')
     image = ExternalOrLocalImageField(upload_to=product_image_path, validators=[validate_file_size])
     
-class Purchase(models.Model):
+class Purchase(PaymentTrackedTransaction):
     id = models.UUIDField(default=uuid.uuid4,primary_key=True,null=False)
     account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name='purchases')
     placed_at= models.DateTimeField(auto_now_add=True,db_index=True)
@@ -197,8 +278,7 @@ class PurchaseItem(models.Model):
                                  PROTECT, related_name='purchaseitems')
      quantity = models.PositiveSmallIntegerField(default=1)
      unit_price = models.DecimalField(max_digits=9, decimal_places=2,validators=[MinValueValidator(0)])
-     unit_multiplier = models.PositiveSmallIntegerField(default=1)
-     
+
 class Customer(models.Model):
     id = models.AutoField(primary_key=True,unique=True)
     account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name='customers')
@@ -219,8 +299,30 @@ class Customer(models.Model):
 
 
 
-class Order(models.Model):
+def generate_share_token():
+    """
+    An unguessable identifier for a public invoice link.
+
+    `secrets`, never `random` or a uuid4 hex: this string is the *only* thing standing between
+    the public internet and a customer's name, phone number and order lines. 32 bytes gives a
+    43-character urlsafe token — far beyond enumeration, which matters because the endpoint it
+    unlocks has no authentication to fall back on.
+    """
+    return secrets.token_urlsafe(32)
+
+
+class Order(PaymentTrackedTransaction):
     id = models.UUIDField(primary_key=True,null=False,default=uuid.uuid4)
+    # Empty until someone actually shares this order, and emptied again on revoke. Not a
+    # boolean plus a derived value: the token IS the capability, so revoking has to destroy it
+    # rather than flip a flag some future code path might forget to check.
+    #
+    # `null=True` with `unique=True` so that every unshared order is NULL rather than '' —
+    # NULLs do not collide in a unique index but two empty strings do. Same reasoning as
+    # Product.barcode; see share() in views.py, which is the only writer.
+    share_token = models.CharField(
+        max_length=64, null=True, blank=True, default=None, unique=True, db_index=True,
+    )
     account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name='orders')
     placed_at= models.DateTimeField(auto_now_add=True,db_index=True)
     customer= models.ForeignKey(Customer,on_delete=models.SET_NULL,
@@ -251,7 +353,6 @@ class OrderItem(models.Model):
                                  PROTECT, related_name='orderitems',blank=True)
      quantity = models.PositiveSmallIntegerField(default=1)
      unit_price = models.DecimalField(max_digits=9, decimal_places=2, validators=[MinValueValidator(0)])
-     unit_multiplier = models.PositiveSmallIntegerField(default=1)
      # What this item cost us at the moment it was sold. Snapshotted, not derived: the
      # product's cost_price is a current figure that gets corrected, and profit computed
      # from it restates history every time it moves.
@@ -274,7 +375,7 @@ class OrderItem(models.Model):
 
      @property
      def profit(self):
-         return (self.unit_price - self.unit_cost_price) * self.quantity * self.unit_multiplier
+         return (self.unit_price - self.unit_cost_price) * self.quantity
 
 
 

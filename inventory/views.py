@@ -7,19 +7,22 @@ from django.http import HttpResponse
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter,OrderingFilter
 from rest_framework.parsers import MultiPartParser,FormParser
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, action
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
 from rest_framework.views import APIView
 from rest_framework.throttling import ScopedRateThrottle
+from rest_framework.permissions import AllowAny
+from django.conf import settings
 from .filters import ProductFilter,PurchaseFilter,OrderFilter,ExpenseFilter
 from .pagination import DefaultPagination
-from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order,Expense,LINE_TOTAL,LINE_COGS
+from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order,Expense,LINE_TOTAL,LINE_COGS,generate_share_token
 from .csv_format import iso as _iso, money as _money, text as _csv_safe
 from .reporting import DateWindow
 from .serializers import *
 import csv
 
+from accounts.audit import log_event
 from accounts.mixins import AccountScopedMixin
 from accounts.models import get_account
 
@@ -184,6 +187,84 @@ class OrderViewSet(AccountScopedMixin, _TotalAnnotationMixin, ModelViewSet):
             return CreateOrderSerializer
         return OrderSerializer
 
+    @action(detail=True, methods=['post', 'delete'], url_path='share')
+    def share(self, request, pk=None):
+        """
+        Mint (POST) or revoke (DELETE) this order's public invoice link.
+
+        Reached through the account-scoped queryset, so an order belonging to another account
+        is a 404 here exactly as it is everywhere else — `get_object()` chains through
+        AccountScopedMixin and never sees it.
+
+        POST is idempotent: re-sharing an already-shared order returns the same token rather
+        than minting a second one, so a customer who was sent the link yesterday is not
+        silently cut off because somebody pressed Share again.
+        """
+        order = self.get_object()
+
+        if request.method == 'DELETE':
+            # Destroy the token rather than flag it. The token IS the capability — a
+            # `revoked` boolean would leave a working secret in the database, one forgotten
+            # filter away from still opening the door.
+            order.share_token = None
+            order.save(update_fields=['share_token'])
+            log_event(
+                'invoice_share_revoked', user=request.user, account=self.account,
+                order=str(order.id),
+            )
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        if not order.share_token:
+            order.share_token = generate_share_token()
+            order.save(update_fields=['share_token'])
+            log_event(
+                'invoice_share_created', user=request.user, account=self.account,
+                order=str(order.id),
+            )
+
+        return Response({
+            'share_token': order.share_token,
+            # Built server-side from SITE_URL so the link a customer receives is the canonical
+            # domain, not whichever host the staff member happened to be using.
+            'share_url': f'{settings.SITE_URL}/i/{order.share_token}',
+        })
+
+
+class PublicInvoiceView(APIView):
+    """
+    An invoice, readable by anyone holding its share token. **No authentication.**
+
+    This is the only unauthenticated data endpoint in the application, so the constraints are
+    worth stating plainly:
+
+    * The token is 32 bytes from `secrets` (43 urlsafe characters). It is not enumerable, and
+      it is the entire access-control story — there is nothing behind it.
+    * The response comes from PublicInvoiceSerializer, which lists its fields explicitly and
+      omits `unit_cost_price`, `profit` and `total_profit`. Publishing those would tell every
+      recipient what the business pays its suppliers.
+    * `authentication_classes = []` so a stray session or JWT cannot change what is returned —
+      the response must depend on the token and nothing else.
+    * Throttled per client address: the token is unguessable, but an endpoint that runs a
+      database query for any string handed to it is still worth a limit.
+    * Revocation is immediate, because revoking nulls the column this looks up.
+    """
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'public_invoice'
+
+    def get(self, request, token):
+        order = get_object_or_404(
+            Order.objects.select_related('account', 'customer').prefetch_related(
+                Prefetch('items', queryset=OrderItem.objects.select_related('product'))
+            ),
+            # Guarding against '' and None explicitly: a bug elsewhere that stored an empty
+            # token must not turn into "GET /i/ returns somebody's invoice".
+            share_token=token or '\x00',
+        )
+        return Response(PublicInvoiceSerializer(order).data)
+
 
 
 GROUP_BY_TRUNC = {
@@ -230,7 +311,7 @@ class AnalyticsView(APIView):
         gross_profit = revenue - cogs
 
         best_seller_query = products.values('product__name').annotate(
-            total_sold=Sum(F('quantity') * F('unit_multiplier'))
+            total_sold=Sum(F('quantity'))
         ).order_by('-total_sold')[:5]
 
         data = {
@@ -377,19 +458,29 @@ class ExportOrdersCSVView(APIView):
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = 'attachment; filename="orders_detailed_export.csv"'
         
-        writer = csv.writer(response)    
-        writer.writerow([
-            'Order ID', 
-            'Customer Name', 
-            'Date Placed', 
-            'Exchange Rate (LBP)', 
+        writer = csv.writer(response)
+
+        account = get_account(request.user)
+        # The exchange rate is a currency *conversion* detail, so it follows the account's
+        # dual-currency setting: an account operating in one currency exports one currency.
+        # The column is dropped from the file entirely rather than blanked, because a
+        # permanently empty column is something a spreadsheet user has to ask about.
+        # The Purchase/Order.exchange_rate row data is still stored either way — this is a
+        # reporting choice, not a change to what is recorded.
+        include_rate = account.enable_dual_currency if account else True
+
+        header = [
+            'Order ID',
+            'Customer Name',
+            'Date Placed',
+            *(['Exchange Rate (LBP)'] if include_rate else []),
             'Product Name',
             'Barcode',
+            # Since unit_multiplier was removed (2026-08-24) this IS the physical count, so
+            # it is summable and is summed in the TOTALS row. The old 'Unit Multiplier' and
+            # 'Total Units' columns are gone: the first no longer exists, and the second was
+            # only ever quantity * multiplier, which is now just quantity.
             'Quantity',
-            'Unit Multiplier',
-            # The physical count, quantity * unit_multiplier. Quantity alone is meaningless
-            # to sum across lines that use different multipliers.
-            'Total Units',
             'Sell Price (USD)',
             'Cost Price (USD)',
             'Line Total (USD)',
@@ -397,9 +488,8 @@ class ExportOrdersCSVView(APIView):
             # repeated the whole order's profit on every one of its lines, so any tool that
             # summed the column multiplied each order's profit by its line count.
             'Line Profit (USD)',
-        ])
-
-        account = get_account(request.user)
+        ]
+        writer.writerow(header)
         items = OrderItem.objects.select_related(
             'order', 'order__customer', 'product'
         ).filter(order__account=account) if account else OrderItem.objects.none()
@@ -427,7 +517,7 @@ class ExportOrdersCSVView(APIView):
         total_line_profit = 0
 
         for item in items:
-            units = item.quantity * item.unit_multiplier
+            units = item.quantity
             line_total = units * item.unit_price
             # The snapshot on the line, not product.cost_price: a re-export of last year
             # must reproduce last year's figures even after a cost correction.
@@ -442,11 +532,9 @@ class ExportOrdersCSVView(APIView):
                 item.order.id,
                 _csv_safe(item.order.customer.name if item.order.customer else "No Customer"),
                 _iso(item.order.placed_at),
-                item.order.exchange_rate,
+                *([item.order.exchange_rate] if include_rate else []),
                 _csv_safe(item.product.name if item.product else "Unknown Product"),
                 _csv_safe(item.product.barcode or '' if item.product else ''),
-                item.quantity,
-                item.unit_multiplier,
                 units,
                 _money(item.unit_price),
                 _money(cost_price),
@@ -454,12 +542,15 @@ class ExportOrdersCSVView(APIView):
                 _money(line_profit),
             ])
 
-        # Quantity is deliberately not totalled: summing it across lines with different
-        # unit_multipliers produces a number that means nothing. Total Units is that column.
-        writer.writerow([
-            'TOTALS', '', '', '', '', '', '', '',
-            total_units, '', '', _money(total_line_value), _money(total_line_profit),
-        ])
+        # Positioned by column name rather than by counting blanks. The old form was a literal
+        # run of '' whose length had to be recounted by hand every time a column moved, and the
+        # rate column now appears or disappears per account, so counting is no longer possible.
+        totals_row = [''] * len(header)
+        totals_row[0] = 'TOTALS'
+        totals_row[header.index('Quantity')] = total_units
+        totals_row[header.index('Line Total (USD)')] = _money(total_line_value)
+        totals_row[header.index('Line Profit (USD)')] = _money(total_line_profit)
+        writer.writerow(totals_row)
 
         return response
     
@@ -474,23 +565,28 @@ class ExportPurchasesCSVView(APIView):
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = 'attachment; filename="purchases_detailed_export.csv"'
         
-        writer = csv.writer(response)    
-        writer.writerow([
-            'Purchase ID', 
-            'Supplier Name', 
-            'Date Placed', 
-            'Exchange Rate (LBP)', 
-            'Product Name',
-            'Barcode',
-            'Quantity',
-            'Unit Multiplier',
-            'Total Units',
-            'Unit Cost Price (USD)',
-            'Line Total (USD)',
-        ])
+        writer = csv.writer(response)
 
         # Query PurchaseItems directly for the row-by-row breakdown
         account = get_account(request.user)
+        # See ExportOrdersCSVView — the rate column follows the account's dual-currency setting.
+        include_rate = account.enable_dual_currency if account else True
+
+        header = [
+            'Purchase ID',
+            'Supplier Name',
+            'Date Placed',
+            *(['Exchange Rate (LBP)'] if include_rate else []),
+            'Product Name',
+            'Barcode',
+            # See ExportOrdersCSVView — quantity is the physical count now that
+            # unit_multiplier is gone, so 'Unit Multiplier' and 'Total Units' are dropped and
+            # this column is the one totalled.
+            'Quantity',
+            'Unit Cost Price (USD)',
+            'Line Total (USD)',
+        ]
+        writer.writerow(header)
         items = PurchaseItem.objects.select_related(
             'purchase_order', 'purchase_order__supplier', 'product'
         ).filter(purchase_order__account=account) if account else PurchaseItem.objects.none()
@@ -515,7 +611,7 @@ class ExportPurchasesCSVView(APIView):
         total_line_value = 0
 
         for item in items:
-            units = item.quantity * item.unit_multiplier
+            units = item.quantity
             line_total = units * item.unit_price
             total_units += units
             total_line_value += line_total
@@ -527,20 +623,19 @@ class ExportPurchasesCSVView(APIView):
                     if item.purchase_order.supplier else "No Supplier"
                 ),
                 _iso(item.purchase_order.placed_at),
-                item.purchase_order.exchange_rate,
+                *([item.purchase_order.exchange_rate] if include_rate else []),
                 _csv_safe(item.product.name if item.product else "Unknown Product"),
                 _csv_safe(item.product.barcode or '' if item.product else ''),
-                item.quantity,
-                item.unit_multiplier,
                 units,
                 _money(item.unit_price),
                 _money(line_total),
             ])
 
-        writer.writerow([
-            'TOTALS', '', '', '', '', '', '', '',
-            total_units, '', _money(total_line_value),
-        ])
+        totals_row = [''] * len(header)
+        totals_row[0] = 'TOTALS'
+        totals_row[header.index('Quantity')] = total_units
+        totals_row[header.index('Line Total (USD)')] = _money(total_line_value)
+        writer.writerow(totals_row)
 
         return response
 

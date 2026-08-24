@@ -97,6 +97,58 @@ Django apps under a single `ims` project, plus a React frontend:
 - **`frontend/`** — React + Vite + Tailwind SPA. Built to `frontend/dist/` and served by WhiteNoise
   via `ims/views.py::spa_index`, which is the catch-all route in `ims/urls.py`.
 
+### Local development in Docker (added 2026-08-24)
+
+Optional — `pipenv shell` + host Postgres still works exactly as before. Five new files, and
+**no existing file was modified**, which is what keeps the Heroku path provably untouched:
+`Dockerfile`, `.dockerignore`, `docker-compose.yml`, `frontend/Dockerfile`, `frontend/.dockerignore`.
+
+```bash
+docker compose up --build -d
+docker compose exec backend python manage.py migrate    # required once; nothing auto-migrates
+docker compose exec backend python manage.py test
+docker compose exec frontend npm test
+docker compose down       # keeps the DB volume;  down -v destroys it
+```
+
+SPA on `localhost:5173`, API on `localhost:8000`, Postgres on `localhost:5433`.
+
+Things that are the way they are for a reason:
+
+- **The base image is `python:3.14-slim`, not 3.12.** `Pipfile`/`Pipfile.lock` pin
+  `python_version = "3.14"` and `pipenv install --deploy` aborts on a mismatch — that check is the
+  point of `--deploy`, and dropping it would also drop the lockfile hash verification.
+- **`pipenv install --system`, never a venv.** Packages land in `/usr/local/lib/python3.14/`, outside
+  `/app`. The `.:/app` bind mount would shadow a `/app/.venv` and the container would fail to import
+  Django.
+- **Postgres publishes `5433:5432`.** The host already runs Postgres on 5432; 5432:5432 will not bind.
+- **`VITE_API_BASE_URL` is deliberately unset in compose.** `lib/api.js` derives the origin from
+  `window.location` (see the rule above). Setting it to `http://backend:8000` breaks everything — that
+  string is inlined into JS running in the *host's browser*, which cannot resolve a Compose DNS name.
+- **The frontend image is `node:22-alpine`** to match `engines.node: 22.x` in the root `package.json`,
+  which is the Node major Heroku's buildpack actually builds the shipped bundle with. Alpine is safe
+  here only because `package-lock.json` carries the `*-linux-x64-musl` native binaries for rollup,
+  `@tailwindcss/oxide`, lightningcss and oxlint — checked before choosing it.
+- **`frontend/.dockerignore` is a second, separate file.** A `.dockerignore` applies only to its own
+  build context, and the frontend's context is `./frontend`, so the root one is not consulted.
+- **`.env` is excluded from the image and injected at runtime** via compose `env_file`. Baking it into
+  a layer would publish the Brevo password, `PAYMENT_ENCRYPTION_KEY` and the Paddle credentials to
+  anyone who pulls the image.
+- **The container runs as root against a bind mount.** `PYTHONDONTWRITEBYTECODE=1` stops `__pycache__`
+  from appearing root-owned in your working copy, but anything that *writes* source will —
+  `makemigrations` and `npm run build` especially. Use
+  `docker compose exec --user "$(id -u):$(id -g)" backend python manage.py makemigrations`, or
+  `chown -R "$(id -u):$(id -g)"` the output afterwards from inside the container.
+- **`pip install pip-audit` is a separate Dockerfile layer, not a Pipfile entry.** The OWASP A06
+  test (`inventory/tests.py::OWASPControlTests`) shells out to it and calls `self.skipTest()` when
+  it is absent — so without it the container reported `OK (skipped=1)` while the host reported the
+  real failure. Adding it to the Pipfile instead would relock the graph and risk a drive-by
+  upgrade of what Heroku installs, which is the one thing this setup must not do.
+- **`dns_opt: [no-aaaa]` on the backend is load-bearing, not tidying.** Docker hands containers
+  AAAA records for public names on this host but no IPv6 route, so pip-audit died with
+  `[Errno 101] Network is unreachable` rather than falling back to IPv4. `no-aaaa` (glibc 2.36+)
+  stops the resolver returning AAAA at all. Remove it and the A06 test breaks again.
+
 **There is no `tenants/` app.** It held `django-tenants` schema-per-tenant routing and was deleted in
 Phase 2, along with the dependency itself. Any surviving mention of `TENANT_*` settings,
 `django_tenants`, `MULTITENANT_RELATIVE_MEDIA_ROOT`, or `TenantS3Storage` is a stale comment, not live
@@ -179,7 +231,10 @@ code with the API export views, so a formula/format fix usually needs to happen 
 - **Required UI Tools**: Build a comprehensive dashboard, spreadsheet-like data views for inventory, printable invoices, and detailed views for orders, purchases, and products (ensuring product images are properly fetched and rendered).
 - **Backend Boundaries**: You are encouraged to add useful frontend features and sorting logic, but **do not** alter the core transactional logic of the backend (e.g., how orders and purchases automatically adjust stock quantities).
 - **Seed Data**: Before building the full UI, write a Python script or Django management command to populate the database with fake products, suppliers, customers, and transactions to facilitate UI/Chart testing.
-- **No Deployment Yet**: Do NOT create Dockerfiles or prepare the application for publishing. Remain strictly in local development mode until explicitly authorized by the user.
+- ~~**No Deployment Yet**~~: superseded twice. The app *is* deployed (Heroku, see above), and on
+  2026-08-24 the owner explicitly authorized a Docker setup. See "Local development in Docker" below.
+  Docker here is a **local dev environment only** — it is not the production build path and must
+  never become one without a separate decision.
 
 ---
 
@@ -447,10 +502,10 @@ logo, no seller address, neither is stored), a `BILL TO` block with the customer
 and phone, a `# / ITEMS / UNIT / QTY / UNIT COST / TOTAL` table, subtotal and total with their LBP
 conversions, a `PAID` badge, and a configurable tagline in `lib/invoiceConfig.js`.
 
-`UNIT` is `unit_multiplier` and `QTY` is `quantity`, in separate columns — the two multiply to the
-units stock is deducted by, and merging them loses that. The `PAID` badge is static and carries the
-transaction date: there is no payment-status column, and these are cash-sale records written after
-the money moved.
+~~`UNIT` is `unit_multiplier` and `QTY` is `quantity`, in separate columns~~ — **superseded
+2026-08-24.** `unit_multiplier` was removed; the table has one `Qty` column carrying the
+physical unit count. ~~The `PAID` badge is static~~ — also superseded: `Order`/`Purchase` now
+carry `payment_status` and `paid_amount` (Phase A below).
 
 The `@media print` block in `index.css` was reworked for mobile printing: `@page { size: auto;
 margin: 0 }` (which is also the only lever CSS has over the browser's own URL/timestamp headers —
@@ -507,6 +562,86 @@ fails if the old subdomain reappears in `ims/`, `accounts/`, `inventory/` or `fr
 # Working Log — mistakes, gotchas, anti-patterns
 
 Append here when something bites. Do not repeat these.
+
+- **`unit_multiplier` no longer exists** (removed 2026-08-24). A line is `quantity * unit_price`,
+  stock moves by `quantity`, profit is `(unit_price - unit_cost_price) * quantity`. Migration
+  `inventory/0006` folded the old column into the quantity (`quantity := quantity * unit_multiplier`)
+  rather than dropping it, because dropping it would have divided the line total, the stock movement
+  and the profit of every multi-unit line by its multiplier — 41% of the development data (1,154 of
+  2,840 line items) carried a multiplier of 6 or 12, and nothing would have raised an error.
+  `UnitMultiplierFoldMigrationTests` pins that the fold is lossless. **The fold is one-way**: 36 could
+  have been 3x12, 6x6 or 36x1, and the factorisation was not recorded.
+- **`payment_status` is derived, never assigned.** `paid_amount` is the source of truth and
+  `_settle_payment` (`inventory/serializers.py`) recomputes the status from it — including on an edit
+  that changed only the line items, because moving the total can turn a PAID transaction into a
+  PARTIALLY_PAID one. Writing the status directly reintroduces exactly the stale-column bug
+  `Account.subscription_status` already has. `payment_status` is accepted on the wire only as
+  shorthand (`PAID` -> pay the full total, `UNPAID` -> pay nothing); `PARTIALLY_PAID` without an
+  amount is a 400, because there is no defensible default for a partial settlement.
+- **`_settle_payment` must run after `bulk_create`, never before.** The total is summed from the
+  line rows, so calling it first sees a total of zero and marks every transaction PAID.
+- **`remaining_amount` is a property, not a column**, matching `total_price`. It clamps at zero:
+  overpayment (a rounded-up cash settlement, routine here) reads as a zero balance, because a
+  negative remainder renders on the invoice as a refund the business does not owe.
+- **`Account.primary_currency` / `enable_dual_currency` are DISPLAY ONLY.** Every stored amount is
+  USD and stays USD; these choose how those USD figures are rendered. They live on their own endpoint
+  (`/accounts/currency-settings/`) rather than in `subscription_payload`, whose field set is pinned by
+  `SubscriptionPayloadContractTests`. `CurrencySettingsDoNotReachBillingTests` fails if anything under
+  `accounts/billing/` ever reads them — every card charge is USD by contract.
+- **There is exactly one unauthenticated endpoint: `PublicInvoiceView`** (`/inventory/public/invoice/<token>/`).
+  Its entire access control is a 32-byte `secrets` token in the URL. `PublicInvoiceSerializer`
+  lists its fields explicitly and omits `unit_cost_price`, `profit` and the internal order UUID —
+  never swap it for `OrderSerializer` or an `exclude` list, or the next field added to the read
+  serializer is published to every customer holding a link. The A05 guard allowlists it **by name**,
+  and a second test asserts the allowlist has exactly one member.
+- **Revoking a share destroys the token, it does not flag it.** `share_token` is nulled, so the
+  capability is gone rather than merely marked. A `revoked` boolean would leave a working secret in
+  the database one forgotten filter away from still opening the door.
+- **Re-sharing an already-shared order returns the same token.** Minting a fresh one would silently
+  cut off the customer who was sent the link yesterday.
+- **Escape closes the topmost overlay only** (`lib/overlayStack.js` + `hooks/useOverlayLayer.js`).
+  Modal and SlideOver each bind their own document listener; before the stack existed, one Escape
+  inside a quick-create modal also closed the order form underneath it and discarded every entered
+  line item. Any new overlay primitive must go through `useOverlayLayer` or it reintroduces that.
+- **Quick-create forms return the created record**: `onSaved(created)` on Customer/Supplier/
+  Category/ProductForm. That is what lets the order and purchase forms select the new row without a
+  refetch. Existing callers ignore the argument, so it stayed backward compatible.
+- **Adding a line goes through `applyScannedProduct` in both forms**, whether it came from the
+  product picker or a barcode scan. One path means the stock cap and the increment-don't-duplicate
+  rule cannot drift between the two entry points. The old "Add row then choose" flow and its
+  `addItem` helper are gone — duplicate lines can no longer be created from the UI, though the
+  server and `lib/stock.js` still aggregate them because older orders have them.
+- **`ProductSearchModal` takes `disableOutOfStock`**: true for orders (cannot sell what is absent),
+  false for purchases (a zero-stock product is exactly the one being restocked).
+- **`CurrencyProvider` is mounted INSIDE `AuthProvider`** (changed 2026-08-24). The settings belong to
+  the signed-in account, so the provider has to know when that changes. It reads `AuthContext` through
+  `useContext`, not `useAuth()`, so a component test that renders a consumer without an auth provider
+  gets the USD defaults instead of an exception.
+- **`formatSecondary()` returns `null` when dual display is off**, and every caller renders the
+  conversion line only if it returns a string. That is what makes "hide every secondary total" one
+  rule instead of a flag re-checked in fifteen components. Don't reintroduce `enableDualCurrency &&`
+  at call sites.
+- **`showExchangeRate` is not `enableDualCurrency`.** With dual off *and* USD primary the rate is
+  noise and the field hides. With **LBP primary** it stays visible even with dual off, because the
+  rate is what turns every stored USD figure into the number on screen — hiding it would remove the
+  user's control over all of them. The stored `exchange_rate` column is written either way.
+- **`formatLBP` rounds before formatting, not just on display.** LBP has no circulating subunit, so
+  a fractional figure reads as a mistake; rounding first keeps the rendered string and the number a
+  reader would add up in agreement. `compact` keeps one decimal on purpose — "1.5M LBP" is a
+  magnitude for a chart axis, not a pound amount.
+- **CSV exporters build their TOTALS row by column name, never by counting blanks.** The rate column
+  now appears or disappears per account (`enable_dual_currency`), so a hand-counted run of `''` puts
+  every figure under the wrong heading. `SingleCurrencyExportTests` pins the alignment both ways.
+- **The `Invoice` component takes `primaryCurrency` / `showSecondaryCurrency` as props, not context.**
+  It is a printable document and stays context-free so it can render from a print view or a future
+  PDF path without a provider. `Orders`/`Purchases` pass the account's real settings.
+- **A migration test must name every app in its target list.** `UnitMultiplierFoldMigrationTests`
+  first named only `inventory`, which left `accounts` at a state whose historical `Account` model had
+  no `paddle_customer_id` while the real table still had it NOT NULL — the insert then failed on a
+  column the test never mentions.
+- **Don't run two `manage.py test` invocations against the same container at once.** The second finds
+  `test_inventory` already present, prompts to delete it, and dies on `EOFError` under
+  `docker compose exec -T`. Pass `--noinput` and serialise the runs.
 
 - **`EmailVerification` rows are scoped by `purpose`.** Any new query against that table must filter
   on it, or a code issued for one flow becomes spendable in another and the two flows start expiring
@@ -692,9 +827,9 @@ Append here when something bites. Do not repeat these.
   an order-level column into a line-level export.
 - **CSV totals are accumulated in the row loop, never a second aggregate query.** `ExportOrdersCSVView`
   has a test pinning its query count constant as rows grow; a totals aggregate would break it.
-- **`Quantity` is deliberately not totalled in the CSV footer** — summing it across lines with
-  different `unit_multiplier`s is meaningless. `Total Units` (`quantity * unit_multiplier`) is the
-  column that carries a real physical count, and it is the one totalled.
+- ~~**`Quantity` is deliberately not totalled in the CSV footer**~~ — **superseded 2026-08-24.**
+  `unit_multiplier` is gone, so `Quantity` *is* the physical unit count and is the column
+  totalled. `Unit Multiplier` and `Total Units` were both removed from all four exporters.
 - **`Product.barcode` is normalized in `Product.save()`** — `''` becomes `NULL` and surrounding
   whitespace is stripped. Query by the stripped value; do not assume `''` is ever stored. This is
   load-bearing for the per-account unique constraint added on 2026-08-10: NULLs do not collide, two

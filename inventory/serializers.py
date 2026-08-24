@@ -1,9 +1,10 @@
 from collections import defaultdict
+from decimal import Decimal
 
 from rest_framework import serializers
 from django.db import transaction
 from django.db.models import F
-from .models import Product , Category,Purchase,PurchaseItem,Order,OrderItem,Supplier,ProductImage,Customer,Expense
+from .models import Product , Category,Purchase,PurchaseItem,Order,OrderItem,Supplier,ProductImage,Customer,Expense,PaymentStatus
 import uuid
 
 
@@ -79,7 +80,7 @@ def _units_by_product_id(items_data):
     """
     totals = defaultdict(int)
     for item in items_data:
-        totals[item['product'].id] += item['quantity'] * item.get('unit_multiplier', 1)
+        totals[item['product'].id] += item['quantity']
     return totals
 
 
@@ -106,7 +107,7 @@ def _units_by_product_id_of(items):
     """`_units_by_product_id` for saved rows, which hold `product_id` rather than a Product."""
     totals = defaultdict(int)
     for item in items:
-        totals[item.product_id] += item.quantity * item.unit_multiplier
+        totals[item.product_id] += item.quantity
     return totals
 
 
@@ -138,6 +139,66 @@ def _stock_deltas(added, removed):
         product_id: added.get(product_id, 0) - removed.get(product_id, 0)
         for product_id in set(added) | set(removed)
     }
+
+
+# Accepted as a write-only convenience on both transaction write serializers. `paid_amount` is
+# the source of truth; this only lets a client say "paid in full" without having to compute the
+# total client-side first and risk disagreeing with the server's arithmetic.
+_PAYMENT_STATUS_SHORTHAND = frozenset({PaymentStatus.PAID, PaymentStatus.UNPAID})
+
+
+def _settle_payment(instance, requested_status, paid_amount_supplied):
+    """
+    Reconcile `paid_amount` and `payment_status` on a saved transaction, then persist both.
+
+    Must be called AFTER the line items exist — the total is summed from them, so running this
+    first sees a total of zero and marks everything PAID.
+
+    The rule: `paid_amount` decides, `payment_status` is derived. The two can therefore never
+    disagree in the database, which is the whole point — a status column that can drift from
+    the number beside it is the bug CLAUDE.md records against Account.subscription_status.
+
+    `payment_status` is still accepted on the wire, but only as shorthand for a `paid_amount`
+    the client would otherwise have to compute:
+
+        PAID    with no paid_amount  ->  paid_amount = the full total
+        UNPAID  with no paid_amount  ->  paid_amount = 0
+
+    PARTIALLY_PAID without an amount is refused rather than guessed: "partly paid" has no
+    single defensible value, and inventing one would put a wrong number in the books.
+    """
+    total = Decimal(instance.total_price)
+
+    if requested_status is not None and not paid_amount_supplied:
+        if requested_status == PaymentStatus.PAID:
+            instance.paid_amount = total
+        elif requested_status == PaymentStatus.UNPAID:
+            instance.paid_amount = Decimal('0.00')
+        else:
+            raise serializers.ValidationError({
+                'paid_amount': [
+                    'paid_amount is required when payment_status is PARTIALLY_PAID — there is '
+                    'no safe default for a partial settlement.'
+                ],
+            })
+
+    instance.payment_status = instance.derive_payment_status(total)
+    instance.save(update_fields=['paid_amount', 'payment_status'])
+
+
+class PaymentWriteMixin:
+    """
+    The `paid_amount` / `payment_status` write pair, shared by orders and purchases.
+
+    `payment_status` is declared write-only here and re-exposed read-only by the read
+    serializers, so a client cannot set a status that contradicts the amount.
+    """
+
+    def _pop_payment_fields(self, validated_data):
+        """Returns (requested_status, paid_amount_supplied) and strips both from the payload."""
+        requested_status = validated_data.pop('payment_status', None)
+        paid_amount_supplied = 'paid_amount' in validated_data
+        return requested_status, paid_amount_supplied
 
 class ProductImageSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
@@ -221,30 +282,38 @@ class CreatePurchaseItemSerializer(AccountScopedSerializerMixin, serializers.Mod
 
     class Meta:
         model = PurchaseItem
-        fields = ['product', 'quantity', 'unit_multiplier', 'unit_price']   
+        fields = ['product', 'quantity', 'unit_price']
 
 
 class PurchaseItemSerializer(serializers.ModelSerializer):
     total_price = serializers.SerializerMethodField()
     product = serializers.StringRelatedField()
-    
+
     def get_total_price(self,obj):
-        return obj.quantity * obj.unit_multiplier * obj.unit_price 
-    
+        return obj.quantity * obj.unit_price
+
     class Meta():
         model = PurchaseItem
-        fields = ['product','quantity','unit_multiplier','unit_price','total_price']    
-    
-        
+        fields = ['product','quantity','unit_price','total_price']
+
+
 class PurchaseSerializer(serializers.ModelSerializer):
     items = PurchaseItemSerializer(many = True)
     id = serializers.UUIDField(read_only=True)
     supplier = serializers.StringRelatedField()
+    # Read-only on the read serializer: the status is derived from paid_amount server-side, so
+    # echoing it back as writable would invite a client to set one that contradicts the amount.
+    payment_status = serializers.CharField(read_only=True)
+    remaining_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+
     class Meta():
         model = Purchase
-        fields = ['id','placed_at','supplier','exchange_rate','items','total_price']
+        fields = [
+            'id','placed_at','supplier','exchange_rate','items','total_price',
+            'payment_status','paid_amount','remaining_amount',
+        ]
         
-class CreatePurchaseSerializer(AccountScopedSerializerMixin, serializers.ModelSerializer):
+class CreatePurchaseSerializer(PaymentWriteMixin, AccountScopedSerializerMixin, serializers.ModelSerializer):
     """
     The write serializer for purchases — POST, PUT and PATCH alike.
 
@@ -263,12 +332,19 @@ class CreatePurchaseSerializer(AccountScopedSerializerMixin, serializers.ModelSe
         required=False,
         allow_null=True
     )
+    # Write-only shorthand — see _settle_payment. The read serializer exposes the resulting
+    # status read-only.
+    payment_status = serializers.ChoiceField(
+        choices=PaymentStatus.choices, required=False, write_only=True,
+    )
+
     class Meta:
         model = Purchase
-        fields = ['id','supplier', 'exchange_rate', 'items']
+        fields = ['id','supplier', 'exchange_rate', 'items', 'payment_status', 'paid_amount']
 
     @transaction.atomic
     def create(self, validated_data):
+        requested_status, paid_supplied = self._pop_payment_fields(validated_data)
         items_data = validated_data.pop('items', [])
         units_by_id = _units_by_product_id(items_data)
 
@@ -280,6 +356,8 @@ class CreatePurchaseSerializer(AccountScopedSerializerMixin, serializers.ModelSe
         # Purchases have no ceiling to validate against, but they have the same
         # stale-instance problem as orders when one product appears on two lines.
         _apply_stock_deltas(units_by_id)
+        # After bulk_create, never before: total_price sums the rows that were just written.
+        _settle_payment(purchase, requested_status, paid_supplied)
         return purchase
 
     @transaction.atomic
@@ -293,6 +371,7 @@ class CreatePurchaseSerializer(AccountScopedSerializerMixin, serializers.ModelSe
         not expose one, so "the second line" is a position, and positions do not survive a
         reorder. Replace-and-recompute is the only semantics that cannot silently mis-target.
         """
+        requested_status, paid_supplied = self._pop_payment_fields(validated_data)
         items_data = validated_data.pop('items', None)
 
         for attr, value in validated_data.items():
@@ -301,6 +380,12 @@ class CreatePurchaseSerializer(AccountScopedSerializerMixin, serializers.ModelSe
 
         if items_data is not None:
             self._replace_items(instance, items_data)
+
+        # Unconditionally, even on a PATCH that touched neither payment field: editing the
+        # lines moves the total, and a transaction that was PAID at $100 is only PARTIALLY_PAID
+        # once a line pushes it to $150. Re-deriving is what keeps the status honest.
+        instance.refresh_from_db()
+        _settle_payment(instance, requested_status, paid_supplied)
         return instance
 
     def _replace_items(self, purchase, items_data):
@@ -353,16 +438,16 @@ class CreateOrderItemSerializer(AccountScopedSerializerMixin, serializers.ModelS
 
     class Meta:
         model = OrderItem
-        fields = ['product', 'quantity', 'unit_multiplier', 'unit_price']
- 
-        
+        fields = ['product', 'quantity', 'unit_price']
+
+
 class OrderItemSerializer(serializers.ModelSerializer):
     class Meta():
         model =OrderItem
-        fields = ['product','quantity','unit_multiplier','unit_price','profit']
-        
-        
-class CreateOrderSerializer(AccountScopedSerializerMixin, serializers.ModelSerializer):
+        fields = ['product','quantity','unit_price','profit']
+
+
+class CreateOrderSerializer(PaymentWriteMixin, AccountScopedSerializerMixin, serializers.ModelSerializer):
     """
     The write serializer for orders — POST, PUT and PATCH alike. See
     CreatePurchaseSerializer for why it keeps the Create* name and why editing replaces
@@ -378,9 +463,14 @@ class CreateOrderSerializer(AccountScopedSerializerMixin, serializers.ModelSeria
         required=False,
         allow_null=True
     )
+    # Write-only shorthand — see _settle_payment.
+    payment_status = serializers.ChoiceField(
+        choices=PaymentStatus.choices, required=False, write_only=True,
+    )
+
     class Meta:
         model = Order
-        fields = ['id','customer','exchange_rate','items']
+        fields = ['id','customer','exchange_rate','items','payment_status','paid_amount']
         
     def validate_items(self, items):
         if not items:
@@ -403,6 +493,7 @@ class CreateOrderSerializer(AccountScopedSerializerMixin, serializers.ModelSeria
 
     @transaction.atomic
     def create(self, validated_data):
+        requested_status, paid_supplied = self._pop_payment_fields(validated_data)
         items_data = validated_data.pop('items', [])
         units_by_id = _units_by_product_id(items_data)
 
@@ -431,6 +522,8 @@ class CreateOrderSerializer(AccountScopedSerializerMixin, serializers.ModelSeria
 
         # One UPDATE per product, computed in the database, rather than a save() per line.
         _apply_stock_deltas({pid: -units for pid, units in units_by_id.items()})
+        # After bulk_create, never before: total_price sums the rows that were just written.
+        _settle_payment(order, requested_status, paid_supplied)
         return order
 
     @transaction.atomic
@@ -441,6 +534,7 @@ class CreateOrderSerializer(AccountScopedSerializerMixin, serializers.ModelSeria
         `items` absent (a PATCH moving only the customer or the exchange rate) leaves lines
         and stock untouched.
         """
+        requested_status, paid_supplied = self._pop_payment_fields(validated_data)
         items_data = validated_data.pop('items', None)
 
         for attr, value in validated_data.items():
@@ -449,6 +543,11 @@ class CreateOrderSerializer(AccountScopedSerializerMixin, serializers.ModelSeria
 
         if items_data is not None:
             self._replace_items(instance, items_data)
+
+        # See CreatePurchaseSerializer.update — an edit that moves the total has to re-derive
+        # the status even when neither payment field was sent.
+        instance.refresh_from_db()
+        _settle_payment(instance, requested_status, paid_supplied)
         return instance
 
     def _replace_items(self, order, items_data):
@@ -500,10 +599,16 @@ class OrderSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True, read_only=True)
     id = serializers.UUIDField(read_only=True)
     customer = serializers.StringRelatedField()
+    # Read-only: derived from paid_amount server-side. See PurchaseSerializer.
+    payment_status = serializers.CharField(read_only=True)
+    remaining_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
     class Meta():
         model = Order
-        fields = ['id','customer','placed_at','exchange_rate','items','total_price','total_profit']  
+        fields = [
+            'id','customer','placed_at','exchange_rate','items','total_price','total_profit',
+            'payment_status','paid_amount','remaining_amount',
+        ]
 
 class ExpenseSerializer(serializers.ModelSerializer):
     """
@@ -521,3 +626,78 @@ class ExpenseSerializer(serializers.ModelSerializer):
             'spent_at', 'created_at',
         ]
         read_only_fields = ['id', 'created_at']
+
+
+class PublicInvoiceItemSerializer(serializers.ModelSerializer):
+    """
+    One invoice line, as shown to a customer holding a share link.
+
+    Note what is NOT here: `unit_cost_price` and `profit`. Those are on OrderItemSerializer and
+    would tell any recipient of the link exactly what the business pays its suppliers and what
+    margin it takes. This serializer exists as a separate, explicitly-listed class rather than
+    the read one with `exclude`, so that adding a field to OrderItemSerializer later cannot
+    quietly publish it.
+    """
+
+    product = serializers.SerializerMethodField()
+    line_total = serializers.SerializerMethodField()
+
+    class Meta:
+        model = OrderItem
+        fields = ['product', 'quantity', 'unit_price', 'line_total']
+
+    def get_product(self, item):
+        return item.product.name if item.product else 'Unknown product'
+
+    def get_line_total(self, item):
+        return item.quantity * item.unit_price
+
+
+class PublicInvoiceSerializer(serializers.ModelSerializer):
+    """
+    The whole public payload. Everything a paper invoice would carry, and nothing else.
+
+    Deliberately excluded: `total_profit`, per-line costs, the order's internal UUID (the token
+    already identifies it), the account id, and anything about other orders. The seller fields
+    are the same ones already printed on the invoice the customer was handed.
+    """
+
+    seller_name = serializers.CharField(source='account.name', read_only=True)
+    seller_phone = serializers.CharField(source='account.phone', read_only=True)
+    customer_name = serializers.SerializerMethodField()
+    customer_phone = serializers.SerializerMethodField()
+    customer_location = serializers.SerializerMethodField()
+    items = PublicInvoiceItemSerializer(many=True, read_only=True)
+    remaining_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    # The currency presentation the seller's account is configured for, so the shared document
+    # reads the same way as the one on their screen.
+    primary_currency = serializers.CharField(source='account.primary_currency', read_only=True)
+    dual_currency = serializers.BooleanField(
+        source='account.enable_dual_currency', read_only=True,
+    )
+
+    class Meta:
+        model = Order
+        fields = [
+            'reference', 'placed_at', 'exchange_rate',
+            'seller_name', 'seller_phone',
+            'customer_name', 'customer_phone', 'customer_location',
+            'items', 'total_price', 'payment_status', 'paid_amount', 'remaining_amount',
+            'primary_currency', 'dual_currency',
+        ]
+
+    reference = serializers.SerializerMethodField()
+
+    def get_reference(self, order):
+        # The short display id the SPA already prints on the invoice. The full UUID is withheld
+        # — it is the authenticated API's lookup key, and there is no reason to hand it out.
+        return str(order.id).replace('-', '')[:8].upper()
+
+    def get_customer_name(self, order):
+        return order.customer.name if order.customer else None
+
+    def get_customer_phone(self, order):
+        return order.customer.phone_number if order.customer else None
+
+    def get_customer_location(self, order):
+        return order.customer.location if order.customer else None

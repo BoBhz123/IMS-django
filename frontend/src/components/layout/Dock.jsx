@@ -39,7 +39,7 @@ function scaleFor(index, hoveredIndex) {
 export function Dock() {
   const [hoveredIndex, setHoveredIndex] = useState(null)
   const { theme, toggleTheme } = useTheme()
-  const { currency, toggleCurrency } = useCurrency()
+  const { currency, toggleCurrency, enableDualCurrency } = useCurrency()
 
   return (
     <nav
@@ -59,9 +59,12 @@ export function Dock() {
 
       <div className="my-2 h-px w-6 bg-hairline" />
 
-      <DockButton label={currency === 'USD' ? 'Show in LBP' : 'Show in USD'} onClick={toggleCurrency}>
-        <span className="font-display text-[11px] font-bold">{currency === 'USD' ? '$' : 'ل.ل'}</span>
-      </DockButton>
+      {/* See WindowChrome — no toggle when the account is single-currency. */}
+      {enableDualCurrency && (
+        <DockButton label={currency === 'USD' ? 'Show in LBP' : 'Show in USD'} onClick={toggleCurrency}>
+          <span className="font-display text-[11px] font-bold">{currency === 'USD' ? '$' : 'ل.ل'}</span>
+        </DockButton>
+      )}
       <DockButton label={theme === 'dark' ? 'Light mode' : 'Dark mode'} onClick={toggleTheme}>
         {theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}
       </DockButton>

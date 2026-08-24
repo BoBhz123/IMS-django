@@ -18,6 +18,7 @@ const MONTH_OPTIONS = Array.from({ length: 12 }, (_, i) => ({
 }))
 
 export function Purchases() {
+  const { primaryCurrency, enableDualCurrency } = useCurrency()
   const [suppliers, setSuppliers] = useState([])
   const [supplier, setSupplier] = useState('all')
   const [year, setYear] = useState('all')
@@ -97,7 +98,6 @@ export function Purchases() {
       items: purchase.items.map((item) => ({
         name: item.product,
         quantity: item.quantity,
-        unitMultiplier: item.unit_multiplier,
         unitPrice: item.unit_price,
       })),
     })
@@ -216,6 +216,8 @@ export function Purchases() {
           partyName={invoicePurchase.supplier}
           partyPhone={invoicePurchase.supplierPhone}
           items={invoicePurchase.items}
+          primaryCurrency={primaryCurrency}
+          showSecondaryCurrency={enableDualCurrency}
         />
       )}
 
@@ -227,6 +229,9 @@ export function Purchases() {
           id={detailPurchase.id}
           placedAt={detailPurchase.placed_at}
           exchangeRate={detailPurchase.exchange_rate}
+          paymentStatus={detailPurchase.payment_status}
+          paidAmount={Number(detailPurchase.paid_amount) || 0}
+          remainingAmount={Number(detailPurchase.remaining_amount) || 0}
           partyLabel="Supplier"
           partyName={detailPurchase.supplier}
           items={detailPurchase.items}

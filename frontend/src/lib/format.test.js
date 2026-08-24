@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { fillSeriesGaps } from '@/lib/format'
+import { fillSeriesGaps, formatLBP } from '@/lib/format'
 
 describe('fillSeriesGaps', () => {
   const window = { start: '2026-03-01', end: '2026-03-03', stepDays: 1 }
@@ -64,5 +64,31 @@ describe('fillSeriesGaps profit keys', () => {
   it('preserves a negative net profit rather than zeroing it', () => {
     const loss = { ...row, net_profit: -80 }
     expect(fillSeriesGaps([loss], window)[1].net_profit).toBe(-80)
+  })
+})
+
+describe('formatLBP', () => {
+  it('rounds to a whole number — LBP has no decimals in practical use', () => {
+    // 12.345 USD * 89000 = 1,098,705.0000000001 in float. A fractional pound figure reads as
+    // a mistake, and the rounding happens before formatting so the string and the underlying
+    // number agree.
+    expect(formatLBP(12.345, 89000)).toBe('1,098,705 LBP')
+  })
+
+  it('rounds half up rather than truncating', () => {
+    expect(formatLBP(1.000006, 89000)).toBe('89,001 LBP')
+  })
+
+  it('separates thousands', () => {
+    expect(formatLBP(1, 89000)).toBe('89,000 LBP')
+    expect(formatLBP(100, 15000)).toBe('1,500,000 LBP')
+  })
+
+  it('accepts a decimal string, which is what DRF sends for money fields', () => {
+    expect(formatLBP('2.50', 89000)).toBe('222,500 LBP')
+  })
+
+  it('keeps one decimal in compact mode, which is a magnitude not a pound amount', () => {
+    expect(formatLBP(20, 89000, { compact: true })).toBe('1.8M LBP')
   })
 })

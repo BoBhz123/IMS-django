@@ -1,6 +1,7 @@
 import logging
 
 from django.db import transaction
+from django.http import Http404
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -18,7 +19,8 @@ from .models import Account, get_account
 # here: the no-account case (superadmin) now lives in that helper rather than being spelled
 # out in the view, and /auth/users/me/ shares it.
 from .serializers import (
-    PasswordResetConfirmSerializer, VerifyEmailSerializer, subscription_payload,
+    AccountCurrencySettingsSerializer, PasswordResetConfirmSerializer, VerifyEmailSerializer,
+    subscription_payload,
 )
 from .throttles import (
     AbandonRegistrationThrottle, PasswordResetRequestThrottle, PasswordResetVerifyThrottle,
@@ -82,6 +84,43 @@ class SubscriptionStatusView(APIView):
         # admin — activate, extend, revoke — shows up on the next fetch with nothing to
         # invalidate. There is no cache here on purpose.
         return Response(subscription_payload(request.user))
+
+
+class AccountCurrencySettingsView(APIView):
+    """
+    GET/PATCH the account's currency display settings.
+
+    `IsAuthenticated` only, dropping the project-wide HasActiveSubscription default, for the
+    same reason the onboarding views do: /settings is on the SPA's unpaid-route whitelist
+    (CLAUDE.md), so an unpaid account can open that screen. If this endpoint demanded an
+    active subscription, the page it is reached from would render with a 403 hole in it.
+
+    Reading and changing how you prefer to *read* your own numbers grants no access to
+    anything, so there is nothing here for the paywall to protect.
+    """
+
+    permission_classes = ONBOARDING_PERMISSIONS
+
+    def _account_or_404(self, request):
+        account = get_account(request.user)
+        if account is None:
+            # A superadmin has no Membership and therefore no account settings to serve.
+            raise Http404('This user is not a member of an account.')
+        return account
+
+    def get(self, request):
+        return Response(
+            AccountCurrencySettingsSerializer(self._account_or_404(request)).data
+        )
+
+    def patch(self, request):
+        account = self._account_or_404(request)
+        serializer = AccountCurrencySettingsSerializer(
+            account, data=request.data, partial=True,
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
 
 
 class VerifyEmailView(APIView):

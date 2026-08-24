@@ -2,29 +2,34 @@ import { useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import { X } from 'lucide-react'
+import { useOverlayLayer } from '@/hooks/useOverlayLayer'
 
 export function SlideOver({ open, onClose, title, children }) {
+  const { zIndex, isTop } = useOverlayLayer(open)
+
   useEffect(() => {
     if (!open) return
     function handleKeyDown(event) {
-      if (event.key === 'Escape') onClose()
+      // Only the topmost overlay reacts. Without this, Escape inside a quick-create modal
+      // closes this slide-over too and takes every entered line item with it.
+      if (event.key === 'Escape' && isTop()) onClose()
     }
+    // Body scrolling is NOT touched here — useOverlayLayer refcounts it. See Modal.jsx and
+    // lib/overlayStack.js.
     document.addEventListener('keydown', handleKeyDown)
-    document.body.style.overflow = 'hidden'
-    return () => {
-      document.removeEventListener('keydown', handleKeyDown)
-      document.body.style.overflow = ''
-    }
-  }, [open, onClose])
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [open, onClose, isTop])
 
   return createPortal(
     <AnimatePresence>
       {open && (
         <motion.div
-          className="fixed inset-0 z-50 flex justify-end bg-black/30 backdrop-blur-sm"
+          style={{ zIndex }}
+          className="fixed inset-0 flex justify-end bg-black/35 backdrop-blur-md"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
+          transition={{ duration: 0.18, ease: 'easeOut' }}
           onClick={onClose}
         >
           <motion.div

@@ -288,20 +288,21 @@ class Command(BaseCommand):
                 exchange_rate=random.randint(88000, 90000),
             )
             for product in random.sample(products, k=min(len(products), random.randint(2, 4))):
-                quantity = random.randint(4, 25)
-                multiplier = random.choice([1, 1, 1, 6, 12])
+                # A plain unit count. This used to be a small quantity times a pack multiplier
+                # of 1/6/12; unit_multiplier was removed on 2026-08-24, so the range here
+                # covers the same spread of physical units directly.
+                quantity = random.randint(4, 150)
                 PurchaseItem.objects.create(
                     purchase_order=purchase,
                     product=product,
                     quantity=quantity,
-                    unit_multiplier=multiplier,
                     # Slight variation around the product's cost — a real supplier price
                     # moves, and a flat cost makes every margin identical.
                     unit_price=(product.cost_price * Decimal(
                         str(round(random.uniform(0.92, 1.08), 2))
                     )).quantize(Decimal('0.01')),
                 )
-                stock[product.id] += quantity * multiplier
+                stock[product.id] += quantity
 
             # placed_at is auto_now_add, which ignores any value assigned before save().
             # A queryset .update() writes straight to the column, bypassing pre_save().
@@ -314,9 +315,9 @@ class Command(BaseCommand):
         """Creates sales, drawing down `stock` in place. Returns how many were created."""
         created = 0
         for _ in range(count):
-            # Only products that actually have units left can be sold. Phase 1's rule is that
-            # stock is consumed as quantity * unit_multiplier, so the pool is in units and
-            # the line is built to fit what is left.
+            # Only products that actually have units left can be sold. Stock is consumed as
+            # the line quantity, so the pool is in units and the line is built to fit what is
+            # left.
             available = [p for p in products if stock[p.id] > 0]
             if not available:
                 break
@@ -338,7 +339,6 @@ class Command(BaseCommand):
                     order=order,
                     product=product,
                     quantity=take,
-                    unit_multiplier=1,
                     unit_price=(product.default_sell_price * Decimal(
                         str(round(random.uniform(0.95, 1.05), 2))
                     )).quantize(Decimal('0.01')),

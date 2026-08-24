@@ -42,9 +42,8 @@ async function scan(user) {
   await user.click(await screen.findByRole('button', { name: /simulate scan/i }))
 }
 
-/** Spinbuttons run [exchange rate, qty, ×per unit, qty, …]. */
-const lineQuantity = (index = 0) =>
-  screen.getAllByRole('spinbutton').slice(1).filter((_, i) => i % 2 === 0)[index]
+/** One spinbutton per line now, after the exchange rate. */
+const lineQuantity = (index = 0) => screen.getAllByRole('spinbutton').slice(1)[index]
 
 describe('PurchaseForm barcode scanning', () => {
   beforeEach(() => {

@@ -36,13 +36,18 @@ function CustomerFormBody({ onClose, onSaved, customer }) {
     setSaving(true)
     setErrors({})
 
+    // Handed to onSaved so an in-context caller (the order/purchase forms' quick-create) can
+    // select the new record immediately instead of re-fetching the list and guessing which
+    // row is the one that was just typed.
+    let created = null
+
     try {
       if (isEdit) {
         await api.patch(`/inventory/customers/${customer.id}/`, form)
       } else {
-        await api.post('/inventory/customers/', form)
+        created = (await api.post('/inventory/customers/', form)).data
       }
-      onSaved()
+      onSaved(created)
       onClose()
     } catch (error) {
       if (error.response?.status === 400) {

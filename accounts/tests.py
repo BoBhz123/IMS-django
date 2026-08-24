@@ -3732,3 +3732,109 @@ class SignupEmailFailureTests(TestCase):
         self.assertEqual(User.objects.count(), before)
         self.assertFalse(Account.objects.filter(name='Test Shop').exists())
         self.assertFalse(Membership.objects.filter(user__username='newsignup@example.com').exists())
+
+
+class AccountCurrencySettingsTests(TestCase):
+    """
+    /accounts/currency-settings/ — the account's DISPLAY currency preferences.
+
+    The load-bearing claim these pin is that the settings are cosmetic: they change how USD
+    figures are rendered and nothing else. No stored amount moves, and billing never sees them.
+    """
+
+    def setUp(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import RefreshToken
+        from accounts.models import Membership
+
+        self.account = Account.objects.create(
+            name='Currency Co', subscription_status=Account.ACTIVE,
+        )
+        self.user = User.objects.create_user(username='curr', password='pw12345!')
+        Membership.objects.create(user=self.user, account=self.account, is_owner=True)
+        self.client = APIClient()
+        self.auth = f'JWT {RefreshToken.for_user(self.user).access_token}'
+
+    def get(self):
+        return self.client.get('/accounts/currency-settings/', HTTP_AUTHORIZATION=self.auth)
+
+    def patch(self, payload):
+        return self.client.patch(
+            '/accounts/currency-settings/', payload,
+            content_type='application/json', HTTP_AUTHORIZATION=self.auth,
+        )
+
+    def test_the_defaults_are_usd_with_dual_display_on(self):
+        body = self.get().json()
+        self.assertEqual(body['primary_currency'], 'USD')
+        self.assertTrue(body['enable_dual_currency'])
+        self.assertEqual(body['secondary_currency'], 'LBP')
+
+    def test_switching_the_primary_currency_flips_the_secondary(self):
+        body = self.patch({'primary_currency': 'LBP'}).json()
+        self.assertEqual(body['primary_currency'], 'LBP')
+        self.assertEqual(body['secondary_currency'], 'USD')
+
+    def test_disabling_dual_currency_leaves_no_secondary(self):
+        body = self.patch({'enable_dual_currency': False}).json()
+        self.assertIsNone(body['secondary_currency'])
+
+    def test_an_unknown_currency_is_refused(self):
+        self.assertEqual(self.patch({'primary_currency': 'EUR'}).status_code, 400)
+
+    def test_the_endpoint_serves_only_the_callers_own_account(self):
+        from accounts.models import Membership
+
+        other = Account.objects.create(
+            name='Other Co', subscription_status=Account.ACTIVE, primary_currency='LBP',
+        )
+        other_user = User.objects.create_user(username='other', password='pw12345!')
+        Membership.objects.create(user=other_user, account=other, is_owner=True)
+
+        # The caller's own account is untouched by the other account's setting, and there is
+        # no id parameter to point at somebody else's row.
+        self.assertEqual(self.get().json()['primary_currency'], 'USD')
+        self.patch({'primary_currency': 'USD'})
+        other.refresh_from_db()
+        self.assertEqual(other.primary_currency, 'LBP')
+
+    def test_an_unpaid_account_can_still_read_and_change_them(self):
+        # /settings is on the SPA's unpaid-route whitelist, so this endpoint must shed the
+        # project-wide HasActiveSubscription default or that screen renders with a 403 hole.
+        self.account.subscription_status = Account.PAST_DUE
+        self.account.expires_at = timezone.now() - timedelta(days=1)
+        self.account.save()
+
+        self.assertEqual(self.get().status_code, 200)
+        self.assertEqual(self.patch({'primary_currency': 'LBP'}).status_code, 200)
+
+    def test_anonymous_callers_are_refused(self):
+        self.assertIn(
+            self.client.get('/accounts/currency-settings/').status_code, (401, 403),
+        )
+
+
+class CurrencySettingsDoNotReachBillingTests(TestCase):
+    """
+    A guard, not a behaviour test.
+
+    Card charges, plan prices and subscription renewals are USD-only and unconditionally so
+    (CLAUDE.md marks this non-negotiable). `primary_currency` exists to reformat inventory
+    figures for reading; the moment anything under accounts/billing/ branches on it, a
+    Lebanese-pound amount can reach a payment gateway. This fails the instant that happens.
+    """
+
+    def test_no_billing_module_reads_the_currency_display_settings(self):
+        billing_dir = settings.BASE_DIR / 'accounts' / 'billing'
+        offenders = []
+        for path in sorted(billing_dir.rglob('*.py')):
+            source = path.read_text(errors='ignore')
+            for needle in ('primary_currency', 'enable_dual_currency', 'secondary_currency'):
+                if needle in source:
+                    offenders.append(f'{path.name}: {needle}')
+
+        self.assertEqual(
+            offenders, [],
+            'billing must never branch on a display-currency setting — every card charge is '
+            f'USD by contract. Found: {offenders}',
+        )

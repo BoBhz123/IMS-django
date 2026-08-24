@@ -1,0 +1,202 @@
+# Local development stack for IMS: Postgres + Django API + Vite dev server.
+#
+# This file is for LOCAL DEVELOPMENT ONLY. Production is Heroku, built by buildpacks from
+# Procfile / Pipfile / package.json. Nothing here is read by Heroku — a Dockerfile only becomes
+# a Heroku build when the app's stack is `container` and a heroku.yml exists, and neither is
+# true for this app.
+#
+#   docker compose up --build -d                            start everything
+#   docker compose exec backend python manage.py migrate    create the schema (required once)
+#   docker compose logs -f backend                          follow the Django log
+#   docker compose down                                     stop; keeps the database volume
+#   docker compose down -v                                  stop AND destroy the database
+#
+# Requires Compose v2.24+ for the `env_file: - path:/required:` long syntax below.
+
+# Names the project explicitly. Without it Compose derives the name from the directory, so a
+# `git worktree` copy of this repo in a differently-named folder would silently create a second,
+# empty postgres_data volume and look like the database had been wiped.
+name: ims
+
+services:
+  # --- Database ---------------------------------------------------------------------------
+  db:
+    # 16-alpine: this project uses no PostGIS and no extensions, so the small musl image is
+    # enough. Pinned to a major version on purpose — Postgres data directories are not
+    # forward-compatible, so an unpinned `postgres:alpine` that rolls to 17 refuses to start on
+    # a 16 volume with "database files are incompatible with server", which reads like data loss.
+    image: postgres:16-alpine
+    environment:
+      # Consumed only by the image's first-run init script. They must agree with the
+      # DATABASE_URL given to the backend below.
+      # `inventory` / `postgres` mirrors the local-dev defaults hardcoded in
+      # ims/settings.py::DATABASES, so switching between host Postgres and this container needs
+      # no other change.
+      POSTGRES_DB: inventory
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      # Named volume, not a bind mount. Postgres needs POSIX file semantics and specific
+      # ownership on its data directory; bind-mounting a host folder into it is a well-known way
+      # to get permission errors and corruption. A named volume is managed by Docker and
+      # survives `docker compose down`, so the database is not wiped every time the stack stops.
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      # 5433 on the host, NOT 5432 — this machine already runs a local Postgres bound to
+      # 127.0.0.1:5432 (checked). Publishing 5432:5432 would fail to bind, or worse, point a
+      # GUI client at the wrong database. Inside the Docker network the port is still 5432;
+      # only the host-side number differs, so `psql -h localhost -p 5433 -U postgres inventory`
+      # reaches the container while the host instance stays untouched.
+      - "5433:5432"
+    healthcheck:
+      # pg_isready is Postgres' own liveness probe. `-h 127.0.0.1` is deliberate: during
+      # first-run initialisation the entrypoint starts a TEMPORARY server that listens on the
+      # unix socket only (listen_addresses=''), so a socket-based check reports "ready" while
+      # the database is still being created and roles are still being set up. Forcing TCP means
+      # the check passes only once the real server is accepting real connections — which is
+      # exactly the condition the backend's `service_healthy` gate needs.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d inventory -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      # Failures during the first 30s don't count against `retries`, so a slow initdb on a cold
+      # volume doesn't mark the container unhealthy before it has had a chance to finish.
+      start_period: 30s
+    restart: unless-stopped
+
+  # --- Django API -------------------------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # No `command:` here on purpose — the Dockerfile's CMD
+    # (`python manage.py runserver 0.0.0.0:8000`) is the single source of truth, so it cannot
+    # drift out of sync with a duplicate copy in this file.
+    volumes:
+      # The live-reload mount: the host working tree is mapped over /app, so an edit on the host
+      # is visible in the container immediately and Django's autoreloader restarts the server.
+      # This shadows the code baked in by the Dockerfile's `COPY . .` — which is fine, and is
+      # why `pipenv install --system` matters: the installed packages live in
+      # /usr/local/lib/python3.14/, outside /app, so this mount cannot hide them. A virtualenv
+      # at /app/.venv would be masked by this line and the container would fail to import Django.
+      - .:/app
+    ports:
+      # host:container. Also what makes the SPA's API calls work: frontend/src/lib/api.js
+      # derives its base URL as `<page protocol>//<page hostname>:8000` when running under
+      # `vite dev`, so the browser calls http://localhost:8000 — this published port — rather
+      # than trying to resolve the Docker-internal name `backend`, which it cannot see.
+      - "8000:8000"
+    env_file:
+      # Runtime injection of the developer's real local secrets (Brevo SMTP, Paddle,
+      # PAYMENT_ENCRYPTION_KEY) WITHOUT baking them into an image layer — .env is excluded by
+      # .dockerignore, so `docker build` never sees it. `required: false` lets a fresh clone,
+      # which has no .env (it is gitignored), still start.
+      - path: .env
+        required: false
+    environment:
+      # `environment:` overrides `env_file:`, so everything below wins over anything in .env.
+
+      # The scheme here is `postgres://`. dj_database_url accepts both `postgres://` and
+      # `postgresql://` and normalises either to ENGINE `django.db.backends.postgresql`
+      # (verified against dj-database-url 3.1.2 with both forms), so this and Heroku's
+      # `postgres://...` DATABASE_URL take the identical code path in ims/settings.py.
+      # `db` is the Compose service name, resolved by Docker's embedded DNS on the project
+      # network; 5432 is the CONTAINER-side port, not the 5433 published to the host.
+      DATABASE_URL: postgres://postgres:postgres@db:5432/inventory
+
+      # Explicit rather than relying on the settings default, so the mode is visible here.
+      # DEBUG=True is what makes this stack work as a dev environment, and it is load-bearing in
+      # three places in ims/settings.py: CORS_ALLOW_ALL_ORIGINS follows DEBUG (so the SPA on
+      # :5173 may call the API on :8000); SECURE_SSL_REDIRECT follows `not DEBUG` (with it off,
+      # every plain-HTTP request to localhost:8000 would 301 to https and fail); and the
+      # SECRET_KEY boot guard only fires when DEBUG is off, so the committed dev key is allowed.
+      DJANGO_DEBUG: "True"
+
+      # The settings fallback already covers localhost/127.0.0.1. Spelled out and extended with
+      # the service name so that container-to-container requests (e.g. `curl http://backend:8000/`
+      # from another container, or a future worker) are not rejected by Django's Host-header
+      # check. Note that a non-empty ALLOWED_HOSTS disables Django's DEBUG-only auto-allow, so
+      # every host the app is reached by has to be listed.
+      ALLOWED_HOSTS: localhost,127.0.0.1,[::1],0.0.0.0,backend
+    # This host's Docker networking hands containers AAAA records for public names but gives
+    # them no IPv6 route, so any client that tries an AAAA address first dies with
+    # `[Errno 101] Network is unreachable` instead of falling back to IPv4. It broke pip-audit,
+    # which the OWASP A06 supply-chain test shells out to. `no-aaaa` (glibc 2.36+) makes the
+    # resolver stop returning AAAA records at all, so everything resolves to the IPv4 that
+    # actually works. Affects name resolution inside this container only.
+    dns_opt:
+      - no-aaaa
+
+      # django-debug-toolbar renders only for INTERNAL_IPS. Harmless either way; noted because
+      # the container's client IP is the Docker bridge gateway, not 127.0.0.1, so the toolbar
+      # will not appear even though DEBUG is on. That is a cosmetic difference, not a fault.
+    depends_on:
+      db:
+        # Waits for the healthcheck above to pass, not merely for the container to exist.
+        # Without `condition: service_healthy`, Compose starts the backend the instant the db
+        # container is created — several seconds before Postgres accepts connections — and
+        # runserver's first query dies with "could not connect to server".
+        condition: service_healthy
+    # Keeps the container alive across a syntax error that kills the autoreloader, and brings
+    # the stack back after a host reboot or a Docker daemon restart.
+    restart: unless-stopped
+
+  # --- Vite dev server --------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    volumes:
+      # Live reload for the SPA: Vite's HMR watches these files. inotify propagates through a
+      # bind mount natively on Linux, so no `usePolling` workaround is needed here (it would be
+      # on macOS/Windows, where the mount goes through a VM).
+      - ./frontend:/app
+      # An ANONYMOUS volume mounted at the node_modules path, and the order matters: it is
+      # mounted *over* the bind mount above, so the container keeps the musl-native
+      # node_modules that `npm ci` produced during the build instead of seeing the host's
+      # glibc-native ones. Without this line, @tailwindcss/oxide and rollup would be the wrong
+      # libc and Vite would die on startup with an ELF-header error.
+      #
+      # Consequence to know: this volume is created once and then reused. After changing
+      # package.json, rebuild AND drop it —
+      #   docker compose down -v && docker compose up --build -d
+      # — or the container will keep serving the old dependency set.
+      - /app/node_modules
+    ports:
+      # Published so the browser can reach the dev server and, just as importantly, so Vite's
+      # HMR websocket (which the client opens back at the page's own origin,
+      # ws://localhost:5173) connects.
+      - "5173:5173"
+    environment:
+      # VITE_API_BASE_URL is deliberately NOT set.
+      #
+      # This is the one place the requested spec would have broken the app. frontend/src/lib/api.js
+      # derives the API origin from `window.location` precisely so the same bundle works from
+      # localhost, a LAN address, a tunnel, and every production domain (see the comment block at
+      # the top of that file, and the CLAUDE.md rule "Never hardcode the API base URL"). Under
+      # `vite dev` it resolves to http://localhost:8000, which is the backend's published port —
+      # already correct, with nothing to configure.
+      #
+      # Setting it to the Docker-internal `http://backend:8000` would be actively wrong: this
+      # variable is inlined into JavaScript that runs in the *browser* on the host, and the
+      # browser has no route to the Compose network's DNS. Every API call would fail to resolve.
+      #
+      # Uncomment only to point the SPA at some other backend entirely (a staging API, a tunnel):
+      # VITE_API_BASE_URL: http://localhost:8000
+      #
+      # CHOKIDAR_USEPOLLING would go here on macOS or Windows, where bind-mount filesystem
+      # events are not delivered. Not needed on this Linux host.
+      NODE_ENV: development
+    depends_on:
+      # Plain dependency, not `service_healthy`: the Vite dev server does not talk to Django at
+      # startup — the *browser* does, later — so it only needs a sane boot order, not a gate.
+      # (Vite has no proxy configured in vite.config.js; requests go straight from the browser
+      # to :8000, which is why CORS, not a proxy, is what makes this work.)
+      - backend
+    restart: unless-stopped
+
+volumes:
+  # Declares the named volume used by `db`. Docker creates it as `ims_postgres_data` (project
+  # name + key) on first `up` and leaves it alone on `down`. `docker compose down -v` is the
+  # only thing here that destroys the database.
+  postgres_data:

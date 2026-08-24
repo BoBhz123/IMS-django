@@ -17,12 +17,13 @@ from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.forms.models import model_to_dict
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
+from django.db.migrations.executor import MigrationExecutor
 from django.db.models import Sum
 from django.conf import settings
 from django.core.cache import cache
 from django.http import HttpResponse
-from django.test import Client, TestCase, override_settings
+from django.test import Client, TestCase, TransactionTestCase, override_settings
 from rest_framework.throttling import ScopedRateThrottle
 from django.utils import timezone
 from rest_framework.test import APIClient, APITestCase
@@ -30,7 +31,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from inventory.models import (
     LINE_COGS, Category, Customer, Expense, ExpenseCategory, Order, OrderItem,
-    Product, ProductImage, Purchase, PurchaseItem, Supplier, items_cogs,
+    PaymentStatus, Product, ProductImage, Purchase, PurchaseItem, Supplier, items_cogs,
 )
 from inventory.reporting import DateWindow
 from accounts.models import Account, EmailVerification
@@ -257,16 +258,16 @@ class TransactionListPerformanceTests(AccountFixtureMixin, APITestCase):
         for _ in range(self.ORDER_COUNT):
             order = Order.objects.create(customer=customer, account=self.account)
             OrderItem.objects.create(
-                order=order, product=self.product, quantity=2,
-                unit_price="10.00", unit_multiplier=3,
+                order=order, product=self.product, quantity=6,
+                unit_price="10.00",
             )
 
         supplier = Supplier.objects.create(name="Supplier Co", account=self.account)
         for _ in range(self.ORDER_COUNT):
             purchase = Purchase.objects.create(supplier=supplier, account=self.account)
             PurchaseItem.objects.create(
-                purchase_order=purchase, product=self.product, quantity=2,
-                unit_price="4.00", unit_multiplier=3,
+                purchase_order=purchase, product=self.product, quantity=6,
+                unit_price="4.00",
             )
 
     def get(self, path, params=None):
@@ -312,12 +313,12 @@ class TransactionListPerformanceTests(AccountFixtureMixin, APITestCase):
         )
 
     def test_sorting_by_total_uses_the_same_formula_the_ui_displays(self):
-        # quantity(2) * unit_multiplier(3) * unit_price(10) — the multiplier is part of the
-        # line total everywhere else (item serializers, CSV exports, analytics), so the
-        # "Total" column and sorting by it must agree.
+        # quantity(6) * unit_price(10). The line total is computed the same way by the item
+        # serializers, the CSV exports and analytics, so the "Total" column and sorting by it
+        # must agree.
         rows = self.get("/inventory/orders/", {"ordering": "-annotated_total"}).json()["results"]
         displayed = sum(
-            i["quantity"] * i["unit_multiplier"] * i["unit_price"] for i in rows[0]["items"]
+            i["quantity"] * i["unit_price"] for i in rows[0]["items"]
         )
         self.assertEqual(displayed, 60)
 
@@ -333,7 +334,7 @@ class TransactionListPerformanceTests(AccountFixtureMixin, APITestCase):
             order = Order.objects.create(customer=customer, account=self.account)
             OrderItem.objects.create(
                 order=order, product=self.product, quantity=1,
-                unit_price="10.00", unit_multiplier=1,
+                unit_price="10.00",
             )
 
         with CaptureQueriesContext(connection) as after:
@@ -362,8 +363,8 @@ class OrdersCSVExportQueryCountTests(AccountFixtureMixin, APITestCase):
         for _ in range(count):
             order = Order.objects.create(customer=self.customer, account=self.account)
             OrderItem.objects.create(
-                order=order, product=self.product, quantity=2,
-                unit_price="10.00", unit_multiplier=3,
+                order=order, product=self.product, quantity=6,
+                unit_price="10.00",
             )
 
     def export(self):
@@ -422,7 +423,7 @@ class AnalyticsPayloadTests(AccountFixtureMixin, APITestCase):
             order = Order.objects.create(customer=customer, account=self.account)
             OrderItem.objects.create(
                 order=order, product=product, quantity=1,
-                unit_price="2.00", unit_multiplier=1,
+                unit_price="2.00",
             )
 
         body = self.client.get(
@@ -435,9 +436,9 @@ class AnalyticsPayloadTests(AccountFixtureMixin, APITestCase):
 
 class LineTotalConsistencyTests(AccountFixtureMixin, APITestCase):
     """
-    total_price on Order/Purchase used to omit unit_multiplier while the item serializers,
-    analytics, CSV exports and the frontend all included it. Everything now routes through
-    inventory.models.LINE_TOTAL / items_total; these pin the surfaces together.
+    total_price on Order/Purchase, the item serializers, analytics, the CSV exports and the
+    frontend must all compute a line the same way. They drifted once before. Everything now
+    routes through inventory.models.LINE_TOTAL / items_total; these pin the surfaces together.
     """
 
     def setUp(self):
@@ -453,22 +454,22 @@ class LineTotalConsistencyTests(AccountFixtureMixin, APITestCase):
             account=self.account,
         )
         OrderItem.objects.create(
-            order=self.order, product=self.product, quantity=2,
-            unit_price="10.00", unit_multiplier=3,
+            order=self.order, product=self.product, quantity=6,
+            unit_price="10.00",
         )
         self.purchase = Purchase.objects.create(
             supplier=Supplier.objects.create(name="Supplier Co", account=self.account),
             account=self.account,
         )
         PurchaseItem.objects.create(
-            purchase_order=self.purchase, product=self.product, quantity=2,
-            unit_price="4.00", unit_multiplier=3,
+            purchase_order=self.purchase, product=self.product, quantity=6,
+            unit_price="4.00",
         )
 
-    def test_order_total_price_includes_unit_multiplier(self):
+    def test_order_total_price_is_quantity_times_unit_price(self):
         self.assertEqual(self.order.total_price, 60)
 
-    def test_purchase_total_price_includes_unit_multiplier(self):
+    def test_purchase_total_price_is_quantity_times_unit_price(self):
         self.assertEqual(self.purchase.total_price, 24)
 
     def test_order_total_price_matches_the_sum_of_item_line_totals(self):
@@ -476,7 +477,7 @@ class LineTotalConsistencyTests(AccountFixtureMixin, APITestCase):
             "/inventory/orders/", HTTP_AUTHORIZATION=self.auth_header
         ).json()["results"][0]
         line_sum = sum(
-            i["quantity"] * i["unit_multiplier"] * i["unit_price"] for i in body["items"]
+            i["quantity"] * i["unit_price"] for i in body["items"]
         )
         self.assertEqual(body["total_price"], line_sum)
 
@@ -521,9 +522,9 @@ class LineTotalConsistencyTests(AccountFixtureMixin, APITestCase):
 
 class OrderStockValidationTests(AccountFixtureMixin, APITestCase):
     """
-    Orders must never drive stock negative. Three things make this less trivial than it
-    looks: stock is consumed as quantity * unit_multiplier, one order may list the same
-    product on several lines, and two concurrent orders can both pass a naive check.
+    Orders must never drive stock negative. Two things make this less trivial than it looks:
+    one order may list the same product on several lines (each under stock, together over),
+    and two concurrent orders can both pass a naive check.
     """
 
     def setUp(self):
@@ -543,11 +544,10 @@ class OrderStockValidationTests(AccountFixtureMixin, APITestCase):
             HTTP_AUTHORIZATION=self.auth_header,
         )
 
-    def line(self, quantity, multiplier=1, product=None):
+    def line(self, quantity, product=None):
         return {
             "product": (product or self.product).id,
             "quantity": quantity,
-            "unit_multiplier": multiplier,
             "unit_price": "10.00",
         }
 
@@ -571,10 +571,9 @@ class OrderStockValidationTests(AccountFixtureMixin, APITestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(self.stock(), 0)
 
-    def test_unit_multiplier_counts_against_stock(self):
-        # 4 * 3 = 12 units against 10 in stock. Validating bare quantity (4) would pass
-        # this and then deduct 12, leaving -2.
-        response = self.post_order([self.line(4, multiplier=3)])
+    def test_a_line_over_stock_is_refused(self):
+        # 12 units against 10 in stock.
+        response = self.post_order([self.line(12)])
         self.assertEqual(response.status_code, 400)
         self.assertEqual(self.stock(), 10)
 
@@ -613,10 +612,8 @@ class OrderStockValidationTests(AccountFixtureMixin, APITestCase):
                 "supplier": supplier.id,
                 "exchange_rate": 89000,
                 "items": [
-                    {"product": self.product.id, "quantity": 3,
-                     "unit_multiplier": 1, "unit_price": "4.00"},
-                    {"product": self.product.id, "quantity": 3,
-                     "unit_multiplier": 1, "unit_price": "4.00"},
+                    {"product": self.product.id, "quantity": 3, "unit_price": "4.00"},
+                    {"product": self.product.id, "quantity": 3, "unit_price": "4.00"},
                 ],
             },
             content_type="application/json",
@@ -698,7 +695,7 @@ class CrossAccountIsolationTests(AccountFixtureMixin, APITestCase):
                 'exchange_rate': 89000,
                 'items': [{
                     'product': self.product_a.id, 'quantity': 1,
-                    'unit_multiplier': 1, 'unit_price': '10.00',
+                    'unit_price': '10.00',
                 }],
             },
             format='json', HTTP_AUTHORIZATION=self.header_b,
@@ -714,7 +711,7 @@ class CrossAccountIsolationTests(AccountFixtureMixin, APITestCase):
                 'exchange_rate': 89000,
                 'items': [{
                     'product': self.product_b.id, 'quantity': 1,
-                    'unit_multiplier': 1, 'unit_price': '10.00',
+                    'unit_price': '10.00',
                 }],
             },
             format='json', HTTP_AUTHORIZATION=self.header_b,
@@ -738,7 +735,7 @@ class CrossAccountIsolationTests(AccountFixtureMixin, APITestCase):
         order = Order.objects.create(account=self.account_a, customer=self.customer_a)
         OrderItem.objects.create(
             order=order, product=self.product_a, quantity=2,
-            unit_price='10.00', unit_multiplier=1,
+            unit_price='10.00',
         )
         body = self.client_b.get('/inventory/analytics/', HTTP_AUTHORIZATION=self.header_b).json()
         self.assertEqual(Decimal(str(body['total_revenue'])), Decimal('0'))
@@ -747,7 +744,7 @@ class CrossAccountIsolationTests(AccountFixtureMixin, APITestCase):
         order = Order.objects.create(account=self.account_a, customer=self.customer_a)
         OrderItem.objects.create(
             order=order, product=self.product_a, quantity=2,
-            unit_price='10.00', unit_multiplier=1,
+            unit_price='10.00',
         )
         response = self.client_b.get(
             '/inventory/orders/export/csv/', HTTP_AUTHORIZATION=self.header_b
@@ -770,7 +767,7 @@ class CostSnapshotTests(AccountFixtureMixin, TestCase):
             category=self.category, stock_quantity=100, account=self.account,
         )
 
-    def place_order(self, quantity=2, unit_price='10.00', unit_multiplier=1):
+    def place_order(self, quantity=2, unit_price='10.00'):
         response = self.client.post(
             '/inventory/orders/',
             {
@@ -778,7 +775,6 @@ class CostSnapshotTests(AccountFixtureMixin, TestCase):
                     'product': self.product.id,
                     'quantity': quantity,
                     'unit_price': unit_price,
-                    'unit_multiplier': unit_multiplier,
                 }],
             },
             format='json',
@@ -809,9 +805,9 @@ class CostSnapshotTests(AccountFixtureMixin, TestCase):
         later = self.place_order()
         self.assertEqual(later.items.first().unit_cost_price, Decimal('9.00'))
 
-    def test_profit_accounts_for_the_unit_multiplier(self):
-        order = self.place_order(quantity=3, unit_price='10.00', unit_multiplier=6)
-        self.assertEqual(order.total_profit, Decimal('108.00'))  # (10 - 4) * 3 * 6
+    def test_profit_is_margin_times_quantity(self):
+        order = self.place_order(quantity=18, unit_price='10.00')
+        self.assertEqual(order.total_profit, Decimal('108.00'))  # (10 - 4) * 18
 
     def test_rows_created_outside_the_serializer_still_get_a_cost(self):
         # The admin inline and seed_data build OrderItems directly. save() fills the
@@ -833,7 +829,7 @@ class CostSnapshotTests(AccountFixtureMixin, TestCase):
     def test_the_aggregate_matches_the_python_property(self):
         # LINE_COGS and items_cogs are duplicated expressions; a test pins them together
         # because the analytics view uses one and the serializers use the other.
-        order = self.place_order(quantity=3, unit_multiplier=6)
+        order = self.place_order(quantity=18)
         aggregated = (
             Order.objects.filter(pk=order.pk).aggregate(total=Sum(LINE_COGS))['total']
         )
@@ -1501,11 +1497,11 @@ class CSVExportTotalsTests(AccountFixtureMixin, TestCase):
         """One order, two lines — the shape that exposed the repeated-profit bug."""
         order = Order.objects.create(account=self.account, exchange_rate=89000)
         OrderItem.objects.create(
-            order=order, product=self.widget, quantity=2, unit_multiplier=3,
+            order=order, product=self.widget, quantity=6,
             unit_price=Decimal('10.00'), unit_cost_price=Decimal('4.00'),
         )  # 6 units, line total 60.00, line profit 36.00
         OrderItem.objects.create(
-            order=order, product=self.gadget, quantity=4, unit_multiplier=2,
+            order=order, product=self.gadget, quantity=8,
             unit_price=Decimal('5.00'), unit_cost_price=Decimal('2.00'),
         )  # 8 units, line total 40.00, line profit 24.00
         return order
@@ -1515,11 +1511,11 @@ class CSVExportTotalsTests(AccountFixtureMixin, TestCase):
             account=self.account, supplier=self.supplier, exchange_rate=89000,
         )
         PurchaseItem.objects.create(
-            purchase_order=purchase, product=self.widget, quantity=5, unit_multiplier=2,
+            purchase_order=purchase, product=self.widget, quantity=10,
             unit_price=Decimal('4.00'),
         )  # 10 units, 40.00
         PurchaseItem.objects.create(
-            purchase_order=purchase, product=self.gadget, quantity=3, unit_multiplier=1,
+            purchase_order=purchase, product=self.gadget, quantity=3,
             unit_price=Decimal('2.00'),
         )  # 3 units, 6.00
         return purchase
@@ -1547,7 +1543,7 @@ class CSVExportTotalsTests(AccountFixtureMixin, TestCase):
         # 1,234.00 would split across two CSV cells and shift every column after it.
         order = Order.objects.create(account=self.account, exchange_rate=89000)
         OrderItem.objects.create(
-            order=order, product=self.widget, quantity=1000, unit_multiplier=2,
+            order=order, product=self.widget, quantity=2000,
             unit_price=Decimal('10.00'), unit_cost_price=Decimal('4.00'),
         )
         rows = self.rows('/inventory/orders/export/csv/')
@@ -1587,30 +1583,39 @@ class CSVExportTotalsTests(AccountFixtureMixin, TestCase):
         self.assertEqual(header.index('Barcode'), header.index('Product Name') + 1)
         self.assertIn('5901234123457', [row[header.index('Barcode')] for row in body])
 
-    # --- total units ------------------------------------------------------------------
+    # --- quantity is the physical unit count -------------------------------------------
+    # 'Unit Multiplier' and 'Total Units' were dropped when unit_multiplier was removed
+    # (2026-08-24): quantity IS the physical count now, so it is the summable column.
 
-    def test_total_units_is_quantity_times_multiplier(self):
+    def test_the_multiplier_columns_are_gone(self):
+        self.make_multi_line_order()
+        header = self.rows('/inventory/orders/export/csv/')[0]
+        self.assertNotIn('Unit Multiplier', header)
+        self.assertNotIn('Total Units', header)
+        self.assertIn('Quantity', header)
+
+    def test_quantity_is_the_unit_count_per_line(self):
         self.make_multi_line_order()
         rows = self.rows('/inventory/orders/export/csv/')
         header, body = rows[0], rows[1:-1]
         units = {
-            row[header.index('Product Name')]: row[header.index('Total Units')]
+            row[header.index('Product Name')]: row[header.index('Quantity')]
             for row in body
         }
-        self.assertEqual(units['Widget'], '6')   # 2 * 3
-        self.assertEqual(units['Gadget'], '8')   # 4 * 2
+        self.assertEqual(units['Widget'], '6')
+        self.assertEqual(units['Gadget'], '8')
 
-    def test_total_units_is_summed_in_the_totals_row(self):
+    def test_quantity_is_summed_in_the_totals_row(self):
         self.make_multi_line_order()
         rows = self.rows('/inventory/orders/export/csv/')
         header, totals = rows[0], rows[-1]
-        self.assertEqual(totals[header.index('Total Units')], '14')
+        self.assertEqual(totals[header.index('Quantity')], '14')
 
-    def test_purchase_total_units(self):
+    def test_purchase_quantity_totals(self):
         self.make_purchase()
         rows = self.rows('/inventory/purchases/export/csv/')
         header, totals = rows[0], rows[-1]
-        self.assertEqual(totals[header.index('Total Units')], '13')  # 10 + 3
+        self.assertEqual(totals[header.index('Quantity')], '13')  # 10 + 3
 
     # --- the repeating profit column is gone ------------------------------------------
 
@@ -1669,7 +1674,7 @@ class CSVExportTotalsTests(AccountFixtureMixin, TestCase):
         self.make_multi_line_order()
         second = Order.objects.create(account=self.account, exchange_rate=89000)
         OrderItem.objects.create(
-            order=second, product=self.widget, quantity=1, unit_multiplier=1,
+            order=second, product=self.widget, quantity=1,
             unit_price=Decimal('10.00'), unit_cost_price=Decimal('4.00'),
         )  # 1 unit, line total 10.00, line profit 6.00
 
@@ -1677,7 +1682,7 @@ class CSVExportTotalsTests(AccountFixtureMixin, TestCase):
         header, totals = rows[0], rows[-1]
         self.assertEqual(totals[header.index('Line Total (USD)')], '110.00')
         self.assertEqual(totals[header.index('Line Profit (USD)')], '66.00')
-        self.assertEqual(totals[header.index('Total Units')], '15')
+        self.assertEqual(totals[header.index('Quantity')], '15')
 
     def test_an_empty_orders_export_still_totals_zero(self):
         rows = self.rows('/inventory/orders/export/csv/')
@@ -1685,7 +1690,7 @@ class CSVExportTotalsTests(AccountFixtureMixin, TestCase):
         self.assertEqual(totals[0], 'TOTALS')
         self.assertEqual(totals[header.index('Line Total (USD)')], '0.00')
         self.assertEqual(totals[header.index('Line Profit (USD)')], '0.00')
-        self.assertEqual(totals[header.index('Total Units')], '0')
+        self.assertEqual(totals[header.index('Quantity')], '0')
 
     def test_the_totals_row_respects_the_same_filters_as_the_rows(self):
         # A totals row computed over an unfiltered queryset would disagree with the rows
@@ -1751,7 +1756,7 @@ class AdminCSVExportTotalsTests(AccountFixtureMixin, TestCase):
         for _ in range(count):
             order = Order.objects.create(account=self.account, exchange_rate=89000)
             OrderItem.objects.create(
-                order=order, product=self.product, quantity=2, unit_multiplier=3,
+                order=order, product=self.product, quantity=6,
                 unit_price=Decimal('10.00'), unit_cost_price=Decimal('4.00'),
             )  # 60.00 each
 
@@ -1760,7 +1765,7 @@ class AdminCSVExportTotalsTests(AccountFixtureMixin, TestCase):
             account=self.account, supplier=self.supplier, exchange_rate=89000,
         )
         PurchaseItem.objects.create(
-            purchase_order=purchase, product=self.product, quantity=5, unit_multiplier=2,
+            purchase_order=purchase, product=self.product, quantity=10,
             unit_price=Decimal('4.00'),
         )  # 40.00
 
@@ -1828,7 +1833,7 @@ class AnalyticsSeriesProfitTests(AccountFixtureMixin, TestCase):
     def sell(self, quantity=10, when=None):
         order = Order.objects.create(account=self.account, exchange_rate=89000)
         OrderItem.objects.create(
-            order=order, product=self.product, quantity=quantity, unit_multiplier=1,
+            order=order, product=self.product, quantity=quantity,
             unit_price=Decimal('10.00'), unit_cost_price=Decimal('4.00'),
         )
         if when:
@@ -1903,7 +1908,7 @@ class AnalyticsSeriesProfitTests(AccountFixtureMixin, TestCase):
         order = Order.objects.create(account=self.account, exchange_rate=89000)
         for _ in range(3):
             OrderItem.objects.create(
-                order=order, product=self.product, quantity=1, unit_multiplier=1,
+                order=order, product=self.product, quantity=1,
                 unit_price=Decimal('10.00'), unit_cost_price=Decimal('4.00'),
             )
         row = self.series()[-1]
@@ -2276,6 +2281,19 @@ class TenantIsolationMatrixTests(AccountFixtureMixin, TestCase):
                 self.assertEqual(response.status_code, 404, f'{resource}: {response.status_code}')
                 row.refresh_from_db()
                 self.assertEqual(model_to_dict(row), before, f'{resource} was modified')
+
+    def test_sharing_another_accounts_order_is_404(self):
+        # The share action lives on OrderViewSet, so it inherits the scoped queryset through
+        # get_object(). Pinned here rather than only in PublicInvoiceShareTests because this
+        # matrix is the place a future custom @action gets checked against the boundary — the
+        # Phase 8 leak was exactly a route that looked scoped and was not.
+        order = self.a['orders']
+        response = self.b_client.post(
+            f'/inventory/orders/{order.id}/share/', HTTP_AUTHORIZATION=self.b_header,
+        )
+        self.assertEqual(response.status_code, 404)
+        order.refresh_from_db()
+        self.assertIsNone(order.share_token, 'account B minted a public link for account A')
 
     def test_deleting_another_accounts_row_is_404_and_the_row_survives(self):
         for resource in self.RESOURCES:
@@ -3064,6 +3082,15 @@ class OWASPControlTests(AccountFixtureMixin, TestCase):
 
         from inventory import urls as inventory_urls
 
+        # The single deliberate exception, named rather than pattern-matched so that adding a
+        # second unauthenticated view is a failing test and a conscious decision — not
+        # something that slips through a loosened rule.
+        #
+        # PublicInvoiceView is the customer-facing invoice link. Its access control is the
+        # 32-byte `secrets` token in the URL, and PublicInvoiceShareTests pins what that
+        # token does and does not expose (no costs, no profit, no other orders, revocable).
+        PUBLICLY_READABLE = {'PublicInvoiceView'}
+
         unprotected = []
         for pattern in inventory_urls.urlpatterns:
             callback = getattr(pattern, 'callback', None)
@@ -3073,12 +3100,42 @@ class OWASPControlTests(AccountFixtureMixin, TestCase):
             if view_class is None:
                 unprotected.append(f'{pattern.pattern}: not a class-based DRF view')
                 continue
+            if view_class.__name__ in PUBLICLY_READABLE:
+                continue
             permissions = getattr(view_class, 'permission_classes', [])
             if not any(issubclass(p, IsAuthenticated) for p in permissions):
                 unprotected.append(f'{pattern.pattern}: {view_class.__name__} {permissions}')
 
         self.assertEqual(
             unprotected, [], 'these inventory routes do not require authentication',
+        )
+
+    def test_a05_the_only_public_inventory_view_is_the_invoice_link(self):
+        """
+        The other half of the exception above: prove the allowlist has exactly one member and
+        that it is the view we think it is. Without this, the allowlist itself is an
+        unguarded place to hide a second unauthenticated endpoint.
+        """
+        from rest_framework.permissions import IsAuthenticated
+
+        from inventory import urls as inventory_urls
+
+        public = []
+        for pattern in inventory_urls.urlpatterns:
+            callback = getattr(pattern, 'callback', None)
+            view_class = getattr(callback, 'cls', None) or getattr(
+                callback, 'view_class', None,
+            )
+            if view_class is None:
+                continue
+            permissions = getattr(view_class, 'permission_classes', [])
+            if not any(issubclass(p, IsAuthenticated) for p in permissions):
+                public.append(view_class.__name__)
+
+        self.assertEqual(
+            sorted(public), ['PublicInvoiceView'],
+            'the set of unauthenticated inventory endpoints changed — this is a security '
+            'decision, not a refactor',
         )
 
     # --- A06: Vulnerable & Outdated Components ----------------------------------------
@@ -3394,10 +3451,9 @@ class OrderEditingTests(AccountFixtureMixin, APITestCase):
         )
         self.customer = Customer.objects.create(name='Walk-in', account=self.account)
 
-    def line(self, product, quantity, multiplier=1, price='10.00'):
+    def line(self, product, quantity, price='10.00'):
         return {
-            'product': product.id, 'quantity': quantity,
-            'unit_multiplier': multiplier, 'unit_price': price,
+            'product': product.id, 'quantity': quantity, 'unit_price': price,
         }
 
     def place(self, items, **extra):
@@ -3459,12 +3515,12 @@ class OrderEditingTests(AccountFixtureMixin, APITestCase):
         self.assertEqual(response.status_code, 200, response.content)
         self.assertEqual(self.stock(self.widget), 0)
 
-    def test_unit_multiplier_counts_on_both_sides_of_the_edit(self):
-        order = self.place([self.line(self.widget, 2, multiplier=3)])  # 6 units
+    def test_reducing_a_line_returns_the_difference_to_stock(self):
+        order = self.place([self.line(self.widget, 6)])
         self.assertEqual(self.stock(self.widget), 4)
 
         self.edit(order, {
-            'exchange_rate': 89000, 'items': [self.line(self.widget, 1, multiplier=3)],
+            'exchange_rate': 89000, 'items': [self.line(self.widget, 3)],
         })
         self.assertEqual(self.stock(self.widget), 7)
 
@@ -3527,7 +3583,7 @@ class OrderEditingTests(AccountFixtureMixin, APITestCase):
 
         self.edit(order, {
             'exchange_rate': 89000,
-            'items': [self.line(self.widget, 3, multiplier=2, price='12.50')],
+            'items': [self.line(self.widget, 6, price='12.50')],
         })
         order.refresh_from_db()
         self.assertEqual(order.total_price, Decimal('75.00'))
@@ -3644,10 +3700,9 @@ class PurchaseEditingTests(AccountFixtureMixin, APITestCase):
         )
         self.supplier = Supplier.objects.create(name='Acme', account=self.account)
 
-    def line(self, product, quantity, multiplier=1, price='4.00'):
+    def line(self, product, quantity, price='4.00'):
         return {
-            'product': product.id, 'quantity': quantity,
-            'unit_multiplier': multiplier, 'unit_price': price,
+            'product': product.id, 'quantity': quantity, 'unit_price': price,
         }
 
     def receive(self, items, **extra):
@@ -3688,12 +3743,12 @@ class PurchaseEditingTests(AccountFixtureMixin, APITestCase):
         self.edit(purchase, {'exchange_rate': 89000, 'items': [self.line(self.widget, 10)]})
         self.assertEqual((self.stock(self.widget), self.stock(self.gadget)), (10, 0))
 
-    def test_unit_multiplier_counts_on_both_sides_of_the_edit(self):
-        purchase = self.receive([self.line(self.widget, 4, multiplier=6)])  # 24 units
+    def test_reducing_a_received_quantity_claws_the_difference_back(self):
+        purchase = self.receive([self.line(self.widget, 24)])
         self.assertEqual(self.stock(self.widget), 24)
 
         self.edit(purchase, {
-            'exchange_rate': 89000, 'items': [self.line(self.widget, 2, multiplier=6)],
+            'exchange_rate': 89000, 'items': [self.line(self.widget, 12)],
         })
         self.assertEqual(self.stock(self.widget), 12)
 
@@ -3703,8 +3758,7 @@ class PurchaseEditingTests(AccountFixtureMixin, APITestCase):
         self.client.post(
             '/inventory/orders/',
             {'exchange_rate': 89000, 'items': [
-                {'product': self.widget.id, 'quantity': 8, 'unit_multiplier': 1,
-                 'unit_price': '10.00'},
+                {'product': self.widget.id, 'quantity': 8, 'unit_price': '10.00'},
             ]},
             content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
         )
@@ -3721,8 +3775,7 @@ class PurchaseEditingTests(AccountFixtureMixin, APITestCase):
         self.client.post(
             '/inventory/orders/',
             {'exchange_rate': 89000, 'items': [
-                {'product': self.widget.id, 'quantity': 8, 'unit_multiplier': 1,
-                 'unit_price': '10.00'},
+                {'product': self.widget.id, 'quantity': 8, 'unit_price': '10.00'},
             ]},
             content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
         )
@@ -3736,8 +3789,7 @@ class PurchaseEditingTests(AccountFixtureMixin, APITestCase):
         self.client.post(
             '/inventory/orders/',
             {'exchange_rate': 89000, 'items': [
-                {'product': self.widget.id, 'quantity': 8, 'unit_multiplier': 1,
-                 'unit_price': '10.00'},
+                {'product': self.widget.id, 'quantity': 8, 'unit_price': '10.00'},
             ]},
             content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
         )
@@ -3912,3 +3964,516 @@ class DomainConfigurationTests(TestCase):
                     offenders.append(str(path.relative_to(settings.BASE_DIR)))
 
         self.assertEqual(offenders, [], f'old domain still referenced in: {offenders}')
+
+
+class UnitMultiplierFoldMigrationTests(TransactionTestCase):
+    """
+    Proves migration 0006 removes `unit_multiplier` without moving a single number.
+
+    This is the one migration in the project that rewrites existing rows, and getting it
+    wrong is silent: dropping the column without folding would have divided the line total,
+    the stock movement and the profit of every multi-unit line by its multiplier, with no
+    exception raised anywhere. On the development database that was 1,154 of 2,840 line
+    items — roughly 41% of the history.
+
+    TransactionTestCase rather than TestCase: this drives the migration executor, which
+    commits DDL, and that cannot happen inside the outer transaction TestCase wraps a test in.
+    """
+
+    # Both apps must be named in every target. Naming only inventory leaves `accounts` at
+    # whatever state the graph resolves it to, so the historical Account model came back
+    # without paddle_customer_id while the real table still had it NOT NULL — the insert then
+    # failed on a column the test never mentions.
+    ACCOUNTS_HEAD = ('accounts', '0011_account_enable_dual_currency_and_more')
+    migrate_from = [('inventory', '0005_unique_product_barcode'), ACCOUNTS_HEAD]
+    migrate_to = [
+        ('inventory', '0007_order_paid_amount_order_payment_status_and_more'), ACCOUNTS_HEAD,
+    ]
+
+    def _migrate(self, targets):
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(targets)
+        executor.loader.build_graph()
+        return executor
+
+    def setUp(self):
+        # Rewind to just before the fold. This also unapplies 0007, which depends on 0006.
+        self._migrate(self.migrate_from)
+
+    def tearDown(self):
+        # Leave the database at the latest state or every subsequent test in the process
+        # runs against a schema missing payment_status.
+        self._migrate(self.migrate_to)
+
+    def test_the_fold_preserves_line_totals_stock_and_profit(self):
+        old_apps = self._migrate(self.migrate_from).loader.project_state(
+            self.migrate_from
+        ).apps
+
+        Account = old_apps.get_model('accounts', 'Account')
+        Category = old_apps.get_model('inventory', 'Category')
+        Product = old_apps.get_model('inventory', 'Product')
+        Order = old_apps.get_model('inventory', 'Order')
+        OrderItem = old_apps.get_model('inventory', 'OrderItem')
+
+        account = Account.objects.create(name='Fold Co', subscription_status='active')
+        category = Category.objects.create(account=account, name='General')
+        product = Product.objects.create(
+            account=account, name='Boxed widget', category=category,
+            cost_price=Decimal('2.00'), default_sell_price=Decimal('5.00'),
+            stock_quantity=0,
+        )
+        order = Order.objects.create(account=account, exchange_rate=89000)
+
+        # The three shapes that matter: a plain line, and the two pack sizes the production
+        # data actually uses.
+        for quantity, multiplier in ((4, 1), (3, 12), (5, 6)):
+            OrderItem.objects.create(
+                order=order, product=product, quantity=quantity,
+                unit_multiplier=multiplier, unit_price=Decimal('5.00'),
+                unit_cost_price=Decimal('2.00'),
+            )
+
+        expected = [
+            # (units, line total, line profit) as they read BEFORE the migration.
+            (4 * 1, Decimal('20.00'), Decimal('12.00')),
+            (3 * 12, Decimal('180.00'), Decimal('108.00')),
+            (5 * 6, Decimal('150.00'), Decimal('90.00')),
+        ]
+
+        self._migrate(self.migrate_to)
+        new_apps = self._migrate(self.migrate_to).loader.project_state(self.migrate_to).apps
+        NewOrderItem = new_apps.get_model('inventory', 'OrderItem')
+
+        rows = list(NewOrderItem.objects.order_by('id'))
+        self.assertEqual(len(rows), 3)
+
+        for row, (units, line_total, line_profit) in zip(rows, expected):
+            # quantity now IS the physical unit count.
+            self.assertEqual(row.quantity, units)
+            self.assertEqual(row.quantity * row.unit_price, line_total)
+            self.assertEqual(
+                (row.unit_price - row.unit_cost_price) * row.quantity, line_profit
+            )
+
+        self.assertFalse(
+            hasattr(rows[0], 'unit_multiplier'),
+            'unit_multiplier should be gone from the model state after 0006',
+        )
+
+    def test_purchase_lines_fold_the_same_way(self):
+        old_apps = self._migrate(self.migrate_from).loader.project_state(
+            self.migrate_from
+        ).apps
+
+        Account = old_apps.get_model('accounts', 'Account')
+        Category = old_apps.get_model('inventory', 'Category')
+        Product = old_apps.get_model('inventory', 'Product')
+        Purchase = old_apps.get_model('inventory', 'Purchase')
+        PurchaseItem = old_apps.get_model('inventory', 'PurchaseItem')
+
+        account = Account.objects.create(name='Fold Co 2', subscription_status='active')
+        category = Category.objects.create(account=account, name='General')
+        product = Product.objects.create(
+            account=account, name='Case of things', category=category,
+            cost_price=Decimal('1.50'), default_sell_price=Decimal('4.00'),
+            stock_quantity=0,
+        )
+        purchase = Purchase.objects.create(account=account, exchange_rate=89000)
+        PurchaseItem.objects.create(
+            purchase_order=purchase, product=product, quantity=7,
+            unit_multiplier=12, unit_price=Decimal('1.50'),
+        )
+
+        self._migrate(self.migrate_to)
+        new_apps = self._migrate(self.migrate_to).loader.project_state(self.migrate_to).apps
+        row = new_apps.get_model('inventory', 'PurchaseItem').objects.get()
+
+        self.assertEqual(row.quantity, 84)
+        self.assertEqual(row.quantity * row.unit_price, Decimal('126.00'))
+
+
+class PaymentStatusTests(AccountFixtureMixin, APITestCase):
+    """
+    `paid_amount` decides; `payment_status` is derived from it and never set independently.
+
+    The failure this guards against is the one CLAUDE.md already records against
+    Account.subscription_status: a status column that drifts from the number beside it, so
+    the books say PAID next to a balance still owing.
+    """
+
+    def setUp(self):
+        self.account, self.user, self.client, self.auth_header = self.make_account_user('payer')
+        self.category = Category.objects.create(name='General', account=self.account)
+        self.customer = Customer.objects.create(name='Acme', account=self.account)
+        self.supplier = Supplier.objects.create(name='Supplier Co', account=self.account)
+        self.product = Product.objects.create(
+            name='Widget', description='', cost_price='4.00', default_sell_price='10.00',
+            category=self.category, stock_quantity=100, account=self.account,
+        )
+
+    def place(self, payload_extra=None, quantity=5, price='10.00'):
+        """An order for 5 x $10 = $50 unless told otherwise."""
+        body = {
+            'customer': self.customer.id,
+            'exchange_rate': 89000,
+            'items': [{
+                'product': self.product.id, 'quantity': quantity, 'unit_price': price,
+            }],
+        }
+        body.update(payload_extra or {})
+        return self.client.post(
+            '/inventory/orders/', body,
+            content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
+        )
+
+    # --- derivation -------------------------------------------------------------------
+    def test_no_payment_is_unpaid_and_owes_the_whole_total(self):
+        order = Order.objects.get(id=self.place().json()['id'])
+        self.assertEqual(order.payment_status, PaymentStatus.UNPAID)
+        self.assertEqual(order.paid_amount, Decimal('0.00'))
+        self.assertEqual(order.remaining_amount, Decimal('50.00'))
+
+    def test_paying_the_full_total_is_paid_with_nothing_remaining(self):
+        order = Order.objects.get(id=self.place({'paid_amount': '50.00'}).json()['id'])
+        self.assertEqual(order.payment_status, PaymentStatus.PAID)
+        self.assertEqual(order.remaining_amount, Decimal('0.00'))
+
+    def test_paying_part_of_the_total_is_partially_paid(self):
+        order = Order.objects.get(id=self.place({'paid_amount': '20.00'}).json()['id'])
+        self.assertEqual(order.payment_status, PaymentStatus.PARTIALLY_PAID)
+        self.assertEqual(order.remaining_amount, Decimal('30.00'))
+
+    def test_overpayment_reads_as_paid_and_never_a_negative_balance(self):
+        # Rounding a cash settlement up is routine here. A negative "remaining" would render
+        # on the invoice as a refund the business does not owe.
+        order = Order.objects.get(id=self.place({'paid_amount': '60.00'}).json()['id'])
+        self.assertEqual(order.payment_status, PaymentStatus.PAID)
+        self.assertEqual(order.remaining_amount, Decimal('0.00'))
+
+    # --- the status shorthand ---------------------------------------------------------
+    def test_status_paid_without_an_amount_settles_the_full_total(self):
+        order = Order.objects.get(id=self.place({'payment_status': 'PAID'}).json()['id'])
+        self.assertEqual(order.paid_amount, Decimal('50.00'))
+        self.assertEqual(order.payment_status, PaymentStatus.PAID)
+
+    def test_status_unpaid_without_an_amount_settles_nothing(self):
+        order = Order.objects.get(id=self.place({'payment_status': 'UNPAID'}).json()['id'])
+        self.assertEqual(order.paid_amount, Decimal('0.00'))
+
+    def test_partially_paid_without_an_amount_is_refused(self):
+        response = self.place({'payment_status': 'PARTIALLY_PAID'})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('paid_amount', response.json())
+
+    def test_an_amount_beats_a_contradicting_status(self):
+        # The client says PAID but sends 20 of a 50 total. The number wins, because the
+        # number is what the books have to reconcile against.
+        order = Order.objects.get(
+            id=self.place({'payment_status': 'PAID', 'paid_amount': '20.00'}).json()['id']
+        )
+        self.assertEqual(order.payment_status, PaymentStatus.PARTIALLY_PAID)
+        self.assertEqual(order.paid_amount, Decimal('20.00'))
+
+    # --- edits ------------------------------------------------------------------------
+    def test_editing_the_lines_upward_downgrades_a_paid_order(self):
+        order_id = self.place({'paid_amount': '50.00'}).json()['id']
+        self.assertEqual(Order.objects.get(id=order_id).payment_status, PaymentStatus.PAID)
+
+        # 8 x $10 = $80 against $50 already paid.
+        response = self.client.patch(
+            f'/inventory/orders/{order_id}/',
+            {'items': [{
+                'product': self.product.id, 'quantity': 8, 'unit_price': '10.00',
+            }]},
+            content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+
+        order = Order.objects.get(id=order_id)
+        self.assertEqual(order.payment_status, PaymentStatus.PARTIALLY_PAID)
+        self.assertEqual(order.remaining_amount, Decimal('30.00'))
+
+    def test_editing_the_lines_downward_can_complete_the_payment(self):
+        order_id = self.place({'paid_amount': '20.00'}).json()['id']
+        self.client.patch(
+            f'/inventory/orders/{order_id}/',
+            {'items': [{
+                'product': self.product.id, 'quantity': 2, 'unit_price': '10.00',
+            }]},
+            content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
+        )
+        order = Order.objects.get(id=order_id)
+        self.assertEqual(order.payment_status, PaymentStatus.PAID)
+        self.assertEqual(order.remaining_amount, Decimal('0.00'))
+
+    # --- the wire ---------------------------------------------------------------------
+    def test_the_order_payload_carries_the_payment_fields(self):
+        self.place({'paid_amount': '20.00'})
+        body = self.client.get(
+            '/inventory/orders/', HTTP_AUTHORIZATION=self.auth_header,
+        ).json()['results'][0]
+        self.assertEqual(body['payment_status'], 'PARTIALLY_PAID')
+        self.assertEqual(Decimal(str(body['paid_amount'])), Decimal('20.00'))
+        self.assertEqual(Decimal(str(body['remaining_amount'])), Decimal('30.00'))
+
+    def test_payment_status_cannot_be_set_directly_through_the_read_serializer(self):
+        # It is write-only on the write serializer and read-only on the read one, so the only
+        # way to move it is to move paid_amount.
+        order_id = self.place({'paid_amount': '0.00'}).json()['id']
+        self.client.patch(
+            f'/inventory/orders/{order_id}/', {'payment_status': 'PAID'},
+            content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
+        )
+        order = Order.objects.get(id=order_id)
+        # The shorthand did apply — but it applied by moving the amount, not by writing a
+        # status that contradicts it.
+        self.assertEqual(order.paid_amount, order.total_price)
+        self.assertEqual(order.payment_status, PaymentStatus.PAID)
+
+    # --- purchases behave the same ----------------------------------------------------
+    def test_purchases_track_payment_the_same_way(self):
+        response = self.client.post(
+            '/inventory/purchases/',
+            {
+                'supplier': self.supplier.id, 'exchange_rate': 89000,
+                'paid_amount': '10.00',
+                'items': [{
+                    'product': self.product.id, 'quantity': 10, 'unit_price': '4.00',
+                }],
+            },
+            content_type='application/json', HTTP_AUTHORIZATION=self.auth_header,
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        purchase = Purchase.objects.get(id=response.json()['id'])
+        self.assertEqual(purchase.total_price, 40)
+        self.assertEqual(purchase.payment_status, PaymentStatus.PARTIALLY_PAID)
+        self.assertEqual(purchase.remaining_amount, Decimal('30.00'))
+
+
+class SingleCurrencyExportTests(AccountFixtureMixin, APITestCase):
+    """
+    With dual currency off, the CSV exports carry no conversion column.
+
+    The rate is still recorded on every Purchase/Order row — this is a reporting choice, not a
+    change to what is stored, which is what makes it safe to flip back and forth.
+    """
+
+    def setUp(self):
+        self.account, self.user, self.client, self.auth_header = self.make_account_user('mono')
+        category = Category.objects.create(name='General', account=self.account)
+        self.product = Product.objects.create(
+            name='Widget', description='', cost_price='4.00', default_sell_price='10.00',
+            category=category, stock_quantity=50, account=self.account,
+        )
+        order = Order.objects.create(account=self.account, exchange_rate=89000)
+        OrderItem.objects.create(
+            order=order, product=self.product, quantity=3,
+            unit_price=Decimal('10.00'), unit_cost_price=Decimal('4.00'),
+        )
+        purchase = Purchase.objects.create(account=self.account, exchange_rate=89000)
+        PurchaseItem.objects.create(
+            purchase_order=purchase, product=self.product, quantity=5,
+            unit_price=Decimal('4.00'),
+        )
+
+    def rows(self, path):
+        response = self.client.get(path, HTTP_AUTHORIZATION=self.auth_header)
+        self.assertEqual(response.status_code, 200)
+        return list(csv.reader(io.StringIO(response.content.decode())))
+
+    def set_dual(self, enabled):
+        self.account.enable_dual_currency = enabled
+        self.account.save(update_fields=['enable_dual_currency'])
+
+    def test_the_rate_column_is_present_by_default(self):
+        for path in ('/inventory/orders/export/csv/', '/inventory/purchases/export/csv/'):
+            self.assertIn('Exchange Rate (LBP)', self.rows(path)[0], path)
+
+    def test_the_rate_column_is_gone_when_dual_currency_is_off(self):
+        self.set_dual(False)
+        for path in ('/inventory/orders/export/csv/', '/inventory/purchases/export/csv/'):
+            self.assertNotIn('Exchange Rate (LBP)', self.rows(path)[0], path)
+
+    def test_dropping_the_column_does_not_shift_the_other_columns(self):
+        # The bug this guards: a TOTALS row built from a hand-counted run of blanks puts the
+        # figures under the wrong headings the moment a column is added or removed.
+        self.set_dual(False)
+        rows = self.rows('/inventory/orders/export/csv/')
+        header, body, totals = rows[0], rows[1:-1], rows[-1]
+
+        self.assertEqual(body[0][header.index('Product Name')], 'Widget')
+        self.assertEqual(body[0][header.index('Quantity')], '3')
+        self.assertEqual(body[0][header.index('Line Total (USD)')], '30.00')
+        self.assertEqual(totals[0], 'TOTALS')
+        self.assertEqual(totals[header.index('Quantity')], '3')
+        self.assertEqual(totals[header.index('Line Total (USD)')], '30.00')
+        self.assertEqual(totals[header.index('Line Profit (USD)')], '18.00')
+
+    def test_the_purchase_totals_row_also_stays_aligned(self):
+        self.set_dual(False)
+        rows = self.rows('/inventory/purchases/export/csv/')
+        header, totals = rows[0], rows[-1]
+        self.assertEqual(totals[header.index('Quantity')], '5')
+        self.assertEqual(totals[header.index('Line Total (USD)')], '20.00')
+
+    def test_the_stored_rate_is_untouched_by_the_setting(self):
+        self.set_dual(False)
+        self.client.get(
+            '/inventory/orders/export/csv/', HTTP_AUTHORIZATION=self.auth_header,
+        )
+        self.assertEqual(Order.objects.get().exchange_rate, 89000)
+
+
+class PublicInvoiceShareTests(AccountFixtureMixin, APITestCase):
+    """
+    The share token and the one unauthenticated endpoint in the project.
+
+    The risk being managed: a URL that opens a customer's name, phone number and order lines
+    to anyone holding it. These tests pin the three things that make that acceptable — the
+    token is the only key, the payload carries no cost or margin data, and revoking works.
+    """
+
+    def setUp(self):
+        self.account, self.user, self.client, self.auth_header = self.make_account_user('shopA')
+        category = Category.objects.create(name='General', account=self.account)
+        self.customer = Customer.objects.create(
+            name='Rita Haddad', location='Beirut', phone_number='+96170123456',
+            account=self.account,
+        )
+        self.product = Product.objects.create(
+            name='Widget', description='', cost_price='4.00', default_sell_price='10.00',
+            category=category, stock_quantity=50, account=self.account,
+        )
+        self.order = Order.objects.create(
+            account=self.account, customer=self.customer, exchange_rate=89000,
+        )
+        OrderItem.objects.create(
+            order=self.order, product=self.product, quantity=3,
+            unit_price=Decimal('10.00'), unit_cost_price=Decimal('4.00'),
+        )
+        self.order.paid_amount = Decimal('12.00')
+        self.order.sync_payment_status()
+
+    def share(self, order=None, method='post'):
+        return getattr(self.client, method)(
+            f'/inventory/orders/{(order or self.order).id}/share/',
+            HTTP_AUTHORIZATION=self.auth_header,
+        )
+
+    def public(self, token):
+        # A brand-new client with no credentials at all — the point is that none are needed.
+        return APIClient().get(f'/inventory/public/invoice/{token}/')
+
+    # --- minting ----------------------------------------------------------------------
+    def test_sharing_returns_a_token_and_a_canonical_url(self):
+        body = self.share().json()
+        self.assertTrue(body['share_token'])
+        self.assertGreaterEqual(len(body['share_token']), 40)
+        self.assertEqual(
+            body['share_url'], f"{settings.SITE_URL}/i/{body['share_token']}",
+        )
+
+    def test_sharing_twice_keeps_the_same_link_alive(self):
+        # Re-sharing must not silently invalidate the link a customer was sent yesterday.
+        first = self.share().json()['share_token']
+        self.assertEqual(self.share().json()['share_token'], first)
+
+    def test_two_orders_get_different_tokens(self):
+        second = Order.objects.create(account=self.account, exchange_rate=89000)
+        OrderItem.objects.create(
+            order=second, product=self.product, quantity=1,
+            unit_price=Decimal('10.00'), unit_cost_price=Decimal('4.00'),
+        )
+        self.assertNotEqual(
+            self.share().json()['share_token'],
+            self.share(order=second).json()['share_token'],
+        )
+
+    # --- reading ----------------------------------------------------------------------
+    def test_the_link_opens_with_no_authentication(self):
+        token = self.share().json()['share_token']
+        response = self.public(token)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body['customer_name'], 'Rita Haddad')
+        self.assertEqual(body['seller_name'], self.account.name)
+        self.assertEqual(body['total_price'], 30)
+        self.assertEqual(body['payment_status'], 'PARTIALLY_PAID')
+        self.assertEqual(Decimal(str(body['remaining_amount'])), Decimal('18.00'))
+        self.assertEqual(body['items'][0]['product'], 'Widget')
+
+    def test_the_payload_never_carries_cost_or_profit(self):
+        # The whole reason PublicInvoiceSerializer lists its fields explicitly instead of
+        # reusing OrderSerializer: this link goes to customers, and unit_cost_price tells them
+        # what the business pays its suppliers.
+        token = self.share().json()['share_token']
+        raw = self.public(token).content.decode()
+        for leak in ('unit_cost_price', 'profit', 'cost_price'):
+            self.assertNotIn(leak, raw)
+
+    def test_the_payload_does_not_expose_the_internal_order_id(self):
+        token = self.share().json()['share_token']
+        body = self.public(token).json()
+        self.assertNotIn('id', body)
+        self.assertNotIn(str(self.order.id), self.public(token).content.decode())
+
+    # --- the token is the only key ----------------------------------------------------
+    def test_an_unshared_order_has_no_public_url(self):
+        self.assertIsNone(Order.objects.get(pk=self.order.pk).share_token)
+
+    def test_a_wrong_token_is_a_404(self):
+        self.share()
+        self.assertEqual(self.public('not-a-real-token').status_code, 404)
+
+    def test_an_empty_token_cannot_match_an_order_stored_with_one(self):
+        # Every unshared order stores NULL, so there is no '' to collide with. This pins the
+        # defence anyway, because "an empty token opens somebody's invoice" is unrecoverable.
+        #
+        # Note what the empty URL actually does: `<str:token>` does not match an empty segment,
+        # so /inventory/public/invoice// never reaches this view at all — it falls through to
+        # the SPA catch-all in ims/urls.py and returns index.html with a 200. That 200 is the
+        # React shell, not an invoice, so the assertion is on the *content*, not the status.
+        Order.objects.filter(pk=self.order.pk).update(share_token='')
+
+        empty = self.public('')
+        self.assertNotIn('Rita Haddad', empty.content.decode())
+
+        # A token that does route and is still effectively blank must 404 outright.
+        self.assertEqual(self.public('%20').status_code, 404)
+
+    def test_revoking_kills_the_link_immediately(self):
+        token = self.share().json()['share_token']
+        self.assertEqual(self.public(token).status_code, 200)
+
+        self.assertEqual(self.share(method='delete').status_code, 204)
+        self.assertEqual(self.public(token).status_code, 404)
+        self.assertIsNone(Order.objects.get(pk=self.order.pk).share_token)
+
+    def test_resharing_after_a_revoke_mints_a_new_token(self):
+        first = self.share().json()['share_token']
+        self.share(method='delete')
+        self.assertNotEqual(self.share().json()['share_token'], first)
+
+    # --- account isolation ------------------------------------------------------------
+    def test_another_account_cannot_share_your_order(self):
+        _, _, other_client, other_header = self.make_account_user('shopB')
+        response = other_client.post(
+            f'/inventory/orders/{self.order.id}/share/', HTTP_AUTHORIZATION=other_header,
+        )
+        # 404, not 403 — a 403 would confirm the order exists across the tenant boundary.
+        self.assertEqual(response.status_code, 404)
+        self.assertIsNone(Order.objects.get(pk=self.order.pk).share_token)
+
+    def test_another_account_cannot_revoke_your_link(self):
+        token = self.share().json()['share_token']
+        _, _, other_client, other_header = self.make_account_user('shopC')
+        other_client.delete(
+            f'/inventory/orders/{self.order.id}/share/', HTTP_AUTHORIZATION=other_header,
+        )
+        self.assertEqual(self.public(token).status_code, 200)
+
+    def test_sharing_requires_authentication(self):
+        response = APIClient().post(f'/inventory/orders/{self.order.id}/share/')
+        self.assertIn(response.status_code, (401, 403))

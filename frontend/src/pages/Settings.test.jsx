@@ -29,8 +29,19 @@ vi.mock('@/context/AuthContext', () => ({
 vi.mock('@/context/ThemeContext', () => ({
   useTheme: () => ({ theme: 'light', toggleTheme: vi.fn() }),
 }))
+// Hoisted so individual tests can vary the account's currency settings and assert on the
+// preferences UI. A partial mock here would let the new controls render `undefined` while the
+// suite still passed, which is exactly the gap this closes.
+const currencyState = vi.hoisted(() => ({
+  currency: 'USD',
+  primaryCurrency: 'USD',
+  enableDualCurrency: true,
+  showExchangeRate: true,
+  toggleCurrency: vi.fn(),
+  updateSettings: vi.fn().mockResolvedValue(undefined),
+}))
 vi.mock('@/context/CurrencyContext', () => ({
-  useCurrency: () => ({ currency: 'USD', toggleCurrency: vi.fn() }),
+  useCurrency: () => currencyState,
 }))
 
 /** The page renders a <Link>, so every render needs a router around it. */
@@ -310,5 +321,49 @@ describe('Settings', () => {
     account = { ...BASE_ACCOUNT, subscription_status: 'canceled', subscription_live: false }
     renderPage()
     expect(screen.getByRole('button', { name: /send reset code/i })).toBeInTheDocument()
+  })
+})
+
+
+describe('Settings currency preferences', () => {
+  beforeEach(() => {
+    currencyState.currency = 'USD'
+    currencyState.primaryCurrency = 'USD'
+    currencyState.enableDualCurrency = true
+    currencyState.updateSettings.mockClear()
+    currencyState.toggleCurrency.mockClear()
+  })
+
+  it('shows the account base currency and the dual-currency state', () => {
+    renderPage()
+    expect(screen.getByRole('button', { name: /base currency/i })).toHaveTextContent('USD')
+    expect(screen.getByRole('button', { name: /dual currency/i })).toHaveTextContent('On')
+  })
+
+  it('switches the base currency to LBP', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(screen.getByRole('button', { name: /base currency/i }))
+    expect(currencyState.updateSettings).toHaveBeenCalledWith({ primary_currency: 'LBP' })
+  })
+
+  it('turns dual currency off', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(screen.getByRole('button', { name: /dual currency/i }))
+    expect(currencyState.updateSettings).toHaveBeenCalledWith({ enable_dual_currency: false })
+  })
+
+  it('offers no "showing" switch when there is only one currency', () => {
+    currencyState.enableDualCurrency = false
+    renderPage()
+    expect(screen.queryByRole('button', { name: /showing/i })).not.toBeInTheDocument()
+  })
+
+  it('offers the "showing" switch while dual currency is on', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(screen.getByRole('button', { name: /showing/i }))
+    expect(currencyState.toggleCurrency).toHaveBeenCalled()
   })
 })

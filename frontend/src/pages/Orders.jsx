@@ -30,6 +30,7 @@ const MONTH_OPTIONS = Array.from({ length: 12 }, (_, i) => ({
 }))
 
 export function Orders() {
+  const { primaryCurrency, enableDualCurrency } = useCurrency()
   const [customers, setCustomers] = useState([])
   const [customer, setCustomer] = useState('all')
   const [year, setYear] = useState('all')
@@ -46,6 +47,11 @@ export function Orders() {
   const [productCache, setProductCache] = useState(new Map())
   const [invoiceLoadingId, setInvoiceLoadingId] = useState(null)
   const [invoiceOrder, setInvoiceOrder] = useState(null)
+  // The public link for the invoice currently open, and whether one is being minted. Kept
+  // here rather than on the order row: it is per-viewing state, and closing the invoice
+  // should not leave a stale token in the list.
+  const [shareUrl, setShareUrl] = useState(null)
+  const [sharing, setSharing] = useState(false)
   const [detailOrder, setDetailOrder] = useState(null)
 
   useEffect(() => {
@@ -132,7 +138,6 @@ export function Orders() {
         items: order.items.map((item) => ({
           name: nextCache.get(item.product) ?? `Product #${item.product}`,
           quantity: item.quantity,
-          unitMultiplier: item.unit_multiplier,
           unitPrice: item.unit_price,
         })),
       })
@@ -246,7 +251,10 @@ export function Orders() {
       {invoiceOrder && (
         <Invoice
           open={Boolean(invoiceOrder)}
-          onClose={() => setInvoiceOrder(null)}
+          onClose={() => {
+            setInvoiceOrder(null)
+            setShareUrl(null)
+          }}
           documentType="Invoice"
           id={invoiceOrder.id}
           placedAt={invoiceOrder.placed_at}
@@ -256,6 +264,22 @@ export function Orders() {
           partyPhone={invoiceOrder.customerPhone}
           partyLocation={invoiceOrder.customerLocation}
           items={invoiceOrder.items}
+          primaryCurrency={primaryCurrency}
+          showSecondaryCurrency={enableDualCurrency}
+          paymentStatus={invoiceOrder.payment_status}
+          paidAmount={Number(invoiceOrder.paid_amount) || 0}
+          remainingAmount={Number(invoiceOrder.remaining_amount) || 0}
+          shareUrl={shareUrl}
+          sharing={sharing}
+          onShare={async () => {
+            setSharing(true)
+            try {
+              const { data } = await api.post(`/inventory/orders/${invoiceOrder.id}/share/`)
+              setShareUrl(data.share_url)
+            } finally {
+              setSharing(false)
+            }
+          }}
         />
       )}
 
@@ -267,6 +291,9 @@ export function Orders() {
           id={detailOrder.id}
           placedAt={detailOrder.placed_at}
           exchangeRate={detailOrder.exchange_rate}
+          paymentStatus={detailOrder.payment_status}
+          paidAmount={Number(detailOrder.paid_amount) || 0}
+          remainingAmount={Number(detailOrder.remaining_amount) || 0}
           partyLabel="Customer"
           partyName={detailOrder.customer}
           items={detailOrder.items}

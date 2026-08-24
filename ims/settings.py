@@ -333,6 +333,11 @@ REST_FRAMEWORK = {
         # a loop. 30/hour is far above any real use (the SPA exports on a button press) and
         # far below what it takes to tie up the database.
         'exports': '30/hour',
+        # The public invoice link. The token is 32 bytes from `secrets` and not enumerable,
+        # but this is the one endpoint that runs a query for any string the internet hands it,
+        # and it is counted per client address rather than per user because there is no user.
+        # A customer opening and re-reading their invoice needs a handful.
+        'public_invoice': '60/hour',
     },
 }
 

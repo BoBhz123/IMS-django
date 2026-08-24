@@ -1,12 +1,13 @@
 import { render, screen, within } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
+import userEvent from '@testing-library/user-event'
+import { describe, expect, it, vi } from 'vitest'
 import { AuthContext } from '@/context/AuthContext'
 import { INVOICE_FALLBACK_NAME, INVOICE_TAGLINE } from '@/lib/invoiceConfig'
 import { Invoice } from './Invoice'
 
 const ITEMS = [
-  { name: 'Widget', quantity: 3, unitMultiplier: 12, unitPrice: 2.5 },
-  { name: 'Gadget', quantity: 1, unitMultiplier: 1, unitPrice: 8 },
+  { name: 'Widget', quantity: 36, unitPrice: 2.5 },
+  { name: 'Gadget', quantity: 1, unitPrice: 8 },
 ]
 
 const ACCOUNT = {
@@ -97,7 +98,7 @@ describe('Invoice line table', () => {
   it('has the reference columns in order', () => {
     renderInvoice()
     const headers = screen.getAllByRole('columnheader').map((cell) => cell.textContent.trim())
-    expect(headers).toEqual(['#', 'Items', 'Unit', 'Qty', 'Unit cost', 'Total'])
+    expect(headers).toEqual(['#', 'Items', 'Qty', 'Unit cost', 'Total'])
   })
 
   it('numbers the lines from one', () => {
@@ -107,13 +108,13 @@ describe('Invoice line table', () => {
     expect(within(rows[1]).getByText('2')).toBeInTheDocument()
   })
 
-  it('shows units per pack and quantity in separate columns', () => {
-    // 3 cases of 12 is not "36" and not "3 × 12" crammed into one cell — the reference
-    // layout keeps UNIT and QTY apart, and stock is deducted as their product.
+  it('shows one quantity column, in physical units', () => {
+    // The old layout split UNIT (pack size) from QTY (number of packs). unit_multiplier was
+    // removed on 2026-08-24, so a case of 12 is recorded as 36 units and there is one column.
     renderInvoice()
     const row = screen.getAllByRole('row')[1]
     const cells = within(row).getAllByRole('cell').map((cell) => cell.textContent.trim())
-    expect(cells).toEqual(['1', 'Widget', '12', '3', '$2.50', '$90.00'])
+    expect(cells).toEqual(['1', 'Widget', '36', '$2.50', '$90.00'])
   })
 })
 
@@ -162,5 +163,95 @@ describe('Invoice print scaffolding', () => {
     renderInvoice()
     const printButton = screen.getByRole('button', { name: /print/i })
     expect(printButton.closest('.no-print')).not.toBeNull()
+  })
+})
+
+describe('Invoice payment stamp', () => {
+  it('shows no stamp when the order carries no payment state', () => {
+    // An older cached payload, or a bare render. Better nothing than "undefined" stamped
+    // across a document a customer receives.
+    renderInvoice()
+    expect(screen.queryByText(/^PAID$/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/UNPAID/)).not.toBeInTheDocument()
+  })
+
+  it('stamps a paid invoice with what was paid and no balance line', () => {
+    renderInvoice({ paymentStatus: 'PAID', paidAmount: 98, remainingAmount: 0 })
+    expect(screen.getByText('PAID')).toBeInTheDocument()
+    expect(screen.getByText(/Paid \$98\.00/)).toBeInTheDocument()
+    expect(screen.queryByText(/Balance/)).not.toBeInTheDocument()
+  })
+
+  it('stamps a partial payment with both figures', () => {
+    renderInvoice({ paymentStatus: 'PARTIALLY_PAID', paidAmount: 40, remainingAmount: 58 })
+    expect(screen.getByText('PARTIALLY PAID')).toBeInTheDocument()
+    expect(screen.getByText(/Paid \$40\.00/)).toBeInTheDocument()
+    expect(screen.getByText(/Balance \$58\.00/)).toBeInTheDocument()
+  })
+
+  it('stamps an unpaid invoice with the balance only', () => {
+    renderInvoice({ paymentStatus: 'UNPAID', paidAmount: 0, remainingAmount: 98 })
+    expect(screen.getByText('UNPAID')).toBeInTheDocument()
+    expect(screen.getByText(/Balance \$98\.00/)).toBeInTheDocument()
+    expect(screen.queryByText(/Paid \$/)).not.toBeInTheDocument()
+  })
+})
+
+describe('Invoice sharing', () => {
+  it('offers to create a link before one exists, and no share targets yet', () => {
+    renderInvoice({ onShare: vi.fn() })
+    expect(screen.getByRole('button', { name: /share invoice/i })).toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: /whatsapp/i })).not.toBeInTheDocument()
+  })
+
+  it('mints the link on demand rather than whenever the invoice is opened', async () => {
+    // Sharing publishes customer details to an unauthenticated URL, so it must be a
+    // deliberate act — not a side effect of viewing.
+    const user = userEvent.setup()
+    const onShare = vi.fn()
+    renderInvoice({ onShare })
+    expect(onShare).not.toHaveBeenCalled()
+
+    await user.click(screen.getByRole('button', { name: /share invoice/i }))
+    expect(onShare).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows the share targets once a link exists', () => {
+    renderInvoice({
+      shareUrl: 'https://myimsapp.com/i/tok3n',
+      paymentStatus: 'PAID',
+      paidAmount: 98,
+    })
+    const whatsapp = screen.getByRole('link', { name: /whatsapp/i })
+    expect(whatsapp).toHaveAttribute('href', expect.stringContaining('https://wa.me/?text='))
+    expect(decodeURIComponent(whatsapp.getAttribute('href'))).toContain(
+      'https://myimsapp.com/i/tok3n',
+    )
+    expect(screen.getByRole('link', { name: /telegram/i })).toHaveAttribute(
+      'href', expect.stringContaining('t.me/share/url'),
+    )
+    expect(screen.getByRole('button', { name: /copy link/i })).toBeInTheDocument()
+  })
+
+  it('opens share targets in a new tab without leaking the opener', () => {
+    renderInvoice({ shareUrl: 'https://myimsapp.com/i/tok3n' })
+    for (const name of [/whatsapp/i, /telegram/i]) {
+      const link = screen.getByRole('link', { name })
+      expect(link).toHaveAttribute('target', '_blank')
+      expect(link.getAttribute('rel')).toContain('noopener')
+    }
+  })
+
+  it('has a close action in the toolbar', async () => {
+    const user = userEvent.setup()
+    const onClose = vi.fn()
+    renderInvoice({ onClose })
+    // Two controls close this: the Modal's own icon-only X and the toolbar button. Pick the
+    // toolbar one by its visible label — the X has none.
+    const closeButton = screen
+      .getAllByRole('button', { name: /close/i })
+      .find((button) => button.textContent.trim() === 'Close')
+    await user.click(closeButton)
+    expect(onClose).toHaveBeenCalled()
   })
 })

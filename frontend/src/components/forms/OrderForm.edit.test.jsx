@@ -16,7 +16,7 @@ const ORDER = {
   customer: 'Layal',
   exchange_rate: 90000,
   placed_at: '2026-08-01T10:00:00Z',
-  items: [{ product: 1, quantity: 4, unit_multiplier: 1, unit_price: '10.00' }],
+  items: [{ product: 1, quantity: 4, unit_price: '10.00' }],
 }
 
 const CUSTOMERS = [{ id: 7, name: 'Rami' }, { id: 8, name: 'Layal' }]
@@ -97,7 +97,7 @@ describe('OrderForm in edit mode', () => {
       {
         customer: '8',
         exchange_rate: 90000,
-        items: [{ product: 1, quantity: 4, unit_multiplier: 1, unit_price: '10.00' }],
+        items: [{ product: 1, quantity: 4, unit_price: '10.00' }],
       },
     ))
     expect(api.post).not.toHaveBeenCalled()

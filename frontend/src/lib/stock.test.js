@@ -1,22 +1,22 @@
 import { describe, expect, it } from 'vitest'
 import { hasBlockingStockError, lineUnits, requestedByProduct, stockStateFor } from './stock'
 
-const line = (product, quantity, unit_multiplier = 1, stock_quantity = 10) => ({
-  product, quantity, unit_multiplier, stock_quantity, unit_price: 10,
+const line = (product, quantity, stock_quantity = 10) => ({
+  product, quantity, stock_quantity, unit_price: 10,
 })
 
 describe('lineUnits', () => {
-  it('multiplies quantity by the multiplier, matching the server deduction', () => {
-    expect(lineUnits(line('1', 4, 3))).toBe(12)
+  it('is the line quantity, matching the server deduction', () => {
+    expect(lineUnits(line('1', 12))).toBe(12)
   })
 
   it('treats blank and non-numeric inputs as zero rather than NaN', () => {
-    expect(lineUnits({ quantity: '', unit_multiplier: 2 })).toBe(0)
-    expect(lineUnits({ quantity: 'abc', unit_multiplier: 1 })).toBe(0)
+    expect(lineUnits({ quantity: '' })).toBe(0)
+    expect(lineUnits({ quantity: 'abc' })).toBe(0)
   })
 
   it('reads numeric strings, which is what number inputs actually produce', () => {
-    expect(lineUnits({ quantity: '3', unit_multiplier: '2' })).toBe(6)
+    expect(lineUnits({ quantity: '6' })).toBe(6)
   })
 })
 
@@ -51,7 +51,7 @@ describe('stockStateFor', () => {
   })
 
   it('reports out when the product has no stock at all', () => {
-    expect(stockStateFor([line('1', 1, 1, 0)], 0).status).toBe('out')
+    expect(stockStateFor([line('1', 1, 0)], 0).status).toBe('out')
   })
 
   it('reports none when no product is selected', () => {
@@ -71,11 +71,11 @@ describe('stockStateFor', () => {
 
 describe('hasBlockingStockError', () => {
   it('blocks when any line is over', () => {
-    expect(hasBlockingStockError([line('1', 3), line('2', 99, 1, 5)])).toBe(true)
+    expect(hasBlockingStockError([line('1', 3), line('2', 99, 5)])).toBe(true)
   })
 
   it('blocks an out-of-stock product', () => {
-    expect(hasBlockingStockError([line('1', 1, 1, 0)])).toBe(true)
+    expect(hasBlockingStockError([line('1', 1, 0)])).toBe(true)
   })
 
   it('allows an order sitting exactly at the cap', () => {

@@ -30,6 +30,15 @@ async function selectProduct(user, name) {
   await user.click(screen.getByRole('button', { name: new RegExp(name, 'i') }))
 }
 
+/** The one-step add: open the picker and tap a product. The modal stays open by design. */
+async function addProduct(user, name) {
+  const opener = screen.queryByRole('button', { name: /^add product$/i })
+  if (opener) await user.click(opener)
+  await user.click(
+    screen.getByRole('button', { name: new RegExp(`${name}.*(left|out of stock)`, 'i') }),
+  )
+}
+
 const submitButton = () => screen.getByRole('button', { name: /create order/i })
 
 describe('OrderForm stock gating', () => {
@@ -69,18 +78,16 @@ describe('OrderForm stock gating', () => {
     expect(submitButton()).toBeDisabled()
   })
 
-  it('counts the multiplier against stock, not bare quantity', async () => {
+  it('flags a line that asks for more than is in stock', async () => {
     const user = userEvent.setup()
     renderForm()
     await selectProduct(user, 'Widget')
 
-    const [, qty, multiplier] = screen.getAllByRole('spinbutton')
+    const [, qty] = screen.getAllByRole('spinbutton')
     await user.clear(qty)
-    await user.type(qty, '2')
-    await user.clear(multiplier)
-    await user.type(multiplier, '3')
+    await user.type(qty, '6')
 
-    // 2 x 3 = 6 units against 5 in stock, even though quantity alone (2) fits.
+    // 6 units against 5 in stock.
     expect(screen.getByText(/over stock by 1/i)).toBeInTheDocument()
     expect(submitButton()).toBeDisabled()
   })
@@ -94,28 +101,33 @@ describe('OrderForm stock gating', () => {
     expect(screen.getByRole('button', { name: /widget/i })).toBeEnabled()
   })
 
-  it('charges two lines of the same product against one shared pool', async () => {
+  it('increments the existing line instead of adding a duplicate', async () => {
+    // The one-step add replaced "Add row, then choose": picking a product already on the
+    // order bumps its quantity rather than opening a second line for the same thing.
     const user = userEvent.setup()
     renderForm()
-    await selectProduct(user, 'Widget')
+    await addProduct(user, 'Widget')
+    await addProduct(user, 'Widget')
 
-    await user.click(screen.getByRole('button', { name: /add item/i }))
-    const pickers = screen.getAllByRole('button', { name: /select product/i })
-    await user.click(pickers[pickers.length - 1])
-    const options = screen.getAllByRole('button', { name: /widget/i })
-    await user.click(options[options.length - 1])
+    // Still one line, now asking for 2 of 5.
+    expect(screen.getAllByRole('spinbutton')).toHaveLength(2) // exchange rate + one quantity
+    expect(screen.getByText(/3 left/i)).toBeInTheDocument()
+  })
 
-    const spinbuttons = screen.getAllByRole('spinbutton')
-    const firstQty = spinbuttons[1]
-    await user.clear(firstQty)
-    await user.type(firstQty, '4')
+  it('refuses to increment past available stock', async () => {
+    const user = userEvent.setup()
+    renderForm()
+    // Widget has 5. A sixth tap has nothing left to claim.
+    for (let i = 0; i < 6; i += 1) await addProduct(user, 'Widget')
 
-    const refreshed = screen.getAllByRole('spinbutton')
-    const secondQty = refreshed[3]
-    await user.clear(secondQty)
-    await user.type(secondQty, '4')
+    expect(screen.getByText(/only 5 of widget in stock/i)).toBeInTheDocument()
+    expect(submitButton()).toBeEnabled()
+  })
 
-    // 4 + 4 = 8 against 5. Each line alone fits; together they do not.
-    expect(submitButton()).toBeDisabled()
+  it('does not offer an out-of-stock product for a sale', async () => {
+    const user = userEvent.setup()
+    renderForm()
+    await user.click(screen.getByRole('button', { name: /^add product$/i }))
+    expect(screen.getByRole('button', { name: /sold out thing/i })).toBeDisabled()
   })
 })

@@ -1,12 +1,18 @@
 from django.urls import path
 
 from .views import (
-    AbandonRegistrationView, PasswordResetConfirmView, PasswordResetRequestView,
-    PasswordResetVerifyView, ResendCodeView, SubscriptionStatusView, VerifyEmailView,
+    AbandonRegistrationView, AccountCurrencySettingsView, PasswordResetConfirmView,
+    PasswordResetRequestView, PasswordResetVerifyView, ResendCodeView,
+    SubscriptionStatusView, VerifyEmailView,
 )
 
 urlpatterns = [
     path('subscription/', SubscriptionStatusView.as_view(), name='subscription-status'),
+    path(
+        'currency-settings/',
+        AccountCurrencySettingsView.as_view(),
+        name='account-currency-settings',
+    ),
     path('verify-email/', VerifyEmailView.as_view(), name='verify-email'),
     path('resend-code/', ResendCodeView.as_view(), name='resend-code'),
     path(

@@ -37,17 +37,29 @@ export function invoiceFileName(placedAt, id) {
 }
 
 /**
- * Line-items total: quantity * unit_multiplier * unit_price.
+ * Line-items total: quantity * unit_price.
  * Agrees with the API's `total_price` field (inventory/models.py::LINE_TOTAL is the shared
  * definition on that side) — this stays because the tables already hold the items and can
  * total them without trusting a second field to be present on every payload shape.
  */
 export function computeItemsTotal(items) {
-  return items.reduce((sum, item) => sum + item.quantity * item.unit_multiplier * item.unit_price, 0)
+  return items.reduce((sum, item) => sum + item.quantity * item.unit_price, 0)
 }
 
+/**
+ * A USD amount rendered as Lebanese pounds.
+ *
+ * LBP is never written with decimals — there is no subunit in practical circulation, and a
+ * figure like "1,112,500.00 LBP" reads as a mistake. The value is rounded to a whole number
+ * *before* formatting, not merely displayed without its decimals, so the string and the number
+ * a reader would add up agree. Thousands separators come from Intl.
+ *
+ * `compact` keeps one decimal on purpose — that path is for chart axes and stat tiles, where
+ * "1.5M LBP" is an abbreviation of the magnitude rather than a fractional pound amount, and
+ * forcing it to zero digits would collapse 1.5M and 2.4M both to "2M".
+ */
 export function formatLBP(usdAmount, exchangeRate, { compact = false } = {}) {
-  const lbp = usdAmount * exchangeRate
+  const lbp = Math.round((typeof usdAmount === 'number' ? usdAmount : parseMoney(usdAmount)) * exchangeRate)
   return `${new Intl.NumberFormat('en-US', {
     maximumFractionDigits: compact ? 1 : 0,
     notation: compact ? 'compact' : 'standard',

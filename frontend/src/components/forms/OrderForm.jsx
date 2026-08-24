@@ -4,6 +4,9 @@ import { api } from '@/lib/api'
 import { DEFAULT_EXCHANGE_RATE, useCurrency } from '@/context/CurrencyContext'
 import { SlideOver } from '@/components/ui/SlideOver'
 import { BarcodeScannerModal } from '@/components/ui/BarcodeScannerModal'
+import { ProductSearchModal } from '@/components/forms/ProductSearchModal'
+import { CustomerForm } from '@/components/forms/CustomerForm'
+import { ProductForm } from '@/components/forms/ProductForm'
 import { CurrencyInput } from '@/components/ui/CurrencyInput'
 import { ProductPicker } from '@/components/forms/ProductPicker'
 import { StockBadge } from '@/components/ui/StockBadge'
@@ -16,13 +19,13 @@ import {
 } from '@/lib/transactionEdit'
 
 function emptyItem() {
-  return { product: '', quantity: 1, unit_multiplier: 1, unit_price: 0, stock_quantity: null, product_name: '' }
+  return { product: '', quantity: 1, unit_price: 0, stock_quantity: null, product_name: '' }
 }
 
 /**
  * Largest quantity this line may take: the product's stock less whatever the other lines
- * already claim, divided back out by this line's multiplier — because the input edits
- * quantity, while stock is consumed in quantity × multiplier units.
+ * already claim. Duplicate lines for one product share a single pool, which is why this
+ * subtracts the other lines rather than looking at this one alone.
  */
 function maxQuantityFor(items, index) {
   const item = items[index]
@@ -32,11 +35,10 @@ function maxQuantityFor(items, index) {
 
   const claimedElsewhere = items.reduce((sum, other, i) => {
     if (i === index || String(other.product) !== String(item.product)) return sum
-    return sum + (Number(other.quantity) || 0) * (Number(other.unit_multiplier) || 0)
+    return sum + (Number(other.quantity) || 0)
   }, 0)
 
-  const multiplier = Number(item.unit_multiplier) || 1
-  return Math.max(0, Math.floor((available - claimedElsewhere) / multiplier))
+  return Math.max(0, available - claimedElsewhere)
 }
 
 export function OrderForm({ open, onClose, order = null, ...rest }) {
@@ -58,8 +60,20 @@ export function OrderForm({ open, onClose, order = null, ...rest }) {
   )
 }
 
-function OrderFormBody({ onClose, onSaved, customers, order = null }) {
-  const { formatAmount } = useCurrency()
+function OrderFormBody({ onClose, onSaved, customers: initialCustomers, order = null }) {
+  // Customers created from inside this form are merged locally rather than triggering a
+  // refetch through the page. A refetch would be a round trip the user waits on, and the
+  // parent's list is only used to populate this one select.
+  const [createdCustomers, setCreatedCustomers] = useState([])
+  const customers = useMemo(
+    () => [...initialCustomers, ...createdCustomers],
+    [initialCustomers, createdCustomers],
+  )
+  const onCustomerCreated = useCallback((created) => {
+    setCreatedCustomers((current) => [...current, created])
+  }, [])
+
+  const { formatAmount, formatSecondary, showExchangeRate } = useCurrency()
   const editing = Boolean(order)
 
   // Only editing needs the catalog: the saved lines carry product ids, and the form needs
@@ -95,6 +109,10 @@ function OrderFormBody({ onClose, onSaved, customers, order = null }) {
   }, [hydrated, catalogStatus, order, catalog, credited])
 
   const [scannerOpen, setScannerOpen] = useState(false)
+  // Direct product add (one step) and the two in-context quick-create surfaces.
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const [newCustomerOpen, setNewCustomerOpen] = useState(false)
+  const [newProductOpen, setNewProductOpen] = useState(false)
   const [scanMessage, setScanMessage] = useState(null)
   const [scanChoices, setScanChoices] = useState([])
 
@@ -195,15 +213,12 @@ function OrderFormBody({ onClose, onSaved, customers, order = null }) {
     })
   }
 
-  function addItem() {
-    setItems((current) => [...current, emptyItem()])
-  }
 
   function removeItem(index) {
     setItems((current) => current.filter((_, i) => i !== index))
   }
 
-  const total = items.reduce((sum, item) => sum + item.quantity * item.unit_multiplier * item.unit_price, 0)
+  const total = items.reduce((sum, item) => sum + item.quantity * item.unit_price, 0)
 
   async function handleSubmit(event) {
     event.preventDefault()
@@ -218,7 +233,6 @@ function OrderFormBody({ onClose, onSaved, customers, order = null }) {
         .map((item) => ({
           product: Number(item.product),
           quantity: Number(item.quantity),
-          unit_multiplier: Number(item.unit_multiplier),
           unit_price: item.unit_price,
         })),
     }
@@ -277,49 +291,71 @@ function OrderFormBody({ onClose, onSaved, customers, order = null }) {
         )}
 
         <Field label="Customer">
-          <select
-            value={customer}
-            onChange={(event) => setCustomer(event.target.value)}
-            className="w-full rounded-xl border border-hairline bg-canvas-2 px-3 py-2 text-[13px] text-text-primary focus:border-accent-blue/60 focus:ring-2 focus:ring-accent-blue/20 focus:outline-none"
-          >
-            <option value="">No customer</option>
-            {customers.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-              </option>
-            ))}
-          </select>
+          <div className="flex items-center gap-2">
+            <select
+              value={customer}
+              onChange={(event) => setCustomer(event.target.value)}
+              className="min-w-0 flex-1 rounded-xl border border-hairline bg-canvas-2 px-3 py-2 text-[13px] text-text-primary focus:border-accent-blue/60 focus:ring-2 focus:ring-accent-blue/20 focus:outline-none"
+            >
+              <option value="">No customer</option>
+              {customers.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
+              ))}
+            </select>
+            {/* Secondary action: compact icon and padding, set against the primary
+                Add product / Scan barcode pair below. */}
+            <button
+              type="button"
+              onClick={() => setNewCustomerOpen(true)}
+              className="flex shrink-0 items-center gap-1 rounded-lg border border-hairline p-2 text-sm font-medium text-accent-blue hover:bg-canvas-2"
+            >
+              <Plus className="h-4 w-4" />
+              New
+            </button>
+          </div>
         </Field>
 
-        <Field label="Exchange rate (LBP per $)">
-          <input
-            type="number"
-            min="1"
-            value={exchangeRate}
-            onChange={(event) => setExchangeRate(event.target.value)}
-            className="w-full rounded-xl border border-hairline bg-canvas-2 px-3 py-2 text-[13px] text-text-primary tabular-nums focus:border-accent-blue/60 focus:ring-2 focus:ring-accent-blue/20 focus:outline-none"
-          />
-        </Field>
+        {/* Hidden when the account is single-currency USD: with no conversion happening
+            anywhere, the rate is noise on the form. It is still SENT — the column is the
+            historical record of the day's rate and stays populated either way. With LBP as the
+            primary currency the field stays visible, because the rate is then what turns every
+            stored USD figure into the number on screen. See CurrencyContext.showExchangeRate. */}
+        {showExchangeRate && (
+          <Field label="Exchange rate (LBP per $)">
+            <input
+              type="number"
+              min="1"
+              value={exchangeRate}
+              onChange={(event) => setExchangeRate(event.target.value)}
+              className="w-full rounded-xl border border-hairline bg-canvas-2 px-3 py-2 text-[13px] text-text-primary tabular-nums focus:border-accent-blue/60 focus:ring-2 focus:ring-accent-blue/20 focus:outline-none"
+            />
+          </Field>
+        )}
 
         <div className="flex flex-col gap-2">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <span className="text-[12px] font-medium text-text-secondary">Items</span>
-            <div className="flex items-center gap-3">
+            {/* Primary actions: the two ways a line actually gets onto an order. Larger icon
+                and padding than the secondary controls above (customer, exchange rate), which
+                are set up once per order rather than used repeatedly. */}
+            <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={() => setScannerOpen(true)}
-                className="flex items-center gap-1 text-[12px] font-medium text-accent-blue hover:opacity-80"
+                onClick={() => setPickerOpen(true)}
+                className="flex items-center gap-2 rounded-xl bg-accent-blue p-3 text-base font-medium text-white hover:opacity-90"
               >
-                <ScanLine size={13} />
-                Scan barcode
+                <Plus className="h-6 w-6" />
+                Add product
               </button>
               <button
                 type="button"
-                onClick={addItem}
-                className="flex items-center gap-1 text-[12px] font-medium text-accent-blue hover:opacity-80"
+                onClick={() => setScannerOpen(true)}
+                className="flex items-center gap-2 rounded-xl bg-accent-blue/12 p-3 text-base font-medium text-accent-blue hover:bg-accent-blue/20"
               >
-                <Plus size={13} />
-                Add item
+                <ScanLine className="h-6 w-6" />
+                Scan barcode
               </button>
             </div>
           </div>
@@ -388,17 +424,12 @@ function OrderFormBody({ onClose, onSaved, customers, order = null }) {
                 )
               })()}
 
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-2 gap-2">
                 <NumberField
                   label="Qty"
                   value={item.quantity}
                   max={maxQuantityFor(items, index)}
                   onChange={(v) => updateItem(index, { quantity: v })}
-                />
-                <NumberField
-                  label="× per unit"
-                  value={item.unit_multiplier}
-                  onChange={(v) => updateItem(index, { unit_multiplier: v })}
                 />
                 <div>
                   <span className="mb-1 block text-[11px] text-text-tertiary">Unit price</span>
@@ -415,7 +446,16 @@ function OrderFormBody({ onClose, onSaved, customers, order = null }) {
 
         <div className="flex items-center justify-between rounded-xl bg-canvas-2 px-3 py-2 text-[13px]">
           <span className="text-text-secondary">Order total</span>
-          <span className="font-semibold text-text-primary tabular-nums">{formatAmount(total, exchangeRate)}</span>
+          <span className="flex flex-col items-end">
+            <span className="font-semibold text-text-primary tabular-nums">{formatAmount(total, exchangeRate)}</span>
+            {/* formatSecondary returns null with dual display off, so this line simply is not
+                rendered — the "hide every secondary total" rule lives in one place. */}
+            {formatSecondary(total, exchangeRate) && (
+              <span className="text-[11px] text-text-tertiary tabular-nums">
+                {formatSecondary(total, exchangeRate)}
+              </span>
+            )}
+          </span>
         </div>
 
         {errors.detail && <p className="text-[13px] text-accent-red">{errors.detail[0]}</p>}
@@ -445,6 +485,37 @@ function OrderFormBody({ onClose, onSaved, customers, order = null }) {
 
       {/* Outside the <form>: the scanner's own buttons default to type="submit". */}
       <BarcodeScannerModal open={scannerOpen} onClose={closeScanner} onScan={handleScan} />
+
+      {/* One-step add: picking a product appends it (or increments the line already holding
+          it) through the same applyScannedProduct the barcode path uses, so the stock cap and
+          the duplicate-line rule cannot drift between the two entry points. */}
+      <ProductSearchModal
+        open={pickerOpen}
+        onClose={() => setPickerOpen(false)}
+        onSelect={applyScannedProduct}
+        onCreateNew={() => setNewProductOpen(true)}
+      />
+
+      {/* Quick-create. Both render alongside this form rather than replacing it, and the
+          overlay stack (lib/overlayStack.js) keeps Escape from closing the order underneath —
+          losing entered line items to a stray keypress is the failure mode here. */}
+      <CustomerForm
+        open={newCustomerOpen}
+        onClose={() => setNewCustomerOpen(false)}
+        onSaved={(created) => {
+          if (created) {
+            onCustomerCreated(created)
+            setCustomer(String(created.id))
+          }
+        }}
+      />
+      <ProductForm
+        open={newProductOpen}
+        onClose={() => setNewProductOpen(false)}
+        onSaved={(created) => {
+          if (created) applyScannedProduct(created)
+        }}
+      />
     </>
   )
 }

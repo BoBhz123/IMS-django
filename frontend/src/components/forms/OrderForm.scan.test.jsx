@@ -46,11 +46,10 @@ async function scan(user) {
 }
 
 /**
- * The quantity input of a line. Spinbuttons run [exchange rate, qty, ×per unit, qty, …], so the
- * quantities are the even-indexed ones once the exchange rate is dropped.
+ * The quantity input of a line. Since unit_multiplier was removed there is exactly one
+ * spinbutton per line, so dropping the exchange rate leaves the quantities in order.
  */
-const lineQuantity = (index = 0) =>
-  screen.getAllByRole('spinbutton').slice(1).filter((_, i) => i % 2 === 0)[index]
+const lineQuantity = (index = 0) => screen.getAllByRole('spinbutton').slice(1)[index]
 
 describe('OrderForm barcode scanning', () => {
   beforeEach(() => {

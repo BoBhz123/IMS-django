@@ -342,9 +342,10 @@ class Command(BaseCommand):
                 PurchaseItem.objects.create(
                     purchase_order=purchase,
                     product=product,
-                    quantity=random.randint(1, 20),
+                    # Plain unit count; unit_multiplier was removed on 2026-08-24 and this
+                    # range covers the same spread of physical units directly.
+                    quantity=random.randint(1, 120),
                     unit_price=unit_price,
-                    unit_multiplier=random.choice([1, 1, 1, 6, 12]),
                 )
             created_ids.append(purchase.id)
 
@@ -371,9 +372,8 @@ class Command(BaseCommand):
                 OrderItem.objects.create(
                     order=order,
                     product=product,
-                    quantity=random.randint(1, 10),
+                    quantity=random.randint(1, 60),
                     unit_price=unit_price,
-                    unit_multiplier=random.choice([1, 1, 1, 6, 12]),
                 )
             created_ids.append(order.id)
 
