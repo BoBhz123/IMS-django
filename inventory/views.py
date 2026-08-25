@@ -18,7 +18,7 @@ from .filters import ProductFilter,PurchaseFilter,OrderFilter,ExpenseFilter
 from .pagination import DefaultPagination
 from .models import Product,Category,Supplier,Customer,Purchase,PurchaseItem,OrderItem,Order,Expense,LINE_TOTAL,LINE_COGS,generate_share_token
 from .csv_format import iso as _iso, money as _money, text as _csv_safe
-from .reporting import DateWindow
+from .reporting import DateWindow, settlement_totals, with_settlement
 from .serializers import *
 import csv
 
@@ -306,6 +306,12 @@ class AnalyticsView(APIView):
         outlays = purchases.aggregate(total=Sum(LINE_TOTAL))['total'] or 0
         expense_total = expenses.aggregate(total=Sum('amount'))['total'] or 0
 
+        # Separate queries, deliberately — see reporting.line_total_subquery. paid_amount is a
+        # column on the transaction, and summing it in the aggregate above (which joins
+        # `items`) would multiply it by each transaction's line count.
+        order_cash = settlement_totals(orders)
+        purchase_cash = settlement_totals(purchases)
+
         revenue = order_totals['total_revenue'] or 0
         cogs = order_totals['total_cogs'] or 0
         gross_profit = revenue - cogs
@@ -326,6 +332,26 @@ class AnalyticsView(APIView):
             # restocking timing. Named inventory_outlays rather than total_costs so it
             # cannot be misread as total_cogs.
             "inventory_outlays": outlays,
+            # Cash and settlement. These are the figures that move when a payment status
+            # changes; the P&L above deliberately does not.
+            #
+            # This app's books are accrual: a sale is revenue when it is placed, and its COGS
+            # is snapshotted at the same moment (OrderItem.unit_cost_price). Recognising
+            # revenue on collection instead would pair a partially collected order against
+            # its *whole* COGS and report a loss on a sale that was profitable — the cost is
+            # per line and known at once, the cash is per transaction and arrives later.
+            # Splitting the two into separate figures is what lets both be honest.
+            #
+            # collected + outstanding == total_revenue exactly, by construction.
+            "revenue_collected": order_cash['collected'],
+            "revenue_outstanding": order_cash['outstanding'],
+            "outlays_paid": purchase_cash['collected'],
+            "outlays_outstanding": purchase_cash['outstanding'],
+            # Cash actually in and out over the window. Expenses have no settlement state —
+            # an Expense row *is* money already spent — so they count in full.
+            "net_cash_flow": (
+                order_cash['collected'] - purchase_cash['collected'] - expense_total
+            ),
             "top_products": best_seller_query,
             # Catalog size, deliberately NOT date-filtered — it's "how many products exist",
             # not "how many were sold in this window". Served here so the dashboard's
@@ -366,7 +392,21 @@ class AnalyticsView(APIView):
         purchase_rows = totals_by_period(purchases, 'placed_at', total_costs=LINE_TOTAL)
         expense_rows = totals_by_period(expenses, 'spent_at', total_expenses='amount')
 
-        periods = sorted(set(order_rows) | set(purchase_rows) | set(expense_rows))
+        # Their own passes, for the same reason the summary splits them: these sum a column on
+        # the transaction, and the two queries above are fanned out across the `items` join.
+        order_cash_rows = totals_by_period(
+            with_settlement(orders), 'placed_at',
+            revenue_collected='settled_collected',
+            revenue_outstanding='settled_outstanding',
+        )
+        purchase_cash_rows = totals_by_period(
+            with_settlement(purchases), 'placed_at', outlays_paid='settled_collected',
+        )
+
+        periods = sorted(
+            set(order_rows) | set(purchase_rows) | set(expense_rows)
+            | set(order_cash_rows) | set(purchase_cash_rows)
+        )
 
         series = []
         for period in periods:
@@ -374,6 +414,8 @@ class AnalyticsView(APIView):
             cogs = order_rows.get(period, {}).get('total_cogs', 0)
             spent = expense_rows.get(period, {}).get('total_expenses', 0)
             gross_profit = revenue - cogs
+            collected = order_cash_rows.get(period, {}).get('revenue_collected', 0)
+            paid_out = purchase_cash_rows.get(period, {}).get('outlays_paid', 0)
             series.append({
                 "period": period.isoformat(),
                 "total_revenue": revenue,
@@ -386,6 +428,18 @@ class AnalyticsView(APIView):
                 # Allowed to be negative. A month with rent and no sales is a loss, and that
                 # is the month most worth seeing on a chart.
                 "net_profit": gross_profit - spent,
+                # The cash half, mirroring the summary. Bucketed by the transaction's own
+                # date, not by when the money arrived — this app records a settlement, not a
+                # dated payment ledger, so "collected" here means "collected against orders
+                # placed in this period". Enough to see whether a period's sales are actually
+                # being paid for; not enough to reconcile a bank statement, which would need
+                # a Payment model.
+                "revenue_collected": collected,
+                "revenue_outstanding": order_cash_rows.get(period, {}).get(
+                    'revenue_outstanding', 0,
+                ),
+                "outlays_paid": paid_out,
+                "net_cash_flow": collected - paid_out - spent,
             })
         return series
 

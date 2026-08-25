@@ -1237,6 +1237,306 @@ class AnalyticsFinancialsTests(AccountFixtureMixin, TestCase):
         self.assertIn('total_expenses', data['series'][0])
 
 
+class AnalyticsSettlementTests(AccountFixtureMixin, TestCase):
+    """
+    The cash half of the dashboard: what has actually been collected, and what is still owed.
+
+    Two rules hold across all of it:
+
+    * The P&L stays accrual. Revenue, COGS and both profit figures are what was invoiced, and
+      they do not move when a payment lands. Recognising revenue on collection would pair a
+      part-paid order against its whole COGS — the cost is per line and known at the sale, the
+      cash is per transaction and arrives later — and report a loss on a profitable sale.
+    * `collected + outstanding == total_revenue`, exactly, in every window.
+    """
+
+    def setUp(self):
+        self.account, self.user, self.client, self.header = self.make_account_user('cash')
+        self.category = Category.objects.create(name='Widgets', account=self.account)
+        self.product = Product.objects.create(
+            name='Widget', description='', cost_price='4.00', default_sell_price='10.00',
+            category=self.category, stock_quantity=1000, account=self.account,
+        )
+        self.supplier = Supplier.objects.create(name='Acme', account=self.account)
+
+    def analytics(self, **params):
+        response = self.client.get(
+            '/inventory/analytics/', params, HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.data
+
+    def money(self, data, key):
+        return Decimal(str(data[key]))
+
+    def sell(self, lines=((10, '10.00'),), paid=None, when=None):
+        """An order of one or more lines, optionally settled by `paid`."""
+        order = Order.objects.create(account=self.account, exchange_rate=89000)
+        OrderItem.objects.bulk_create([
+            OrderItem(
+                order=order, product=self.product, quantity=quantity,
+                unit_price=Decimal(unit_price), unit_cost_price=Decimal('4.00'),
+            )
+            for quantity, unit_price in lines
+        ])
+        if paid is not None:
+            order.paid_amount = Decimal(paid)
+            order.sync_payment_status()
+        if when:
+            Order.objects.filter(pk=order.pk).update(placed_at=when)
+        return order
+
+    def buy(self, quantity=50, unit_price='4.00', paid=None):
+        purchase = Purchase.objects.create(
+            account=self.account, supplier=self.supplier, exchange_rate=89000,
+        )
+        PurchaseItem.objects.create(
+            purchase_order=purchase, product=self.product, quantity=quantity,
+            unit_price=Decimal(unit_price),
+        )
+        if paid is not None:
+            purchase.paid_amount = Decimal(paid)
+            purchase.sync_payment_status()
+        return purchase
+
+    def assertBalances(self, data, revenue, collected, outstanding):
+        self.assertEqual(self.money(data, 'total_revenue'), Decimal(revenue))
+        self.assertEqual(self.money(data, 'revenue_collected'), Decimal(collected))
+        self.assertEqual(self.money(data, 'revenue_outstanding'), Decimal(outstanding))
+        # The invariant that lets the tiles be read as adding up.
+        self.assertEqual(
+            self.money(data, 'revenue_collected') + self.money(data, 'revenue_outstanding'),
+            self.money(data, 'total_revenue'),
+        )
+
+    # --- the three payment states -------------------------------------------------
+
+    def test_an_unpaid_order_is_revenue_but_not_cash(self):
+        self.sell()
+        self.assertBalances(self.analytics(), '100.00', '0.00', '100.00')
+
+    def test_a_fully_paid_order_is_collected_in_full(self):
+        self.sell(paid='100.00')
+        self.assertBalances(self.analytics(), '100.00', '100.00', '0.00')
+
+    def test_a_partially_paid_order_splits_across_both(self):
+        self.sell(paid='30.00')
+        self.assertBalances(self.analytics(), '100.00', '30.00', '70.00')
+
+    def test_the_three_states_add_up_together(self):
+        self.sell(paid='100.00')
+        self.sell(paid='30.00')
+        self.sell()
+        self.assertBalances(self.analytics(), '300.00', '130.00', '170.00')
+
+    # --- the arithmetic traps -----------------------------------------------------
+
+    def test_a_multi_line_order_is_not_counted_once_per_line(self):
+        """
+        The bug this whole module exists to prevent.
+
+        `paid_amount` lives on the order; revenue is summed across the `items` join. Sum both
+        in one aggregate and the join fans out, counting the payment once per line — a
+        three-line order paid $100 reports $300 collected. Nothing raises, revenue stays
+        right, and the error scales with basket size.
+        """
+        self.sell(lines=((10, '10.00'), (5, '4.00'), (2, '15.00')), paid='150.00')
+        self.assertBalances(self.analytics(), '150.00', '150.00', '0.00')
+
+    def test_overpayment_is_capped_rather_than_inflating_revenue(self):
+        # Rounding a cash sale up is routine here. The extra is a customer credit, not
+        # revenue, and counting it would break the collected + outstanding identity.
+        self.sell(paid='120.00')
+        self.assertBalances(self.analytics(), '100.00', '100.00', '0.00')
+
+    def test_one_overpaid_order_does_not_cancel_another_customers_debt(self):
+        # Clamping per row, not across the queryset. A global
+        # `Sum(total) - Sum(paid)` would net these to 80 and hide the unpaid order.
+        self.sell(paid='120.00')
+        self.sell()
+        self.assertBalances(self.analytics(), '200.00', '100.00', '100.00')
+
+    def test_an_order_with_no_lines_does_not_poison_the_sums(self):
+        # Coalesce on the line-total subquery: a NULL total would make every sum it joins NULL.
+        Order.objects.create(account=self.account, exchange_rate=89000)
+        self.sell(paid='40.00')
+        self.assertBalances(self.analytics(), '100.00', '40.00', '60.00')
+
+    def test_everything_is_zero_with_no_data(self):
+        data = self.analytics()
+        for key in ('revenue_collected', 'revenue_outstanding', 'outlays_paid',
+                    'outlays_outstanding', 'net_cash_flow'):
+            self.assertEqual(self.money(data, key), Decimal('0'))
+
+    # --- the P&L must not move ----------------------------------------------------
+
+    def test_payment_status_does_not_change_profit(self):
+        self.sell(paid='100.00')
+        paid = self.analytics()
+        Order.objects.all().delete()
+        self.sell()
+        unpaid = self.analytics()
+
+        for key in ('total_revenue', 'total_cogs', 'gross_profit', 'net_profit'):
+            self.assertEqual(
+                self.money(paid, key), self.money(unpaid, key),
+                f'{key} moved with payment status; the P&L is accrual and must not',
+            )
+
+    def test_net_profit_still_subtracts_cogs_and_expenses_only(self):
+        self.sell(paid='30.00')
+        Expense.objects.create(
+            account=self.account, description='Rent', amount=Decimal('25.00'),
+            category=ExpenseCategory.RENT,
+        )
+        self.buy(quantity=50, unit_price='4.00', paid='200.00')
+        data = self.analytics()
+
+        self.assertEqual(self.money(data, 'gross_profit'), Decimal('60.00'))
+        self.assertEqual(self.money(data, 'net_profit'), Decimal('35.00'))
+        # Restocking is cash flow, never a cost of what was sold.
+        self.assertEqual(self.money(data, 'inventory_outlays'), Decimal('200.00'))
+
+    # --- purchases ----------------------------------------------------------------
+
+    def test_purchase_settlement_is_reported_separately(self):
+        self.buy(quantity=50, unit_price='4.00', paid='50.00')
+        data = self.analytics()
+        self.assertEqual(self.money(data, 'inventory_outlays'), Decimal('200.00'))
+        self.assertEqual(self.money(data, 'outlays_paid'), Decimal('50.00'))
+        self.assertEqual(self.money(data, 'outlays_outstanding'), Decimal('150.00'))
+
+    def test_a_supplier_payment_is_not_multiplied_by_its_line_count(self):
+        purchase = Purchase.objects.create(
+            account=self.account, supplier=self.supplier, exchange_rate=89000,
+        )
+        PurchaseItem.objects.bulk_create([
+            PurchaseItem(
+                purchase_order=purchase, product=self.product, quantity=10,
+                unit_price=Decimal('4.00'),
+            ),
+            PurchaseItem(
+                purchase_order=purchase, product=self.product, quantity=5,
+                unit_price=Decimal('8.00'),
+            ),
+        ])
+        purchase.paid_amount = Decimal('80.00')
+        purchase.sync_payment_status()
+
+        data = self.analytics()
+        self.assertEqual(self.money(data, 'inventory_outlays'), Decimal('80.00'))
+        self.assertEqual(self.money(data, 'outlays_paid'), Decimal('80.00'))
+        self.assertEqual(self.money(data, 'outlays_outstanding'), Decimal('0.00'))
+
+    def test_net_cash_flow_is_money_in_minus_money_out(self):
+        self.sell(paid='100.00')
+        self.buy(quantity=10, unit_price='4.00', paid='40.00')
+        Expense.objects.create(
+            account=self.account, description='Rent', amount=Decimal('25.00'),
+            category=ExpenseCategory.RENT,
+        )
+        # 100 collected - 40 paid to the supplier - 25 spent.
+        self.assertEqual(self.money(self.analytics(), 'net_cash_flow'), Decimal('35.00'))
+
+    def test_net_cash_flow_may_be_negative(self):
+        # A month of restocking and slow-paying customers is exactly the month worth seeing.
+        self.sell()
+        self.buy(quantity=10, unit_price='4.00', paid='40.00')
+        self.assertEqual(self.money(self.analytics(), 'net_cash_flow'), Decimal('-40.00'))
+
+    # --- windowing and scoping ----------------------------------------------------
+
+    def test_the_date_window_reaches_the_cash_figures_too(self):
+        old = timezone.now() - timedelta(days=200)
+        self.sell(paid='100.00', when=old)
+        self.sell(paid='30.00')
+        self.assertBalances(self.analytics(period='last_month'), '100.00', '30.00', '70.00')
+
+    def test_cash_figures_are_account_scoped(self):
+        other_account, _, _, _ = self.make_account_user('cash2')
+        theirs = Order.objects.create(account=other_account, exchange_rate=89000)
+        their_product = Product.objects.create(
+            name='Theirs', description='', cost_price='1.00', default_sell_price='2.00',
+            category=Category.objects.create(name='C', account=other_account),
+            stock_quantity=10, account=other_account,
+        )
+        OrderItem.objects.create(
+            order=theirs, product=their_product, quantity=100,
+            unit_price=Decimal('9.99'), unit_cost_price=Decimal('1.00'),
+        )
+        theirs.paid_amount = Decimal('999.00')
+        theirs.sync_payment_status()
+
+        self.assertBalances(self.analytics(), '0', '0', '0')
+
+    # --- the series ---------------------------------------------------------------
+
+    def test_the_series_carries_the_cash_figures_per_period(self):
+        self.sell(paid='30.00')
+        self.buy(quantity=10, unit_price='4.00', paid='40.00')
+        row = self.analytics(group_by='month')['series'][0]
+
+        self.assertEqual(Decimal(str(row['revenue_collected'])), Decimal('30.00'))
+        self.assertEqual(Decimal(str(row['revenue_outstanding'])), Decimal('70.00'))
+        self.assertEqual(Decimal(str(row['outlays_paid'])), Decimal('40.00'))
+        self.assertEqual(Decimal(str(row['net_cash_flow'])), Decimal('-10.00'))
+
+    def test_a_period_with_only_a_purchase_still_appears(self):
+        # The period list is a union across every source. Leave the cash queries out of it
+        # and a month whose only activity was paying a supplier vanishes from the chart.
+        self.buy(quantity=10, unit_price='4.00', paid='40.00')
+        series = self.analytics(group_by='month')['series']
+        self.assertEqual(len(series), 1)
+        self.assertEqual(Decimal(str(series[0]['outlays_paid'])), Decimal('40.00'))
+
+    def test_series_cash_is_not_multiplied_by_line_count(self):
+        self.sell(lines=((10, '10.00'), (5, '4.00')), paid='120.00')
+        row = self.analytics(group_by='month')['series'][0]
+        self.assertEqual(Decimal(str(row['revenue_collected'])), Decimal('120.00'))
+
+    # --- the figures move when a payment is recorded ------------------------------
+
+    def test_recording_a_partial_payment_updates_the_dashboard(self):
+        order = self.sell()
+        self.assertBalances(self.analytics(), '100.00', '0.00', '100.00')
+
+        response = self.client.patch(
+            f'/inventory/orders/{order.id}/',
+            {'payment_status': 'PARTIALLY_PAID', 'paid_amount': '40.00'},
+            format='json', HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 200)
+
+        self.assertBalances(self.analytics(), '100.00', '40.00', '60.00')
+
+    def test_settling_an_order_in_full_updates_the_dashboard(self):
+        order = self.sell(paid='40.00')
+        response = self.client.patch(
+            f'/inventory/orders/{order.id}/',
+            {'payment_status': 'PAID'}, format='json', HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertBalances(self.analytics(), '100.00', '100.00', '0.00')
+
+    def test_editing_the_lines_of_a_paid_order_resettles_the_cash_figures(self):
+        """
+        `_settle_payment` re-derives the status on every write, so growing a paid order turns
+        it into a partially paid one — and the dashboard has to follow, not report the stale
+        column.
+        """
+        order = self.sell(paid='100.00')
+        response = self.client.patch(
+            f'/inventory/orders/{order.id}/',
+            {'items': [{'product': self.product.id, 'quantity': 20, 'unit_price': '10.00'}]},
+            format='json', HTTP_AUTHORIZATION=self.header,
+        )
+        self.assertEqual(response.status_code, 200)
+
+        order.refresh_from_db()
+        self.assertEqual(order.payment_status, PaymentStatus.PARTIALLY_PAID)
+        self.assertBalances(self.analytics(), '200.00', '100.00', '100.00')
+
+
 class ProductBarcodeTests(AccountFixtureMixin, TestCase):
     """
     An optional barcode, searchable through the same ?search= the products list already uses,
@@ -1896,6 +2196,10 @@ class AnalyticsSeriesProfitTests(AccountFixtureMixin, TestCase):
         expected = {
             'period', 'total_revenue', 'total_costs', 'total_cogs',
             'gross_profit', 'total_expenses', 'net_profit',
+            # The cash half. Same reasoning: a period the SPA gap-fills without these reads
+            # undefined, and fillSeriesGaps names every key explicitly for exactly that
+            # reason — extend both together, never loosen this to a subset check.
+            'revenue_collected', 'revenue_outstanding', 'outlays_paid', 'net_cash_flow',
         }
         rows = self.series()
         self.assertGreaterEqual(len(rows), 2)

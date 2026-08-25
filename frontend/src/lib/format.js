@@ -100,6 +100,12 @@ export function fillSeriesGaps(series, { start, end, stepDays }) {
       gross_profit: row?.gross_profit ?? 0,
       // ?? rather than ||: a real -80 must survive, and 0 is a legitimate value here.
       net_profit: row?.net_profit ?? 0,
+      // The cash half. A gap here means no transaction was placed in that bucket, so nothing
+      // was collected or owed against it — zero is the true value, not a missing one.
+      revenue_collected: row?.revenue_collected ?? 0,
+      revenue_outstanding: row?.revenue_outstanding ?? 0,
+      outlays_paid: row?.outlays_paid ?? 0,
+      net_cash_flow: row?.net_cash_flow ?? 0,
     })
     cursor.setUTCDate(cursor.getUTCDate() + stepDays)
   }

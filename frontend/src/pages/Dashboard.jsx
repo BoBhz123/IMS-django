@@ -43,6 +43,11 @@ function toChartSeries(series, granularity) {
     expenses: row.total_expenses ?? 0,
     grossProfit: row.gross_profit ?? 0,
     netProfit: row.net_profit ?? 0,
+    // Cash, as opposed to the accrued figures above. `revenue` is what was invoiced in the
+    // period; `collected` is how much of it has actually been paid.
+    collected: row.revenue_collected ?? 0,
+    outstanding: row.revenue_outstanding ?? 0,
+    netCashFlow: row.net_cash_flow ?? 0,
   }))
 }
 
@@ -291,7 +296,41 @@ export function Dashboard() {
           deltaLabel={deltaLabel}
           sparkline={sparkline.map((t) => t.cost)}
         />
-        <StatTile index={5} label="Products in catalog" value={productsCount.toLocaleString()} />
+        {/* The cash tiles. These are the ones that move when a payment is recorded — the
+            five above are accrual and deliberately do not, so a sale stays profitable while
+            the customer still owes for it. */}
+        <StatTile
+          index={5}
+          label="Collected"
+          value={formatAmount(money('value', 'revenue_collected'))}
+          delta={delta('revenue_collected', true)}
+          deltaLabel={deltaLabel}
+          sparkline={sparkline.map((t) => t.collected)}
+        />
+        <StatTile
+          index={6}
+          label="Owed to you"
+          value={formatAmount(money('value', 'revenue_outstanding'))}
+          delta={delta('revenue_outstanding', false)}
+          deltaLabel={deltaLabel}
+          sparkline={sparkline.map((t) => t.outstanding)}
+        />
+        <StatTile
+          index={7}
+          label="Owed to suppliers"
+          value={formatAmount(money('value', 'outlays_outstanding'))}
+          delta={delta('outlays_outstanding', false)}
+          deltaLabel={deltaLabel}
+        />
+        <StatTile
+          index={8}
+          label="Net cash flow"
+          value={formatAmount(money('value', 'net_cash_flow'))}
+          delta={delta('net_cash_flow', true)}
+          deltaLabel={deltaLabel}
+          sparkline={sparkline.map((t) => t.netCashFlow)}
+        />
+        <StatTile index={9} label="Products in catalog" value={productsCount.toLocaleString()} />
       </div>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
@@ -368,7 +407,7 @@ function DashboardSkeleton() {
   return (
     <div className="flex flex-col gap-6">
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-3">
-        {Array.from({ length: 6 }).map((_, i) => (
+        {Array.from({ length: 10 }).map((_, i) => (
           <div key={i} className="h-24 animate-pulse rounded-squircle bg-canvas-2" />
         ))}
       </div>

@@ -17,6 +17,7 @@ describe('fillSeriesGaps', () => {
     expect(filled[0]).toEqual({
       period: '2026-03-01', total_revenue: 0, total_costs: 0, total_expenses: 0,
       total_cogs: 0, gross_profit: 0, net_profit: 0,
+      revenue_collected: 0, revenue_outstanding: 0, outlays_paid: 0, net_cash_flow: 0,
     })
   })
 
@@ -64,6 +65,51 @@ describe('fillSeriesGaps profit keys', () => {
   it('preserves a negative net profit rather than zeroing it', () => {
     const loss = { ...row, net_profit: -80 }
     expect(fillSeriesGaps([loss], window)[1].net_profit).toBe(-80)
+  })
+})
+
+describe('fillSeriesGaps cash keys', () => {
+  const window = { start: '2026-03-01', end: '2026-03-03', stepDays: 1 }
+  const row = {
+    period: '2026-03-02',
+    total_revenue: 100, total_costs: 20, total_cogs: 40,
+    gross_profit: 60, total_expenses: 25, net_profit: 35,
+    revenue_collected: 30, revenue_outstanding: 70, outlays_paid: 20,
+    net_cash_flow: -15,
+  }
+
+  it('carries the collected, outstanding and cash-flow figures through', () => {
+    const filled = fillSeriesGaps([row], window)
+    expect(filled[1].revenue_collected).toBe(30)
+    expect(filled[1].revenue_outstanding).toBe(70)
+    expect(filled[1].outlays_paid).toBe(20)
+  })
+
+  it('preserves a negative net cash flow', () => {
+    // A month of restocking against slow-paying customers. `??` rather than `||` is what
+    // keeps this from becoming a flat zero.
+    expect(fillSeriesGaps([row], window)[1].net_cash_flow).toBe(-15)
+  })
+
+  it('zero-fills them for periods the API had no rows for', () => {
+    const filled = fillSeriesGaps([row], window)
+    expect(filled[0].revenue_collected).toBe(0)
+    expect(filled[0].revenue_outstanding).toBe(0)
+    expect(filled[0].outlays_paid).toBe(0)
+    expect(filled[0].net_cash_flow).toBe(0)
+  })
+
+  it('zero-fills a payload that predates the cash keys', () => {
+    // An older cached response, or a period the backend had nothing to report for. These
+    // must read 0, not undefined — an undefined in a sparkline makes Math.max return NaN and
+    // the line renders invisible with no error.
+    const bare = {
+      period: '2026-03-02', total_revenue: 100, total_costs: 20, total_cogs: 40,
+      gross_profit: 60, total_expenses: 25, net_profit: 35,
+    }
+    const filled = fillSeriesGaps([bare], window)
+    expect(filled[1].revenue_collected).toBe(0)
+    expect(filled[1].net_cash_flow).toBe(0)
   })
 })
 

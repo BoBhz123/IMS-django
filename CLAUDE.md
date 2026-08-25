@@ -588,6 +588,42 @@ every invoice printed as unpaid with a zero balance regardless of what had been 
 Out of scope by decision: per-line or per-order discounts, customer/supplier balances, and a
 whole-SPA restyle (Dashboard, Settings, Subscription, Login and Signup are untouched).
 
+### Dashboard cash & settlement figures — **done (2026-08-25)**
+
+Payment status now reaches the dashboard, without moving the P&L. `AnalyticsView` grew five
+summary keys and four series keys, and the SPA grew four tiles (Collected, Owed to you, Owed to
+suppliers, Net cash flow).
+
+**The books stay accrual, and that is the whole design decision.** Revenue is what was
+invoiced; COGS is the `OrderItem.unit_cost_price` snapshot taken at the sale. Recognising
+revenue on collection instead — the obvious reading of "revenue should reflect actual collected
+funds" — pairs a part-collected order against its *whole* COGS and reports a loss on a sale that
+was profitable, because the cost is per line and known immediately while the cash is per
+transaction and arrives later. So cash became a second, parallel set of figures rather than a
+redefinition of the first:
+
+| Accrual (unchanged by payment) | Cash (moves with payment) |
+| --- | --- |
+| `total_revenue`, `total_cogs`, `gross_profit`, `total_expenses`, `net_profit` | `revenue_collected`, `revenue_outstanding`, `outlays_paid`, `outlays_outstanding`, `net_cash_flow` |
+
+`inventory_outlays` keeps straddling neither: it is purchase spend, already outside the P&L.
+
+`revenue_collected + revenue_outstanding == total_revenue`, exactly, in every window — pinned by
+`assertBalances` in every `AnalyticsSettlementTests` case. That identity is the only reason the
+tiles can be read as adding up, and it is what forces the per-row clamping described in the
+Working Log below.
+
+The arithmetic lives in `inventory/reporting.py` (`line_total_subquery`, `with_settlement`,
+`settlement_totals`) beside `DateWindow`, for the same reason `DateWindow` is there: it has to be
+identical across every queryset a report touches, and it is testable without a view.
+
+**Not built, and it is the honest limit of this feature:** there is no payment ledger. `Order`
+and `Purchase` carry a single `paid_amount`, not dated payment rows, so the series buckets cash
+by the *transaction's* date — "collected against orders placed in this period", not "collected
+during this period". Enough to see whether a period's sales are being paid for; not enough to
+reconcile a bank statement. A real cash-flow statement needs a `Payment` model and is its own
+decision.
+
 ---
 
 # Working Log — mistakes, gotchas, anti-patterns
@@ -602,6 +638,30 @@ Append here when something bites. Do not repeat these.
   2,840 line items) carried a multiplier of 6 or 12, and nothing would have raised an error.
   `UnitMultiplierFoldMigrationTests` pins that the fold is lossless. **The fold is one-way**: 36 could
   have been 3x12, 6x6 or 36x1, and the factorisation was not recorded.
+- **Never sum a transaction column and a line expression in one aggregate.** This is the mirror
+  image of the "revenue and COGS must be summed in one `annotate()`" rule, and it bites in the
+  opposite direction. `orders.aggregate(revenue=Sum(LINE_TOTAL), collected=Sum('paid_amount'))`
+  fans out across the `items` join, so `paid_amount` — which lives on the *order* — is counted
+  once per line: a three-line order paid $100 reports $300 collected. Revenue stays correct, so
+  the only wrong number is the one with no second source to check it against, and the error
+  scales with basket size. `reporting.line_total_subquery` reaches the line total by correlated
+  subquery instead, so the outer query never joins `items`.
+- **Collected is capped and outstanding is floored *per row*, never across the queryset.**
+  `Sum(total) - Sum(paid)` looks equivalent and is not: one customer who rounded a cash payment
+  up silently cancels out another customer's real debt, and the dashboard reports less owed than
+  it is. `with_settlement` uses `Least`/`Greatest` per transaction, which also matches
+  `PaymentTrackedTransaction.remaining_amount`'s own clamp. The cap on collected is what keeps
+  `collected + outstanding == total_revenue` exact — an overpayment is a customer credit, not
+  revenue.
+- **The P&L must not move when a payment lands.** `AnalyticsSettlementTests.test_payment_status_does_not_change_profit`
+  exists because "make revenue reflect what was actually collected" is a natural-sounding request
+  that quietly breaks profit: COGS is snapshotted per line at the sale, so pairing it with
+  partial cash reports a loss on a profitable order. Cash is a parallel set of keys, never a
+  redefinition of the accrual ones. See the plan section above.
+- **A transaction with no line items must total 0, not NULL.** The `Coalesce` around
+  `line_total_subquery` is load-bearing — a NULL total propagates through `Least`/`Greatest` and
+  turns the whole account's collected figure NULL, which the view then renders as `0.00` with no
+  hint that anything was dropped. Reachable: `Order.objects.create()` with nothing added yet.
 - **`payment_status` is derived, never assigned.** `paid_amount` is the source of truth and
   `_settle_payment` (`inventory/serializers.py`) recomputes the status from it — including on an edit
   that changed only the line items, because moving the total can turn a PAID transaction into a
@@ -905,7 +965,14 @@ Append here when something bites. Do not repeat these.
 - **`fillSeriesGaps` (`frontend/src/lib/format.js`) drops any key it does not name.** Adding a field
   to the analytics `series` requires adding it there too, or the chart reads `undefined`, `Math.max`
   returns `NaN`, and the sparkline renders invisible with no error. The exact-match test on the
-  filled row shape is the guard — extend it, never loosen it.
+  filled row shape is the guard — extend it, never loosen it. It has a backend twin,
+  `AnalyticsSeriesProfitTests.test_every_period_row_has_every_key`, which asserts the row's key
+  set exactly; a new series field means editing both, and both were written to fail rather than
+  shrug.
+- **The series period list is a union over every source queryset.** `_build_series` unions the
+  order, purchase, expense *and* both cash groupings. Leave one out and a period whose only
+  activity was of that kind vanishes from the chart entirely — a month spent paying down supplier
+  invoices simply does not appear.
 - **Series money keys and summary money keys differ on purpose.** `series` rows use `total_costs` for
   purchases; the summary uses `inventory_outlays`. Both are correct in place, and the series has no
   equivalent of the summary's `total_cogs` naming hazard.
