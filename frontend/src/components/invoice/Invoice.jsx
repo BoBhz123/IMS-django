@@ -1,10 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { Check, Copy, Download, Printer, Send, Share2, X } from 'lucide-react'
 import {
+  buildShareSummary,
   canShareFiles,
   makeInvoiceFile,
   paymentLabel,
   shareInvoiceFile,
+  telegramShareUrl,
+  whatsappShareUrl,
 } from '@/lib/invoiceShare'
 import { invoicePdfBlob } from '@/lib/invoicePdf'
 import { Modal } from '@/components/ui/Modal'
@@ -146,31 +149,44 @@ export function Invoice({
   }
 
   /**
-   * Sends the invoice as a document — the PDF and nothing else.
+   * Sends the invoice: the PDF through the OS share sheet, or the link for the target.
    *
-   * There is no link in this path. The share carries the file and a title; it does not carry
-   * a URL back into this app, so what the recipient gets is the invoice rather than an
-   * invitation to open a web page. That also means the public share link is no longer
-   * involved in sending an invoice at all — it stays available under "Share invoice" and
-   * "Copy link" for anyone who does want a URL.
+   * Everything up to `navigator.share` runs synchronously inside the click — the PDF is
+   * built inline (lib/pdf.js is written to make that possible), `canShareFiles` is a plain
+   * check and `shareInvoiceFile` is deliberately not `async`. Any `await` before the call
+   * would move it off the gesture's call stack and mobile browsers would refuse it with
+   * NotAllowedError.
    *
-   * Where the platform cannot share files — Firefox, most desktop Linux — the fallback is a
-   * download, not a wa.me link. A wa.me link cannot attach the file, so opening one would
-   * deliver a web link under a button labelled "WhatsApp" and quietly reintroduce exactly
-   * what this replaced. A download leaves the reader holding the real document to attach.
+   * Where files cannot be shared this opens the target's own share URL with a short text
+   * summary. It does *not* download: a press on "WhatsApp" that silently drops a file into
+   * the downloads folder and opens nothing reads as a broken button. Downloading is what the
+   * "Download PDF" button is for, and it is the only thing that does it.
    */
-  function handleSendPdf() {
+  function handleSendPdf(buildTargetUrl) {
     const file = buildInvoiceFile()
+    const openTarget = () =>
+      window.open(
+        buildTargetUrl(
+          buildShareSummary({
+            reference: shortId(id),
+            sellerName: seller.name,
+            total,
+            formatPrimary: primary,
+          }),
+        ),
+        '_blank',
+        'noopener,noreferrer',
+      )
 
     if (!canShareFiles(file)) {
-      downloadPdfFile(file)
+      openTarget()
       return
     }
 
     shareInvoiceFile({ file, title: `Invoice #${shortId(id)}` }).then((result) => {
-      // A dismissal is the reader changing their mind and needs no recovery. A genuine
-      // failure still has to leave them with the document.
-      if (result === 'error') downloadPdfFile(file)
+      // A dismissal is the reader changing their mind — the sheet did open, so there is
+      // nothing to recover. A genuine failure falls through to the link.
+      if (result === 'error') openTarget()
     })
   }
 
@@ -245,14 +261,13 @@ export function Invoice({
             Download PDF
           </button>
 
-          {/* Sending the document. Both targets do the same thing — hand the PDF to the OS
-              share sheet — because no web page can preselect an app for a file share; the
-              sheet belongs to the OS and the reader picks from it. They are kept as two
-              familiar affordances rather than one "Send" button, and neither depends on a
-              public share link existing. */}
+          {/* Sending the document. On a platform that can share files both hand the PDF to
+              the OS share sheet — no web page can preselect an app for a file share, so the
+              reader picks the target there. Where it cannot, each falls back to its own
+              share URL with a text summary, which is why they take different builders. */}
           <button
             type="button"
-            onClick={handleSendPdf}
+            onClick={() => handleSendPdf(whatsappShareUrl)}
             className="flex items-center gap-1.5 rounded-xl bg-[#25D366] px-3 py-1.5 text-[13px] font-semibold text-white hover:opacity-90"
           >
             <Share2 size={14} />
@@ -260,7 +275,7 @@ export function Invoice({
           </button>
           <button
             type="button"
-            onClick={handleSendPdf}
+            onClick={() => handleSendPdf(telegramShareUrl)}
             className="flex items-center gap-1.5 rounded-xl bg-[#229ED9] px-3 py-1.5 text-[13px] font-semibold text-white hover:opacity-90"
           >
             <Send size={14} />

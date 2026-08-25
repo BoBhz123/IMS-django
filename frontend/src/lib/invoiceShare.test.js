@@ -1,10 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  buildShareSummary,
   canShareFiles,
   makeInvoiceFile,
   paymentLabel,
   shareInvoiceFile,
+  telegramShareUrl,
+  whatsappShareUrl,
 } from './invoiceShare'
+
+const usd = (value) => `$${Number(value).toFixed(2)}`
 
 describe('paymentLabel', () => {
   it('spells out a partial payment', () => {
@@ -15,6 +20,42 @@ describe('paymentLabel', () => {
     // An older cached payload, or a status added server-side before the SPA ships. Reading
     // "UNPAID" is the safe wrong answer; rendering "undefined" on an invoice is not.
     expect(paymentLabel(undefined)).toBe('UNPAID')
+  })
+})
+
+describe('the text fallback', () => {
+  const base = { reference: 'A3F2B1C9', sellerName: 'Acme Trading', total: 148, formatPrimary: usd }
+
+  it('summarises the invoice in one line', () => {
+    expect(buildShareSummary(base)).toBe('Invoice #A3F2B1C9 — Acme Trading · Total: $148.00')
+  })
+
+  it('reads correctly with no seller name on the account', () => {
+    // No dangling separator with nothing after it.
+    expect(buildShareSummary({ ...base, sellerName: '' }))
+      .toBe('Invoice #A3F2B1C9 · Total: $148.00')
+  })
+
+  it('renders the total in the account display currency', () => {
+    const lbp = buildShareSummary({ ...base, formatPrimary: () => '13,172,000 LBP' })
+    expect(lbp).toContain('13,172,000 LBP')
+  })
+
+  it('never carries a URL back into the app', () => {
+    // The summary is the whole message on the fallback path, so a link smuggled in here
+    // would reach exactly the recipients the change was meant to stop sending links to.
+    expect(buildShareSummary(base)).not.toMatch(/http|myimsapp/)
+  })
+
+  it('encodes the whole summary into wa.me', () => {
+    expect(whatsappShareUrl('Invoice #A3F2 · Total: $10.00'))
+      .toBe('https://wa.me/?text=Invoice%20%23A3F2%20%C2%B7%20Total%3A%20%2410.00')
+  })
+
+  it('sends the summary to telegram as text with an empty url', () => {
+    const params = new URLSearchParams(telegramShareUrl('Invoice #A3F2').split('?')[1])
+    expect(params.get('text')).toBe('Invoice #A3F2')
+    expect(params.get('url')).toBe('')
   })
 })
 
@@ -44,8 +85,8 @@ describe('sharing the document itself', () => {
   })
 
   it('reports no file sharing on a browser without the Web Share API', () => {
-    // Firefox and most desktop Linux. The caller downloads the PDF there rather than
-    // opening a share URL, which could not carry the file anyway.
+    // Firefox and most desktop Linux. The caller opens the wa.me / t.me link with a text
+    // summary there — it does not download, which would look like a broken button.
     expect(canShareFiles(pdf())).toBe(false)
   })
 
@@ -86,6 +127,19 @@ describe('sharing the document itself', () => {
 
     expect(share).toHaveBeenCalledWith({ files: [file], title: 'Invoice #A3F2B1C9' })
     expect(Object.keys(share.mock.calls[0][0])).not.toContain('text')
+  })
+
+  it('calls navigator.share synchronously, inside the click gesture', () => {
+    // Load-bearing: browsers decide whether a share is user-initiated from the call stack,
+    // and an await anywhere before the call moves it to a microtask where Safari and Chrome
+    // on Android reject it with NotAllowedError. Asserted by checking the call has already
+    // happened before control returns — an `async` shareInvoiceFile would fail this.
+    const share = vi.fn().mockResolvedValue(undefined)
+    installShare({ share, canShare: () => true })
+
+    shareInvoiceFile({ file: pdf(), title: 'Invoice #A3F2B1C9' })
+
+    expect(share).toHaveBeenCalledTimes(1)
   })
 
   it('does not attempt a share the platform cannot do', async () => {

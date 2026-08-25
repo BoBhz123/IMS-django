@@ -290,14 +290,15 @@ describe('Invoice PDF sharing', () => {
     expect(share.mock.calls[0][0].text).toBeUndefined()
   })
 
-  it('downloads the PDF where the platform cannot share files', async () => {
-    // Firefox and most desktop Linux. A wa.me link cannot attach the file, so opening one
-    // would deliver a web link from a button labelled WhatsApp. The download leaves the
-    // reader holding the real document instead.
+  it('opens the WhatsApp link with a summary where files cannot be shared', async () => {
+    // Firefox and most desktop Linux. It must NOT download here — a press on WhatsApp that
+    // silently drops a file in the downloads folder and opens nothing reads as broken.
     const user = userEvent.setup()
     const share = vi.fn()
+    const open = vi.fn()
     const createObjectURL = vi.fn(() => 'blob:invoice')
     installShare({ canShare: () => false, share })
+    vi.stubGlobal('open', open)
     vi.stubGlobal('URL', Object.assign(Object.create(URL), {
       createObjectURL, revokeObjectURL: vi.fn(),
     }))
@@ -306,18 +307,42 @@ describe('Invoice PDF sharing', () => {
     await user.click(screen.getByRole('button', { name: /whatsapp/i }))
 
     expect(share).not.toHaveBeenCalled()
-    expect(createObjectURL).toHaveBeenCalledTimes(1)
-    expect(createObjectURL.mock.calls[0][0].type).toBe('application/pdf')
+    expect(createObjectURL).not.toHaveBeenCalled()
+    expect(open).toHaveBeenCalledTimes(1)
+
+    const [url] = open.mock.calls[0]
+    expect(url).toContain('https://wa.me/?text=')
+    const text = decodeURIComponent(url.split('text=')[1])
+    expect(text).toContain('Invoice #C7BD9F4A')
+    expect(text).toContain('$98.00')
+    // Still no URL back into this app, even though this invoice has a live share token.
+    expect(text).not.toContain('myimsapp.com')
     vi.unstubAllGlobals()
   })
 
-  it('falls back to a download when the share sheet itself fails', async () => {
+  it('opens the Telegram link where files cannot be shared', async () => {
     const user = userEvent.setup()
+    const open = vi.fn()
+    installShare({ canShare: () => false, share: vi.fn() })
+    vi.stubGlobal('open', open)
+
+    renderInvoice({})
+    await user.click(screen.getByRole('button', { name: /telegram/i }))
+
+    expect(open).toHaveBeenCalledTimes(1)
+    expect(open.mock.calls[0][0]).toContain('t.me/share/url')
+    vi.unstubAllGlobals()
+  })
+
+  it('falls back to the link when the share sheet itself fails', async () => {
+    const user = userEvent.setup()
+    const open = vi.fn()
     const createObjectURL = vi.fn(() => 'blob:invoice')
     installShare({
       canShare: () => true,
       share: vi.fn().mockRejectedValue(new Error('NotAllowedError')),
     })
+    vi.stubGlobal('open', open)
     vi.stubGlobal('URL', Object.assign(Object.create(URL), {
       createObjectURL, revokeObjectURL: vi.fn(),
     }))
@@ -325,17 +350,20 @@ describe('Invoice PDF sharing', () => {
     renderInvoice({})
     await user.click(screen.getByRole('button', { name: /telegram/i }))
 
-    expect(createObjectURL).toHaveBeenCalledTimes(1)
+    expect(open).toHaveBeenCalledTimes(1)
+    expect(createObjectURL).not.toHaveBeenCalled()
     vi.unstubAllGlobals()
   })
 
-  it('does not download when the reader simply dismisses the share sheet', async () => {
-    // A dismissal is a decision, not a failure — pushing a file into the downloads folder
-    // because somebody closed the sheet is the wrong recovery.
+  it('does nothing further when the reader dismisses the share sheet', async () => {
+    // The sheet did open — a dismissal is a decision, not a failure, and must not be
+    // "recovered" by opening a web link or pushing a file into the downloads folder.
     const user = userEvent.setup()
+    const open = vi.fn()
     const createObjectURL = vi.fn(() => 'blob:invoice')
     const abort = Object.assign(new Error('cancelled'), { name: 'AbortError' })
     installShare({ canShare: () => true, share: vi.fn().mockRejectedValue(abort) })
+    vi.stubGlobal('open', open)
     vi.stubGlobal('URL', Object.assign(Object.create(URL), {
       createObjectURL, revokeObjectURL: vi.fn(),
     }))
@@ -343,7 +371,27 @@ describe('Invoice PDF sharing', () => {
     renderInvoice({})
     await user.click(screen.getByRole('button', { name: /whatsapp/i }))
 
+    expect(open).not.toHaveBeenCalled()
     expect(createObjectURL).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('reserves the download for the Download PDF button alone', async () => {
+    const user = userEvent.setup()
+    const open = vi.fn()
+    const createObjectURL = vi.fn(() => 'blob:invoice')
+    installShare({ canShare: () => false, share: vi.fn() })
+    vi.stubGlobal('open', open)
+    vi.stubGlobal('URL', Object.assign(Object.create(URL), {
+      createObjectURL, revokeObjectURL: vi.fn(),
+    }))
+
+    renderInvoice({})
+    await user.click(screen.getByRole('button', { name: /download pdf/i }))
+
+    expect(createObjectURL).toHaveBeenCalledTimes(1)
+    expect(createObjectURL.mock.calls[0][0].type).toBe('application/pdf')
+    expect(open).not.toHaveBeenCalled()
     vi.unstubAllGlobals()
   })
 

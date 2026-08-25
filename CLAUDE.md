@@ -1274,14 +1274,24 @@ Append here when something bites. Do not repeat these.
   PDF has to go through the Web Share API, which opens the OS sheet and lets the *user* pick the
   target. Both buttons therefore do exactly the same thing, and that is not a bug to be tidied
   into one button: they are two familiar affordances onto one sheet.
-- **The invoice share carries the PDF and no link, by decision (2026-08-26).** `buildShareMessage`,
-  `whatsappShareUrl` and `telegramShareUrl` were deleted, not deprecated — a share must not deliver
-  a URL back into this app under a button labelled WhatsApp. The payload is
-  `{ files: [pdf], title }` with **no `text`**, and `shareInvoiceFile` omits absent keys rather than
-  passing `text: undefined`, which some implementations validate against.
-  Where file sharing is unsupported (Firefox, most desktop Linux) the fallback is a **download**,
-  never a `wa.me` link — reopening that path is what the change existed to stop. A dismissed sheet
-  (`AbortError`) must *not* trigger the download; only a real failure does.
+- **The invoice share carries the PDF; the fallback carries a text summary (2026-08-26).** The
+  share payload is `{ files: [pdf], title }` with **no `text`**, and `shareInvoiceFile` omits absent
+  keys rather than passing `text: undefined`, which some implementations validate against. Where
+  file sharing is unsupported (Firefox, most desktop Linux) each button opens its own
+  `wa.me` / `t.me` link with `buildShareSummary` — one line, reference + seller + total, and **no
+  URL back into this app**; that part of the earlier decision stands and is pinned by a test.
+  **The fallback must not be a silent download.** It briefly was, and it reads as a broken button:
+  a press on "WhatsApp" that drops a file in the downloads folder and opens nothing. Downloading
+  belongs to the "Download PDF" button and to nothing else. A dismissed sheet (`AbortError`) does
+  nothing at all — the sheet opened, so there is nothing to recover; only a real failure falls
+  through to the link.
+- **`shareInvoiceFile` must not be an `async function`.** Browsers decide whether a share is
+  user-initiated from the call stack, and an `await` anywhere before `navigator.share` — even on an
+  already-resolved value — moves the call into a microtask, where Safari and Chrome on Android
+  reject it with `NotAllowedError`. It returns the promise instead of awaiting it, and the whole
+  path from the click through `buildInvoiceFile` (why `lib/pdf.js` is synchronous) to
+  `navigator.share` is one unbroken synchronous stack. There is a test that fails if `async` comes
+  back.
 - **The send buttons are deliberately not gated on `shareUrl`.** They were, while they still built
   link-based messages. Now that they carry only the PDF, gating them would force every send to first
   mint a public share token — publishing the customer's details to an unauthenticated URL that is
