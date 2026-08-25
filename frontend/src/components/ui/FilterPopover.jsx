@@ -32,7 +32,10 @@ export function FilterPopover({
 }) {
   const [open, setOpen] = useState(false)
   const containerRef = useRef(null)
-  const { isTop } = useOverlayLayer(open)
+  // Escape ordering yes, scroll lock no — see the hook. This popover is anchored to a header
+  // button and dims nothing, so freezing the page would freeze the very table the user opened
+  // it to filter.
+  const { isTop } = useOverlayLayer(open, { lockScroll: false })
 
   useEffect(() => {
     if (!open) return undefined

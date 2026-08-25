@@ -667,6 +667,27 @@ outstanding balance as a badge, Net profit with gross margin, Collected, Net cas
 products. Ten equally weighted tiles had no entry point — the figure a shopkeeper opens the app
 for competed with the catalog size for attention.
 
+### Currency switcher consolidated into one toggle — **done (2026-08-25)**
+
+`components/ui/CurrencyToggle.jsx` is the single display-currency control, used by both the dock
+(`placement="right"`) and the mobile window header (`placement="bottom"`). One press flips the
+view currency; there is no menu.
+
+A dropdown picker was built first and **removed the same day at the owner's direction**. Don't
+reintroduce it: for a two-item list a menu costs two interactions where one will do. What the
+dropdown was solving is kept — the button shows the currency **code** (`USD` / `LBP`) beside the
+symbol, where it previously showed a bare `$` or `ل.ل`. A lone glyph is ambiguous in the one way
+that matters: it reads equally as "you are in dollars" and "press for dollars", which are
+opposite claims, and nothing else on screen settled it.
+
+The accessible name carries what the visible label cannot — `Currency: US Dollar. Switch to
+Lebanese Pound.` The previous label was only the action ("Show in LBP"), which reads as the
+current mode to anyone who never sees the glyph.
+
+`enableDualCurrency` off renders **nothing** rather than a disabled control: the account is
+strictly single-currency then, so a switch is offering something that does not exist. That rule
+now lives in the component, so the two surfaces cannot disagree about it.
+
 ---
 
 # Working Log — mistakes, gotchas, anti-patterns
@@ -774,6 +795,17 @@ Append here when something bites. Do not repeat these.
   the database one forgotten filter away from still opening the door.
 - **Re-sharing an already-shared order returns the same token.** Minting a fresh one would silently
   cut off the customer who was sent the link yesterday.
+- **`useOverlayLayer` does two separable jobs, and popovers want only one.** Escape ordering is
+  wanted by every overlay; freezing the page behind it is wanted only by the ones that cover it.
+  The refcounted scroll lock was added unconditionally, so `FilterPopover` inherited a body lock
+  its own doc comment said it must not have — opening a filter panel silently froze the table
+  the user opened it to filter. Pass `{ lockScroll: false }` for anchored chrome. The release
+  must be gated on the same flag: a layer that never acquired must not release, or closing a
+  popover opened over a modal hands scrolling back while the modal still covers the page.
+- **A `role="option"` and its click handler must be on the same element.** Putting the role on
+  the `<li>` and the handler on a `<button>` inside it produces a control that does nothing when
+  the option is activated — a click on a parent never reaches a child. Same for `menuitem`,
+  `tab`, and anything else a test or a screen reader activates by role.
 - **Escape closes the topmost overlay only** (`lib/overlayStack.js` + `hooks/useOverlayLayer.js`).
   Modal and SlideOver each bind their own document listener; before the stack existed, one Escape
   inside a quick-create modal also closed the order form underneath it and discarded every entered
