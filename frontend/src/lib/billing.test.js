@@ -11,6 +11,7 @@ import {
   subscriptionBadge,
   telegramUrl,
   trialBannerMessage,
+  trialDaysRemaining,
   whatsappUrl,
 } from '@/lib/billing'
 
@@ -133,6 +134,83 @@ describe('trialBannerMessage', () => {
   })
 })
 
+describe('trialDaysRemaining', () => {
+  // Built in *local* time, because the count is in local calendar days — a UTC literal would
+  // make these tests pass or fail depending on the machine's timezone.
+  const NOW = new Date(2026, 7, 25, 10, 0, 0).getTime()
+
+  function endingIn(ms) {
+    return { is_trial: true, trial_ends_at: new Date(NOW + ms).toISOString() }
+  }
+
+  const HOUR = 60 * 60 * 1000
+  const DAY = 24 * HOUR
+
+  it('counts whole days to the deadline', () => {
+    expect(trialDaysRemaining(endingIn(9 * DAY), NOW)).toBe(9)
+  })
+
+  it('counts calendar days, not elapsed 24-hour blocks', () => {
+    // 30 hours from 10:00 lands at 16:00 tomorrow — one sleep away, so "1 day left".
+    expect(trialDaysRemaining(endingIn(30 * HOUR), NOW)).toBe(1)
+    // Later today is zero days, however many hours that is. This is the case a raw
+    // millisecond division gets wrong whichever way it rounds.
+    expect(trialDaysRemaining(endingIn(HOUR), NOW)).toBe(0)
+    expect(trialDaysRemaining(endingIn(13 * HOUR), NOW)).toBe(0)
+  })
+
+  it('clamps an elapsed trial at zero rather than going negative', () => {
+    expect(trialDaysRemaining(endingIn(-3 * DAY), NOW)).toBe(0)
+  })
+
+  it('recomputes from the same payload as time passes', () => {
+    // The whole point. `trial_days_remaining` is a snapshot taken when the payload was
+    // fetched; a tab left open overnight would keep reporting it. Same account object, two
+    // different clocks, two different answers.
+    const account = endingIn(5 * DAY)
+    expect(trialDaysRemaining(account, NOW)).toBe(5)
+    expect(trialDaysRemaining(account, NOW + 3 * DAY)).toBe(2)
+  })
+
+  it('prefers the timestamp over the server’s day count when they disagree', () => {
+    // They disagree exactly when the snapshot has gone stale, and the timestamp is the one
+    // that is still true.
+    const stale = { ...endingIn(2 * DAY), trial_days_remaining: 14 }
+    expect(trialDaysRemaining(stale, NOW)).toBe(2)
+  })
+
+  it('falls back to the server count when there is no timestamp', () => {
+    expect(trialDaysRemaining({ is_trial: true, trial_days_remaining: 6 }, NOW)).toBe(6)
+    expect(trialDaysRemaining({ is_trial: true, trial_ends_at: null }, NOW)).toBeNull()
+  })
+
+  it('ignores an unparseable timestamp rather than reporting NaN days', () => {
+    const broken = { is_trial: true, trial_ends_at: 'not a date', trial_days_remaining: 4 }
+    expect(trialDaysRemaining(broken, NOW)).toBe(4)
+  })
+})
+
+describe('trialBannerMessage with a deadline', () => {
+  const NOW = new Date(2026, 7, 25, 10, 0, 0).getTime()
+  const DAY = 24 * 60 * 60 * 1000
+
+  it('distinguishes “ends today” from “has ended”', () => {
+    // Both are 0 days, and they need different words: an elapsed trial is still reported as
+    // is_trial until something refetches, and telling that user it "ends today" invites them
+    // to keep working against an app that has already locked them out.
+    const endsLater = { is_trial: true, trial_ends_at: new Date(NOW + 60_000).toISOString() }
+    const alreadyOver = { is_trial: true, trial_ends_at: new Date(NOW - DAY).toISOString() }
+
+    expect(trialBannerMessage(endsLater, NOW)).toBe('Your free trial ends today.')
+    expect(trialBannerMessage(alreadyOver, NOW)).toBe('Your free trial has ended.')
+  })
+
+  it('counts down from the deadline', () => {
+    const account = { is_trial: true, trial_ends_at: new Date(NOW + 4 * DAY).toISOString() }
+    expect(trialBannerMessage(account, NOW)).toBe('4 days left in your free trial.')
+  })
+})
+
 describe('isTrialUrgent', () => {
   it('stays quiet early in the trial', () => {
     // A fortnight-long banner that shouts from day one is a banner users stop seeing.
@@ -145,6 +223,17 @@ describe('isTrialUrgent', () => {
 
   it('is never urgent for a paid account', () => {
     expect(isTrialUrgent({ is_trial: false, trial_days_remaining: 0 })).toBe(false)
+  })
+
+  it('escalates off the deadline, not the stale day count', () => {
+    const NOW = new Date(2026, 7, 25, 10, 0, 0).getTime()
+    const DAY = 24 * 60 * 60 * 1000
+    const account = {
+      is_trial: true,
+      trial_ends_at: new Date(NOW + 2 * DAY).toISOString(),
+      trial_days_remaining: 14,
+    }
+    expect(isTrialUrgent(account, 3, NOW)).toBe(true)
   })
 })
 

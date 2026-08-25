@@ -1,7 +1,11 @@
+import { memo } from 'react'
 import { ArrowDownRight, ArrowUpRight } from 'lucide-react'
 import { GlassCard } from './GlassCard'
+import { Sparkline } from './Sparkline'
 
-export function StatTile({ label, value, delta, sparkline, index = 0, deltaLabel = 'vs. last month' }) {
+export const StatTile = memo(function StatTile({
+  label, value, delta, sparkline, index = 0, deltaLabel = 'vs. last month',
+}) {
   const hasDelta = delta && Number.isFinite(delta.percent)
   const isGood = hasDelta && (delta.direction === 'up') === delta.goodWhenUp
   const DeltaIcon = delta?.direction === 'down' ? ArrowDownRight : ArrowUpRight
@@ -35,28 +39,4 @@ export function StatTile({ label, value, delta, sparkline, index = 0, deltaLabel
       {hasDelta && <span className="text-[12px] text-text-tertiary">{deltaLabel}</span>}
     </GlassCard>
   )
-}
-
-function Sparkline({ data }) {
-  const max = Math.max(...data)
-  const min = Math.min(...data)
-  const range = max - min || 1
-  const width = 56
-  const height = 22
-  const points = data
-    .map((value, index) => {
-      const x = (index / (data.length - 1)) * width
-      const y = height - ((value - min) / range) * height
-      return `${x},${y}`
-    })
-    .join(' ')
-  const lastX = width
-  const lastY = height - ((data.at(-1) - min) / range) * height
-
-  return (
-    <svg width={width} height={height} className="shrink-0 overflow-visible" aria-hidden="true">
-      <polyline points={points} fill="none" stroke="var(--text-tertiary)" strokeWidth="1.5" opacity="0.5" />
-      <circle cx={lastX} cy={lastY} r="2.5" fill="var(--accent-blue)" stroke="var(--chart-surface)" strokeWidth="1.5" />
-    </svg>
-  )
-}
+})

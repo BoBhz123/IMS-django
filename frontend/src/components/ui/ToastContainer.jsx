@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import { AlertCircle, CheckCircle2, X } from 'lucide-react'
@@ -8,14 +8,29 @@ const AUTO_DISMISS_MS = 5000
 
 export function ToastContainer() {
   const [toasts, setToasts] = useState([])
+  // Every pending auto-dismiss, so unmounting can cancel all of them. Unsubscribing from the
+  // toast bus stopped new toasts arriving but left the timers already scheduled — each holding
+  // this component's setState for up to five seconds after it was gone. Rare in the app (the
+  // container is mounted for the session) and constant in tests, where a file that raises a
+  // few toasts leaves them firing into the next test's timers.
+  const dismissTimers = useRef(new Set())
 
   useEffect(() => {
-    return subscribeToasts((toast) => {
+    const unsubscribe = subscribeToasts((toast) => {
       setToasts((current) => [...current, toast])
-      setTimeout(() => {
+      const timer = setTimeout(() => {
+        dismissTimers.current.delete(timer)
         setToasts((current) => current.filter((t) => t.id !== toast.id))
       }, AUTO_DISMISS_MS)
+      dismissTimers.current.add(timer)
     })
+
+    const timers = dismissTimers.current
+    return () => {
+      unsubscribe()
+      timers.forEach(clearTimeout)
+      timers.clear()
+    }
   }, [])
 
   function dismiss(id) {

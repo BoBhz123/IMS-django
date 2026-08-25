@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import { api, tokenStore } from '@/lib/api'
 
 // Exported so a consumer that must tolerate having no session — useSellerIdentity, which
@@ -14,7 +14,7 @@ export function AuthProvider({ children }) {
   // Both calls are needed before the app can render: the router decides which onboarding
   // screen to show from the account's subscription status, so fetching it lazily would flash
   // the dashboard at an unpaid account.
-  async function loadSession() {
+  const loadSession = useCallback(async () => {
     const [{ data: me }, { data: accountData }] = await Promise.all([
       api.get('/auth/users/me/'),
       api.get('/accounts/subscription/'),
@@ -23,7 +23,7 @@ export function AuthProvider({ children }) {
     setAccount(accountData)
     setStatus('authenticated')
     return accountData
-  }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -47,15 +47,18 @@ export function AuthProvider({ children }) {
     return () => {
       cancelled = true
     }
-  }, [])
+    // loadSession is a useCallback with no dependencies, so this still runs exactly once on
+    // mount. Listed rather than omitted so the dependency is honest — if loadSession ever
+    // gains a dependency, this effect needs to know.
+  }, [loadSession])
 
-  async function login(username, password) {
+  const login = useCallback(async (username, password) => {
     const { data } = await api.post('/auth/jwt/create/', { username, password })
     tokenStore.set(data.access, data.refresh)
     await loadSession()
-  }
+  }, [loadSession])
 
-  async function register({ email, password, phone, businessName }) {
+  const register = useCallback(async ({ email, password, phone, businessName }) => {
     await api.post('/auth/users/', {
       email,
       password,
@@ -65,7 +68,7 @@ export function AuthProvider({ children }) {
     // The email is the username: AUTH_USER_MODEL was not swapped, so simplejwt still
     // authenticates against the username column.
     await login(email, password)
-  }
+  }, [login])
 
   /**
    * Throw away an unverified sign-up and return to anonymous.
@@ -78,7 +81,7 @@ export function AuthProvider({ children }) {
    * No /auth/jwt/blacklist/ call, unlike logout: the user row is deleted, which cascades its
    * outstanding tokens, so there is nothing left to blacklist and the request would only 401.
    */
-  async function abandonRegistration() {
+  const abandonRegistration = useCallback(async () => {
     try {
       await api.post('/accounts/abandon-registration/')
     } catch {
@@ -89,15 +92,15 @@ export function AuthProvider({ children }) {
     setUser(null)
     setAccount(null)
     setStatus('anonymous')
-  }
+  }, [])
 
-  async function refreshAccount() {
+  const refreshAccount = useCallback(async () => {
     const { data } = await api.get('/accounts/subscription/')
     setAccount(data)
     return data
-  }
+  }, [])
 
-  async function logout() {
+  const logout = useCallback(async () => {
     const refresh = tokenStore.getRefresh()
     tokenStore.clear()
     setUser(null)
@@ -111,24 +114,30 @@ export function AuthProvider({ children }) {
         // Token may already be expired/rotated — logout has already cleared local state either way.
       }
     }
-  }
+  }, [])
 
-  return (
-    <AuthContext.Provider
-      value={{
-        user,
-        account,
-        status,
-        login,
-        register,
-        refreshAccount,
-        abandonRegistration,
-        logout,
-      }}
-    >
-      {children}
-    </AuthContext.Provider>
+  // Memoised, and every action above is a useCallback, because this context sits at the root
+  // of the tree: a fresh object here re-renders every consumer in the app. Before this, the
+  // object literal was rebuilt on each render of the provider, so the identity changed even
+  // when nothing about the session had — and any state change anywhere above a consumer
+  // cascaded through the whole SPA. That is the cost that shows up as a stutter on the way
+  // back to an idle tab, when the session refresh lands and the tree redraws for a payload
+  // that is usually byte-identical to the one it already had.
+  const value = useMemo(
+    () => ({
+      user,
+      account,
+      status,
+      login,
+      register,
+      refreshAccount,
+      abandonRegistration,
+      logout,
+    }),
+    [user, account, status, login, register, refreshAccount, abandonRegistration, logout],
   )
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
 
 export function useAuth() {

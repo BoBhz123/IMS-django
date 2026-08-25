@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { ArrowLeft, MailCheck, TimerOff } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useAuth } from '@/context/AuthContext'
+import { usePageVisible } from '@/hooks/usePageVisible'
 import { GlassCard } from '@/components/ui/GlassCard'
 import {
   formatCooldown,
@@ -25,6 +26,7 @@ export function VerifyEmail() {
   const [expired, setExpired] = useState(Boolean(account?.registration_session_expired))
   const [sessionLeft, setSessionLeft] = useState(() => registrationSecondsRemaining(account))
   const [leaving, setLeaving] = useState(false)
+  const visible = usePageVisible()
 
   useEffect(() => {
     if (cooldown <= 0) return undefined
@@ -34,15 +36,24 @@ export function VerifyEmail() {
 
   // The session countdown. Recomputed from the deadline each tick rather than decremented,
   // so a backgrounded tab that stops firing timers still shows the truth when it wakes.
+  //
+  // Parked entirely while the tab is hidden: a per-second interval nobody can see is pure
+  // wakeup cost, and because the value is derived from the deadline rather than decremented,
+  // stopping it loses nothing. The effect re-runs on the way back and its first act is to
+  // recompute, so the number is already right on the frame the tab is restored.
   useEffect(() => {
-    if (expired || !account?.registration_expires_at) return undefined
-    const timer = setInterval(() => {
+    if (expired || !account?.registration_expires_at || !visible) return undefined
+
+    function sync() {
       const left = registrationSecondsRemaining(account)
       setSessionLeft(left)
       if (left === 0) setExpired(true)
-    }, 1000)
+    }
+
+    sync()
+    const timer = setInterval(sync, 1000)
     return () => clearInterval(timer)
-  }, [account, expired])
+  }, [account, expired, visible])
 
   async function handleSubmit(event) {
     event.preventDefault()

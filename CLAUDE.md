@@ -624,6 +624,49 @@ during this period". Enough to see whether a period's sales are being paid for; 
 reconcile a bank statement. A real cash-flow statement needs a `Payment` model and is its own
 decision.
 
+### Refocus performance, live trial countdown, dashboard hierarchy — **done (2026-08-25)**
+
+Three strands, done together because they all bear on what happens when somebody returns to a
+tab this app has been sitting in for days.
+
+**1. `CONN_MAX_AGE = 60` + `CONN_HEALTH_CHECKS`.** Django's default is 0 — a TCP connect, TLS
+handshake and authentication before *every* request. The dashboard issues ten. See the Working
+Log for the trap in how it must be set.
+
+**2. The trial banner counts from `trial_ends_at`, live.** It read the server's
+`trial_days_remaining`, which is a snapshot taken when the payload was fetched and then frozen
+for as long as the tab stays open. `lib/billing.js::trialDaysRemaining` derives the count
+instead, against a clock (`hooks/useDailyTick.js`) that reticks at local midnight and on tab
+resume. `trial_days_remaining` remains the fallback for a payload without the timestamp.
+
+Deliberately **not** derived from `date_joined + 14`, which was the other option on the table:
+an admin can extend, reset or revoke a trial, so a join-date guess is wrong for exactly the
+accounts somebody has intervened on, and wrong in the direction of promising days they do not
+have.
+
+**3. Visibility and aborts.** `lib/visibility.js` + `hooks/usePageVisible.js` are the single
+place that touches `document.visibilityState`. VerifyEmail's per-second countdown parks while
+hidden. Four list pages (Categories, Suppliers, Customers, Expenses) were still using a
+`cancelled` flag, which suppresses the *response* while the request runs to completion; they
+use `AbortController` now, like Orders/Purchases/Products already did.
+
+**4. Leaked timers and listeners**, all of which fired `setState` into an unmounted tree:
+`ExportButton`'s error revert, `ToastContainer`'s auto-dismiss (one per toast), `Invoice`'s
+copy-confirmation revert and its `afterprint` title restore.
+
+**5. Re-render cost.** `AuthContext`'s value was an object literal rebuilt every render, so any
+state change re-rendered every consumer in the app; it is `useMemo` + `useCallback` now, matching
+what `CurrencyContext` already did. `StatTile`, `Sparkline`, `RecentOrdersTable`,
+`TopProductsChart` and `DashboardCarousel` are `React.memo`, and the dashboard's ~30 derived
+figures — including the sparkline arrays, whose identity is what makes the memos work — are one
+`useMemo`.
+
+**6. Dashboard hierarchy.** The ten equal tiles became four hero KPIs (Total revenue with its
+outstanding balance as a badge, Net profit with gross margin, Collected, Net cash flow) over two
+`MetricGroup` widgets (Working capital; Cost & outlays), with the catalog count moved beside Top
+products. Ten equally weighted tiles had no entry point — the figure a shopkeeper opens the app
+for competed with the catalog size for attention.
+
 ---
 
 # Working Log — mistakes, gotchas, anti-patterns
@@ -638,6 +681,47 @@ Append here when something bites. Do not repeat these.
   2,840 line items) carried a multiplier of 6 or 12, and nothing would have raised an error.
   `UnitMultiplierFoldMigrationTests` pins that the fold is lossless. **The fold is one-way**: 36 could
   have been 3x12, 6x6 or 36x1, and the factorisation was not recorded.
+- **`CONN_MAX_AGE` must be passed *into* `dj_database_url.config()`, not applied around it.**
+  `config()` replaces `DATABASES['default']` wholesale and writes its own `CONN_MAX_AGE` of 0 —
+  so setting it in the literal block above is discarded, and a later `.setdefault()` never fires
+  because the key is present, just zero. Both failures are invisible locally (no `DATABASE_URL`,
+  so the literal block survives) and take effect only on Heroku, which is the deployment that
+  needed persistent connections in the first place.
+  `PersistentDatabaseConnectionTests.test_the_setting_survives_a_database_url_deployment` is the
+  guard and it caught exactly this on the first run.
+- **A `cancelled` flag is not a cancellation.** `let cancelled = false` in an effect suppresses
+  the *response handler*; the request still crosses the network, still occupies a connection and
+  still costs the server a query. Every superseded keystroke in a debounced search ran to
+  completion. Use `AbortController` and pass `signal` — and then treat `axios.isCancel(error)`
+  as not-an-error, or an aborted request paints a failure over the load that replaced it.
+- **`document.visibilityState` goes through `lib/visibility.js`, never a bare listener.**
+  `subscribeVisibility` returns its own unsubscribe, so a call site that leaks is visibly wrong
+  rather than silently wrong. Browsers throttle background timers, they do not stop them — and
+  the throttling is what makes a resumed *counter* wrong, which is why anything gated on
+  visibility must recompute from a deadline rather than resume decrementing.
+- **A timer scheduled in an event handler can only be cancelled by an unmount effect.** The
+  `setTimeout` in a click handler outlives the component by default: `ExportButton`,
+  `ToastContainer` (one per toast) and `Invoice` all fired `setState` into unmounted trees.
+  React 19 removed the warning that used to make this visible, so the only symptom is
+  accumulating scheduled work — and, in the suite, timers from one file firing during the next.
+  Hold the id in a ref and clear it from `useEffect(() => () => clearTimeout(ref.current), [])`.
+- **`window.addEventListener('afterprint', …)` that removes itself on fire is still a leak.**
+  Some embedded and mobile browsers never fire it, and the tab can be closed from the print
+  preview. `Invoice` keeps the restore function in a ref and *runs* it on unmount — not merely
+  detaches it — or the browser tab stays named after an invoice nobody has open.
+- **A context provider's value must be `useMemo`d, and its actions `useCallback`ed.** An object
+  literal in the JSX is a new identity every render, so every consumer in the tree re-renders
+  whether or not anything changed. `AuthContext` sat at the root of the app doing this for
+  eight phases. `CurrencyContext` already had it right — copy that shape.
+- **`React.memo` on a component whose props are built inline does nothing.** The dashboard's
+  sparkline arrays were `sparkline.map(...)` in the JSX, so every tile got a fresh array on every
+  render and every memo missed. The arrays are built in the same `useMemo` as the figures now.
+  Memoising a component without checking where its props come from is decoration.
+- **The Vitest suite cannot catch a syntax error in a module every test mocks.** 476 tests
+  passed against a `TopProductsChart` whose `memo()` wrapper closed on the wrong brace, because
+  the only test importing it stubs it out (recharts needs a layout engine jsdom does not have).
+  `npm run build` caught it. This is the concrete case behind the standing rule that the build
+  is a required check and not a formality.
 - **Never sum a transaction column and a line expression in one aggregate.** This is the mirror
   image of the "revenue and COGS must be summed in one `annotate()`" rule, and it bites in the
   opposite direction. `orders.aggregate(revenue=Sum(LINE_TOTAL), collected=Sum('paid_amount'))`

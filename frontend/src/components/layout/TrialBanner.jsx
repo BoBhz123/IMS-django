@@ -2,6 +2,7 @@ import { Link } from 'react-router-dom'
 import { motion } from 'framer-motion'
 import { Clock } from 'lucide-react'
 import { useAuth } from '@/context/AuthContext'
+import { useDailyTick } from '@/hooks/useDailyTick'
 import { isTrialUrgent, trialBannerMessage } from '@/lib/billing'
 
 /**
@@ -10,13 +11,22 @@ import { isTrialUrgent, trialBannerMessage } from '@/lib/billing'
  * Renders nothing for a paid account, so the app is uncluttered for the people who have
  * already converted. It only turns red in the last few days — a banner that shouts from day
  * one of a fortnight is a banner the user learns to stop seeing.
+ *
+ * The day count is derived from `account.trial_ends_at` against a clock that reticks at
+ * midnight and on tab resume, not read off the server's `trial_days_remaining`. That field is
+ * a snapshot taken when the session payload was fetched: correct on load, and then frozen for
+ * as long as the tab stays open. This app is a shop tool that lives in a pinned tab for days,
+ * so "frozen until reload" meant the banner routinely showed a number that had been wrong
+ * since some previous midnight. It stays as the fallback for a payload without the timestamp.
  */
 export function TrialBanner() {
   const { account } = useAuth()
-  const message = trialBannerMessage(account)
+  const now = useDailyTick()
+
+  const message = trialBannerMessage(account, now)
   if (!message) return null
 
-  const urgent = isTrialUrgent(account)
+  const urgent = isTrialUrgent(account, 3, now)
 
   return (
     <motion.div

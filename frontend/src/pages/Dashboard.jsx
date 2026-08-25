@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 import axios from 'axios'
 import { api } from '@/lib/api'
 import {
@@ -9,7 +9,8 @@ import {
   shortId,
 } from '@/lib/format'
 import { useCurrency } from '@/context/CurrencyContext'
-import { StatTile } from '@/components/ui/StatTile'
+import { HeroStatTile, StatFootnote } from '@/components/ui/HeroStatTile'
+import { MetricGroup } from '@/components/ui/MetricGroup'
 import { GlassCard } from '@/components/ui/GlassCard'
 import { SegmentedControl } from '@/components/ui/SegmentedControl'
 import { DashboardCarousel } from '@/components/charts/DashboardCarousel'
@@ -216,6 +217,59 @@ export function Dashboard() {
     }
   }, [period])
 
+  const stats = statsState.data
+  const sparkline = state.data?.sparkline
+
+  // Every derived figure on the page, in one memo.
+  //
+  // These are cheap individually and there are around thirty of them, each re-derived on any
+  // render of this component — and this component re-renders on a currency toggle, a period
+  // change, and every AuthContext update. The sparkline arrays matter most: a fresh array is a
+  // new prop identity, which defeats the memo on every tile that receives one, so recomputing
+  // them is what would make React.memo below decorative.
+  const figures = useMemo(() => {
+    // Analytics money arrives as raw numbers since Phase 3. It used to be pre-formatted as
+    // "$1,234.00" and parsed straight back out here so the LBP toggle could reformat it.
+    const money = (source, key) => (stats ? Number(stats[source][key] ?? 0) : 0)
+
+    // Each delta compares the server's own figure for each window. The profit delta used to be
+    // computed here as revenue − purchases, which was the cash-flow definition wearing the
+    // profit label — the confusion this phase set out to remove.
+    const delta = (key, goodWhenUp) =>
+      percentDelta(money('current', key), money('previous', key), goodWhenUp)
+
+    const revenue = money('value', 'total_revenue')
+    const grossProfit = money('value', 'gross_profit')
+
+    return {
+      revenue,
+      grossProfit,
+      netProfit: money('value', 'net_profit'),
+      expenses: money('value', 'total_expenses'),
+      outlays: money('value', 'inventory_outlays'),
+      collected: money('value', 'revenue_collected'),
+      receivable: money('value', 'revenue_outstanding'),
+      payable: money('value', 'outlays_outstanding'),
+      netCashFlow: money('value', 'net_cash_flow'),
+      // Margin, not profit: the same $500 profit is a different business at $1k of sales than
+      // at $50k. Null rather than 0 when there is no revenue — 0% margin claims a fact about a
+      // period in which nothing was sold, and the tile renders nothing instead.
+      grossMargin: revenue > 0 ? (grossProfit / revenue) * 100 : null,
+      deltas: {
+        revenue: delta('total_revenue', true),
+        netProfit: delta('net_profit', true),
+        collected: delta('revenue_collected', true),
+        netCashFlow: delta('net_cash_flow', true),
+      },
+      spark: {
+        revenue: sparkline?.map((t) => t.revenue),
+        netProfit: sparkline?.map((t) => t.netProfit),
+        collected: sparkline?.map((t) => t.collected),
+        netCashFlow: sparkline?.map((t) => t.netCashFlow),
+      },
+    }
+  }, [stats, sparkline])
+
   if (state.status === 'loading') return <DashboardSkeleton />
   if (state.status === 'error') {
     return (
@@ -226,18 +280,7 @@ export function Dashboard() {
     )
   }
 
-  const { carouselTabs, sparkline, recentOrders, productsCount } = state.data
-  const stats = statsState.data
-  // Analytics money arrives as raw numbers since Phase 3. It used to be pre-formatted as
-  // "$1,234.00" and parsed straight back out here so the LBP toggle could reformat it.
-  const money = (source, key) => (stats ? Number(stats[source][key] ?? 0) : 0)
-
-  // Each delta compares the server's own figure for each window. The profit delta used to be
-  // computed here as revenue − purchases, which was the cash-flow definition wearing the
-  // profit label — the confusion this phase set out to remove.
-  const delta = (key, goodWhenUp) =>
-    percentDelta(money('current', key), money('previous', key), goodWhenUp)
-
+  const { carouselTabs, recentOrders, productsCount } = state.data
   const deltaLabel = stats?.deltaLabel ?? 'vs. last month'
   const statsLoading = statsState.status === 'loading'
 
@@ -250,87 +293,114 @@ export function Dashboard() {
         </div>
       </div>
 
+      {/* The hero row: the four figures a shopkeeper opens the app to see. Did I sell, did I
+          make money on it, has the money arrived, and am I up or down on cash. Everything
+          else is context for one of these, and is grouped below rather than competing here. */}
       <div
-        className={`grid grid-cols-2 gap-4 lg:grid-cols-3 transition-opacity ${statsLoading ? 'opacity-60' : ''}`}
+        className={`grid grid-cols-1 gap-4 transition-opacity sm:grid-cols-2 xl:grid-cols-4 ${
+          statsLoading ? 'opacity-60' : ''
+        }`}
       >
-        <StatTile
+        <HeroStatTile
           index={0}
           label="Total revenue"
-          value={formatAmount(money('value', 'total_revenue'))}
-          delta={delta('total_revenue', true)}
+          value={formatAmount(figures.revenue)}
+          delta={figures.deltas.revenue}
           deltaLabel={deltaLabel}
-          sparkline={sparkline.map((t) => t.revenue)}
+          sparkline={figures.spark.revenue}
+          accent="var(--accent-blue)"
+          footnote={
+            figures.receivable > 0 ? (
+              // Invoiced revenue includes money that has not arrived, and that gap is the
+              // single most useful caveat on this number. Carried as a badge on the tile
+              // rather than as its own card, so the two are read together.
+              <StatFootnote tone="warn">{formatAmount(figures.receivable)} owed to you</StatFootnote>
+            ) : (
+              <StatFootnote tone="good">All invoices settled</StatFootnote>
+            )
+          }
         />
-        {/* The profit tiles draw real per-period figures: the series carries COGS since
-            Phase 6, so gross and net profit are computed the same way here as in the
-            summary rather than approximated from revenue minus purchases. */}
-        <StatTile
+        <HeroStatTile
           index={1}
-          label="Gross profit"
-          value={formatAmount(money('value', 'gross_profit'))}
-          delta={delta('gross_profit', true)}
-          deltaLabel={deltaLabel}
-          sparkline={sparkline.map((t) => t.grossProfit)}
-        />
-        <StatTile
-          index={2}
-          label="Expenses"
-          value={formatAmount(money('value', 'total_expenses'))}
-          delta={delta('total_expenses', false)}
-          deltaLabel={deltaLabel}
-          sparkline={sparkline.map((t) => t.expenses)}
-        />
-        <StatTile
-          index={3}
           label="Net profit"
-          value={formatAmount(money('value', 'net_profit'))}
-          delta={delta('net_profit', true)}
+          value={formatAmount(figures.netProfit)}
+          delta={figures.deltas.netProfit}
           deltaLabel={deltaLabel}
-          sparkline={sparkline.map((t) => t.netProfit)}
+          sparkline={figures.spark.netProfit}
+          accent="var(--accent-green)"
+          footnote={
+            figures.grossMargin !== null && (
+              <StatFootnote>{figures.grossMargin.toFixed(1)}% gross margin</StatFootnote>
+            )
+          }
         />
-        <StatTile
-          index={4}
-          label="Inventory outlays"
-          value={formatAmount(money('value', 'inventory_outlays'))}
-          delta={delta('inventory_outlays', false)}
-          deltaLabel={deltaLabel}
-          sparkline={sparkline.map((t) => t.cost)}
-        />
-        {/* The cash tiles. These are the ones that move when a payment is recorded — the
-            five above are accrual and deliberately do not, so a sale stays profitable while
-            the customer still owes for it. */}
-        <StatTile
-          index={5}
+        {/* The cash pair. These move when a payment is recorded; the accrual figures beside
+            them deliberately do not, so a sale stays profitable while the customer owes. */}
+        <HeroStatTile
+          index={2}
           label="Collected"
-          value={formatAmount(money('value', 'revenue_collected'))}
-          delta={delta('revenue_collected', true)}
+          value={formatAmount(figures.collected)}
+          delta={figures.deltas.collected}
           deltaLabel={deltaLabel}
-          sparkline={sparkline.map((t) => t.collected)}
+          sparkline={figures.spark.collected}
+          accent="var(--accent-teal)"
+          footnote={<StatFootnote>Cash actually in</StatFootnote>}
         />
-        <StatTile
-          index={6}
-          label="Owed to you"
-          value={formatAmount(money('value', 'revenue_outstanding'))}
-          delta={delta('revenue_outstanding', false)}
-          deltaLabel={deltaLabel}
-          sparkline={sparkline.map((t) => t.outstanding)}
-        />
-        <StatTile
-          index={7}
-          label="Owed to suppliers"
-          value={formatAmount(money('value', 'outlays_outstanding'))}
-          delta={delta('outlays_outstanding', false)}
-          deltaLabel={deltaLabel}
-        />
-        <StatTile
-          index={8}
+        <HeroStatTile
+          index={3}
           label="Net cash flow"
-          value={formatAmount(money('value', 'net_cash_flow'))}
-          delta={delta('net_cash_flow', true)}
+          value={formatAmount(figures.netCashFlow)}
+          delta={figures.deltas.netCashFlow}
           deltaLabel={deltaLabel}
-          sparkline={sparkline.map((t) => t.netCashFlow)}
+          sparkline={figures.spark.netCashFlow}
+          accent={figures.netCashFlow < 0 ? 'var(--accent-red)' : 'var(--accent-purple)'}
+          footnote={<StatFootnote>In, less stock and expenses</StatFootnote>}
         />
-        <StatTile index={9} label="Products in catalog" value={productsCount.toLocaleString()} />
+      </div>
+
+      {/* Secondary metrics, grouped by the question they answer rather than given a tile
+          each. Quieter by construction — see MetricGroup. */}
+      <div
+        className={`grid grid-cols-1 gap-4 transition-opacity lg:grid-cols-2 ${
+          statsLoading ? 'opacity-60' : ''
+        }`}
+      >
+        <MetricGroup
+          index={0}
+          title="Working capital"
+          hint="Unsettled both ways"
+          items={[
+            {
+              label: 'Owed to you',
+              value: formatAmount(figures.receivable),
+              hint: 'Accounts receivable',
+              tone: figures.receivable > 0 ? 'var(--accent-orange)' : undefined,
+            },
+            {
+              label: 'Owed to suppliers',
+              value: formatAmount(figures.payable),
+              hint: 'Accounts payable',
+              tone: figures.payable > 0 ? 'var(--accent-orange)' : undefined,
+            },
+          ]}
+        />
+        <MetricGroup
+          index={1}
+          title="Cost & outlays"
+          hint="Stock spend sits outside profit"
+          items={[
+            {
+              label: 'Inventory outlays',
+              value: formatAmount(figures.outlays),
+              hint: 'Cash flow, not a cost of sales',
+            },
+            {
+              label: 'Operating expenses',
+              value: formatAmount(figures.expenses),
+              hint: 'Subtracted from gross profit',
+            },
+          ]}
+        />
       </div>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
@@ -339,9 +409,21 @@ export function Dashboard() {
         </GlassCard>
 
         <GlassCard className="p-5 lg:col-span-2">
-          <h2 className="mb-4 font-display text-[14px] font-semibold text-text-primary">
-            Top products
-          </h2>
+          {/* Catalog size lives here rather than in a tile of its own. It is not a financial
+              figure and never moved with the period selector, so sitting in the KPI grid it
+              read as one more money number that happened to be stuck. Next to the products
+              that actually sold, it is the denominator: five of how many. */}
+          <div className="mb-4 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+            <h2 className="font-display text-[14px] font-semibold text-text-primary">
+              Top products
+            </h2>
+            <span className="text-[12px] text-text-tertiary">
+              <span className="font-semibold text-text-secondary tabular-nums">
+                {productsCount.toLocaleString()}
+              </span>{' '}
+              in catalog
+            </span>
+          </div>
           {stats?.value.top_products?.length ? (
             <TopProductsChart data={stats.value.top_products} />
           ) : (
@@ -366,7 +448,17 @@ function percentDelta(current, previous, goodWhenUp) {
   return { percent: Math.abs(percent), direction: percent >= 0 ? 'up' : 'down', goodWhenUp }
 }
 
-function RecentOrdersTable({ orders }) {
+/**
+ * memo'd: it renders eight rows of formatted money and is the most expensive thing on the
+ * page after the charts, but `orders` only changes when the dashboard reloads — not when the
+ * period selector moves, which re-renders everything above it.
+ *
+ * It reads useCurrency itself rather than taking formatAmount as a prop. A context consumer
+ * re-renders on a context change whatever memo says, which is correct here (the toggle must
+ * reformat these rows); taking the function as a prop would break the memo on every parent
+ * render instead, which is not.
+ */
+const RecentOrdersTable = memo(function RecentOrdersTable({ orders }) {
   const { formatAmount } = useCurrency()
 
   if (!orders.length) {
@@ -401,14 +493,19 @@ function RecentOrdersTable({ orders }) {
       </table>
     </div>
   )
-}
+})
 
 function DashboardSkeleton() {
   return (
     <div className="flex flex-col gap-6">
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-3">
-        {Array.from({ length: 10 }).map((_, i) => (
-          <div key={i} className="h-24 animate-pulse rounded-squircle bg-canvas-2" />
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <div key={i} className="h-32 animate-pulse rounded-squircle bg-canvas-2" />
+        ))}
+      </div>
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        {Array.from({ length: 2 }).map((_, i) => (
+          <div key={i} className="h-28 animate-pulse rounded-squircle bg-canvas-2" />
         ))}
       </div>
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">

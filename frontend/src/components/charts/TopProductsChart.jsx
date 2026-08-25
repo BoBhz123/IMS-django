@@ -1,6 +1,11 @@
+import { memo } from 'react'
 import { Bar, BarChart, Cell, LabelList, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 
-export function TopProductsChart({ data }) {
+/**
+ * memo'd: recharts re-lays out the whole bar chart on every render, and `data` only changes
+ * when the dashboard refetches — not when the period selector or the currency toggle moves.
+ */
+export const TopProductsChart = memo(function TopProductsChart({ data }) {
   const rows = data.map((item) => ({
     name: item.product__name,
     units: item.total_sold,
@@ -34,7 +39,7 @@ export function TopProductsChart({ data }) {
       </BarChart>
     </ResponsiveContainer>
   )
-}
+})
 
 function BarTooltip({ active, payload }) {
   if (!active || !payload?.length) return null

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import axios from 'axios'
 import {
   ArrowDown,
   ArrowUp,
@@ -41,27 +42,28 @@ export function Suppliers() {
   }, [searchInput])
 
   useEffect(() => {
-    let cancelled = false
+    // AbortController, not a `cancelled` flag. The flag only suppressed the *response* — the
+    // request itself still crossed the network and still held a connection, so every
+    // superseded query ran to completion. See Orders.jsx, which was converted first.
+    const controller = new AbortController()
     setStatus('loading')
 
     const params = { ordering: sort.direction === 'desc' ? `-${sort.field}` : sort.field }
     if (search) params.search = search
 
     api
-      .get('/inventory/suppliers/', { params })
+      .get('/inventory/suppliers/', { params, signal: controller.signal })
       .then(({ data }) => {
-        if (!cancelled) {
-          setSuppliers(data)
-          setStatus('ready')
-        }
+        setSuppliers(data)
+        setStatus('ready')
       })
-      .catch(() => {
-        if (!cancelled) setStatus('error')
+      .catch((error) => {
+        // A cancelled request is not a failure. Painting an error here would replace the
+        // spinner of the load that superseded it.
+        if (!axios.isCancel(error)) setStatus('error')
       })
 
-    return () => {
-      cancelled = true
-    }
+    return () => controller.abort()
   }, [search, sort, refreshKey])
 
   const pageCount = Math.max(1, Math.ceil(suppliers.length / PAGE_SIZE))

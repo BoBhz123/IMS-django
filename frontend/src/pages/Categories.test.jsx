@@ -152,6 +152,10 @@ describe('Categories', () => {
     await waitFor(() =>
       expect(get).toHaveBeenLastCalledWith('/inventory/categories/', {
         params: { ordering: 'name', search: 'dri' },
+        // Every superseded search is aborted rather than merely ignored, so each call now
+        // carries a signal. Matched loosely — the assertion is about the query, and pinning
+        // the AbortSignal instance would make this a test of the effect's internals.
+        signal: expect.any(AbortSignal),
       }),
     )
   })

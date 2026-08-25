@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Check, Copy, Printer, Send, Share2, X } from 'lucide-react'
 import { buildShareMessage, paymentLabel, telegramShareUrl, whatsappShareUrl } from '@/lib/invoiceShare'
 import { Modal } from '@/components/ui/Modal'
@@ -70,6 +70,15 @@ export function Invoice({
   const total = subtotal
 
   const [copied, setCopied] = useState(false)
+  const copyResetRef = useRef(null)
+  const restorePrintTitleRef = useRef(null)
+
+  useEffect(() => () => {
+    clearTimeout(copyResetRef.current)
+    // Runs the restore rather than only detaching it: unmounting mid-print must not leave the
+    // browser tab named after an invoice.
+    restorePrintTitleRef.current?.()
+  }, [])
 
   const shareMessage = buildShareMessage({
     reference: shortId(id),
@@ -89,7 +98,10 @@ export function Invoice({
       await navigator.clipboard.writeText(shareUrl)
       setCopied(true)
       // Reverts on its own — a permanently "Copied" button gives no feedback the second time.
-      setTimeout(() => setCopied(false), 2000)
+      // Tracked in a ref so closing the invoice cancels it; this modal is closed within two
+      // seconds of a copy often enough (copy the link, close, paste) for it to matter.
+      clearTimeout(copyResetRef.current)
+      copyResetRef.current = setTimeout(() => setCopied(false), 2000)
     } catch {
       // Clipboard access is denied outside a secure context and in some embedded browsers.
       // The link is visible in the WhatsApp/Telegram targets either way, so this is a
@@ -105,10 +117,18 @@ export function Invoice({
     // dialog has actually read the title on every browser/platform).
     const originalTitle = document.title
     document.title = invoiceFileName(placedAt, id)
+
     function restoreTitle() {
       document.title = originalTitle
       window.removeEventListener('afterprint', restoreTitle)
+      restorePrintTitleRef.current = null
     }
+
+    // Also held in a ref, because `afterprint` is not guaranteed to arrive: some embedded and
+    // mobile browsers never fire it, and the tab can be closed from the print preview. Without
+    // an unmount path the listener outlives the invoice holding a captured title, and the next
+    // print from a different order restores a filename from a document nobody has open.
+    restorePrintTitleRef.current = restoreTitle
     window.addEventListener('afterprint', restoreTitle)
     window.print()
   }

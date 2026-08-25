@@ -1,9 +1,15 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Download, Loader2 } from 'lucide-react'
 import { downloadFile } from '@/lib/download'
 
 export function ExportButton({ url, params, filename }) {
   const [status, setStatus] = useState('idle')
+  // The revert timer has to outlive the handler that scheduled it but not the component. Held
+  // in a ref so unmounting can cancel it: an export failing as the user navigates away
+  // otherwise leaves a timer holding this component's setState for two more seconds.
+  const revertRef = useRef(null)
+
+  useEffect(() => () => clearTimeout(revertRef.current), [])
 
   async function handleClick() {
     setStatus('loading')
@@ -12,7 +18,8 @@ export function ExportButton({ url, params, filename }) {
       setStatus('idle')
     } catch {
       setStatus('error')
-      setTimeout(() => setStatus('idle'), 2000)
+      clearTimeout(revertRef.current)
+      revertRef.current = setTimeout(() => setStatus('idle'), 2000)
     }
   }
 

@@ -217,10 +217,39 @@ DATABASES = {
     }
 }
 
+# Persistent database connections.
+#
+# Django's default is 0 — close the connection at the end of every request. Against a local
+# socket that is nearly free; against Heroku Postgres it is a TCP round trip plus a TLS
+# handshake plus authentication before any query runs, on *every* request. The dashboard alone
+# issues ten (six analytics windows, the orders page and the session pair), so returning to an
+# idle tab paid that setup cost ten times over before a single row was read.
+#
+# 60s rather than None (forever): a connection held open indefinitely survives a Postgres
+# restart or a failover as a dead socket, and the ceiling is real — every worker process holds
+# up to one connection for this long, against a plan with a fixed connection limit.
+DB_CONN_MAX_AGE = int(os.environ.get('DB_CONN_MAX_AGE', 60))
+
+DATABASES['default']['CONN_MAX_AGE'] = DB_CONN_MAX_AGE
+# Cheap liveness check before a pooled connection is handed to a request. Without it the first
+# query after Postgres has dropped the far end raises InterfaceError rather than transparently
+# reconnecting — the failure mode that makes people blame persistent connections and turn them
+# back off.
+DATABASES['default']['CONN_HEALTH_CHECKS'] = True
+
 # Heroku (and any other DATABASE_URL-based host) sets DATABASE_URL — parse it if present.
 # Local dev has no DATABASE_URL, so config() returns {} and the DATABASES['default'] block
 # above is unchanged.
-_database_url_config = dj_database_url.config()
+#
+# The connection settings are passed *into* config() rather than applied to its result. This is
+# not a style choice: dj_database_url replaces DATABASES['default'] wholesale and writes its own
+# CONN_MAX_AGE of 0, so assigning beforehand is discarded and a later `.setdefault()` never
+# fires — the key is present, just zero. Either way the local developer sees persistent
+# connections working and the deployment that actually needs them silently does not.
+# `?conn_max_age=` in the URL still wins, which is the point of letting the library do it.
+_database_url_config = dj_database_url.config(
+    conn_max_age=DB_CONN_MAX_AGE, conn_health_checks=True,
+)
 if _database_url_config:
     DATABASES['default'] = _database_url_config
 

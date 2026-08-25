@@ -4149,6 +4149,75 @@ class PurchaseEditingTests(AccountFixtureMixin, APITestCase):
 OLD_SUBDOMAIN = 'client.' + 'myimsapp.com'
 
 
+class PersistentDatabaseConnectionTests(TestCase):
+    """
+    CONN_MAX_AGE, and the one way of setting it that does not work.
+
+    Asserted in a subprocess for the same reason DomainConfigurationTests is: this process
+    inherited the developer's `.env` and DATABASE_URL, and Django's test runner is entitled to
+    rewrite connection settings for the test database. An in-process assertion would be
+    describing this machine rather than what a deploy gets.
+    """
+
+    def boot(self, **env):
+        script = (
+            'import django; django.setup(); from django.conf import settings; '
+            'd = settings.DATABASES["default"]; '
+            'print(d.get("CONN_MAX_AGE")); print(d.get("CONN_HEALTH_CHECKS"))'
+        )
+        base = {
+            key: value for key, value in os.environ.items()
+            if key not in ('DATABASE_URL', 'DB_CONN_MAX_AGE')
+        }
+        result = subprocess.run(
+            [sys.executable, '-c', script],
+            capture_output=True, text=True, timeout=120,
+            env={
+                **base,
+                'DJANGO_SETTINGS_MODULE': 'ims.settings',
+                'DJANGO_DEBUG': 'False',
+                'DJANGO_SECRET_KEY': 'z' * 60,
+                **env,
+            },
+            cwd=str(settings.BASE_DIR),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        max_age, health_checks = result.stdout.strip().split('\n')
+        return max_age, health_checks
+
+    def test_connections_are_held_open_between_requests(self):
+        # Django defaults to 0 — a fresh TCP connect, TLS handshake and authentication before
+        # every single request. Against a managed Postgres that is the dominant cost of a
+        # dashboard load, which issues ten of them.
+        max_age, _ = self.boot()
+        self.assertEqual(max_age, '60')
+
+    def test_a_reused_connection_is_health_checked(self):
+        # Without this the first query after Postgres has dropped the far end raises
+        # InterfaceError rather than transparently reconnecting.
+        _, health_checks = self.boot()
+        self.assertEqual(health_checks, 'True')
+
+    def test_the_setting_survives_a_database_url_deployment(self):
+        """
+        The one that actually matters.
+
+        `dj_database_url.config()` *replaces* DATABASES['default'] wholesale, so CONN_MAX_AGE
+        written inside the literal block above it is silently discarded — on Heroku, and only
+        on Heroku. The local developer sees the setting applied and the deployment that needed
+        it does not, with nothing anywhere reporting a problem.
+        """
+        max_age, health_checks = self.boot(
+            DATABASE_URL='postgres://user:pw@db.example.com:5432/appdb',
+        )
+        self.assertEqual(max_age, '60')
+        self.assertEqual(health_checks, 'True')
+
+    def test_the_environment_can_still_override_it(self):
+        max_age, _ = self.boot(DB_CONN_MAX_AGE='120')
+        self.assertEqual(max_age, '120')
+
+
 class DomainConfigurationTests(TestCase):
     """
     The canonical domain is myimsapp.com, migrated from the old client. subdomain 2026-08-13.

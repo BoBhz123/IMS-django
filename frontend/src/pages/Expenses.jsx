@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import axios from 'axios'
 import {
   ChevronLeft,
   ChevronRight,
@@ -46,7 +47,10 @@ export function Expenses() {
   }, [searchInput])
 
   useEffect(() => {
-    let cancelled = false
+    // AbortController, not a `cancelled` flag. The flag only suppressed the *response* — the
+    // request itself still crossed the network and still held a connection, so every
+    // superseded query ran to completion. See Orders.jsx, which was converted first.
+    const controller = new AbortController()
     setStatus('loading')
 
     const params = { page, ordering: '-spent_at' }
@@ -56,20 +60,18 @@ export function Expenses() {
     if (spentBefore) params.spent_before = spentBefore
 
     api
-      .get('/inventory/expenses/', { params })
+      .get('/inventory/expenses/', { params, signal: controller.signal })
       .then(({ data }) => {
-        if (!cancelled) {
-          setResult(data)
-          setStatus('ready')
-        }
+        setResult(data)
+        setStatus('ready')
       })
-      .catch(() => {
-        if (!cancelled) setStatus('error')
+      .catch((error) => {
+        // A cancelled request is not a failure. Painting an error here would replace the
+        // spinner of the load that superseded it.
+        if (!axios.isCancel(error)) setStatus('error')
       })
 
-    return () => {
-      cancelled = true
-    }
+    return () => controller.abort()
   }, [search, category, spentAfter, spentBefore, page, refreshKey])
 
   // The page's own total, not the account's. Labelled as such so it is never mistaken for

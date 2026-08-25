@@ -1,11 +1,15 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { SegmentedControl } from '@/components/ui/SegmentedControl'
 import { RevenueTrendChart } from './RevenueTrendChart'
 
 const SWIPE_THRESHOLD = 60
 
-export function DashboardCarousel({ tabs }) {
+/**
+ * memo'd for the same reason as TopProductsChart: it owns a recharts surface and an
+ * AnimatePresence, and `tabs` is rebuilt only by the dashboard's own data effect.
+ */
+export const DashboardCarousel = memo(function DashboardCarousel({ tabs }) {
   const [index, setIndex] = useState(0)
   const [direction, setDirection] = useState(0)
 
@@ -77,4 +81,4 @@ export function DashboardCarousel({ tabs }) {
       </div>
     </div>
   )
-}
+})
