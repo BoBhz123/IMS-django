@@ -14,6 +14,7 @@ import {
   Users,
 } from 'lucide-react'
 import { CurrencyToggle } from '@/components/ui/CurrencyToggle'
+import { DockButton, DockTooltip } from './DockButton'
 import { useTheme } from '@/context/ThemeContext'
 import { UserMenu } from './UserMenu'
 
@@ -116,38 +117,9 @@ function DockItem({ item, scale, hovered, onHover }) {
           {isActive && (
             <span className="absolute top-1/2 -left-2 h-1 w-1 -translate-y-1/2 rounded-full bg-accent-blue" />
           )}
-          <Tooltip visible={hovered}>{item.label}</Tooltip>
+          <DockTooltip visible={hovered}>{item.label}</DockTooltip>
         </>
       )}
     </NavLink>
-  )
-}
-
-function DockButton({ label, onClick, children }) {
-  const [isHovered, setIsHovered] = useState(false)
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      onMouseEnter={() => setIsHovered(true)}
-      onMouseLeave={() => setIsHovered(false)}
-      className="group relative flex h-10 w-10 items-center justify-center rounded-2xl text-text-secondary transition-colors hover:bg-canvas-2 hover:text-text-primary"
-      aria-label={label}
-    >
-      {children}
-      <Tooltip visible={isHovered}>{label}</Tooltip>
-    </button>
-  )
-}
-
-function Tooltip({ visible, children }) {
-  return (
-    <span
-      className={`pointer-events-none absolute top-1/2 left-full ml-3 -translate-y-1/2 rounded-lg border border-glass-border bg-glass-strong px-2.5 py-1 text-[12px] font-medium whitespace-nowrap text-text-primary backdrop-blur-xl transition-all duration-150 [box-shadow:var(--shadow-glass)] ${
-        visible ? 'translate-x-0 opacity-100' : '-translate-x-1 opacity-0'
-      }`}
-    >
-      {children}
-    </span>
   )
 }

@@ -110,4 +110,45 @@ describe('CurrencyToggle', () => {
     render(<CurrencyToggle placement="bottom" />)
     expect(toggle().className).toMatch(/touch-target/)
   })
+
+  describe('in the dock rail', () => {
+    it('wears the rail chrome, so it matches the buttons beside it', () => {
+      // Rendered through DockButton rather than reimplementing its 40px squircle. A control
+      // that is visibly a dock button but silently not one is the difference nobody reports
+      // and everybody notices.
+      render(<CurrencyToggle placement="right" />)
+      expect(toggle().className).toMatch(/h-10 w-10/)
+      expect(toggle().className).toMatch(/rounded-2xl/)
+    })
+
+    it('carries the hover tooltip the rest of the rail has', async () => {
+      const user = userEvent.setup()
+      render(<CurrencyToggle placement="right" />)
+
+      // Always in the DOM — DockButton animates opacity rather than mounting on hover.
+      expect(toggle()).toHaveTextContent('Switch to Lebanese Pound')
+
+      await user.hover(toggle())
+      const tooltip = screen.getByText('Switch to Lebanese Pound')
+      expect(tooltip.className).toMatch(/opacity-100/)
+
+      await user.unhover(toggle())
+      expect(screen.getByText('Switch to Lebanese Pound').className).toMatch(/opacity-0/)
+    })
+
+    it('tells the tooltip the action and the accessible name the state too', () => {
+      // A tooltip sits beside a control the user can already see, so the action alone is
+      // right. A screen-reader user never sees the glyph and needs both.
+      render(<CurrencyToggle placement="right" />)
+      expect(toggle()).toHaveAccessibleName('Currency: US Dollar. Switch to Lebanese Pound.')
+      expect(toggle()).toHaveTextContent('Switch to Lebanese Pound')
+    })
+
+    it('still flips on a press', async () => {
+      const user = userEvent.setup()
+      render(<CurrencyToggle placement="right" />)
+      await user.click(toggle())
+      expect(toggleCurrency).toHaveBeenCalledTimes(1)
+    })
+  })
 })

@@ -1,3 +1,4 @@
+import { DockButton } from '@/components/layout/DockButton'
 import { useCurrency } from '@/context/CurrencyContext'
 
 const CURRENCY_LABELS = {
@@ -37,30 +38,42 @@ export function CurrencyToggle({ placement = 'right' }) {
   // USD/LBP, so an account whose base is LBP describes the swap the right way round.
   const other = currency === primaryCurrency ? secondaryCurrency : primaryCurrency
 
+  const action = `Switch to ${describe(other)}`
+  // Names the state *and* the outcome. The old label said only "Show in LBP", which reads as
+  // the current mode to anyone who meets it without seeing the glyph. `action` alone is right
+  // for the dock's tooltip, which sits beside a control the user can already see.
+  const accessibleName = `Currency: ${describe(currency)}. ${action}.`
+
+  // In the rail, wear the rail's own chrome — same 40px squircle, same hover, same tooltip as
+  // the theme and nav buttons beside it. A control that is visibly a dock button but silently
+  // not one is the kind of difference nobody reports and everybody notices.
+  if (placement === 'right') {
+    return (
+      <DockButton label={action} ariaLabel={accessibleName} onClick={toggleCurrency}>
+        <span aria-hidden="true" className="flex flex-col items-center leading-none">
+          <span className="font-display text-[12px] leading-none font-bold">{symbol}</span>
+          <span className="font-display text-[9px] leading-tight font-semibold tracking-wide">
+            {currency}
+          </span>
+        </span>
+      </DockButton>
+    )
+  }
+
   return (
     <button
       type="button"
       onClick={toggleCurrency}
-      // Names the state *and* the outcome. The old label said only "Show in LBP", which reads
-      // as the current mode to anyone who meets it without seeing the glyph.
-      aria-label={`Currency: ${describe(currency)}. Switch to ${describe(other)}.`}
-      title={`Switch to ${describe(other)}`}
-      className={
-        placement === 'right'
-          ? 'flex h-10 w-10 flex-col items-center justify-center gap-0 rounded-2xl text-text-secondary transition-colors hover:bg-canvas-2 hover:text-text-primary'
-          : 'touch-target flex items-center justify-center gap-1 rounded-lg px-2 text-text-secondary transition-colors hover:bg-canvas-2 hover:text-text-primary'
-      }
+      aria-label={accessibleName}
+      title={action}
+      className="touch-target flex items-center justify-center gap-1 rounded-lg px-2 text-text-secondary transition-colors hover:bg-canvas-2 hover:text-text-primary"
     >
       <span aria-hidden="true" className="font-display text-[12px] leading-none font-bold">
         {symbol}
       </span>
       <span
         aria-hidden="true"
-        className={
-          placement === 'right'
-            ? 'font-display text-[9px] leading-tight font-semibold tracking-wide'
-            : 'font-display text-[11px] leading-none font-semibold tracking-wide'
-        }
+        className="font-display text-[11px] leading-none font-semibold tracking-wide"
       >
         {currency}
       </span>

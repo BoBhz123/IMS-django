@@ -688,6 +688,14 @@ current mode to anyone who never sees the glyph.
 strictly single-currency then, so a switch is offering something that does not exist. That rule
 now lives in the component, so the two surfaces cannot disagree about it.
 
+The dock variant renders through `components/layout/DockButton.jsx`, which was lifted out of
+`Dock.jsx` for it — `Dock` imports `CurrencyToggle`, so importing `DockButton` back from `Dock`
+would be a cycle. Anything else that lands in the rail should come through it too, or the rail
+ends up with controls that are visibly dock buttons and silently not. `DockButton` takes an
+optional `ariaLabel` separate from `label`: the tooltip is read beside a control the user can
+already see and carries the action alone, while the accessible name has to carry the current
+state as well.
+
 ---
 
 # Working Log — mistakes, gotchas, anti-patterns
