@@ -1,3 +1,4 @@
+import { StrictMode } from 'react'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -131,4 +132,50 @@ describe('CurrencyProvider', () => {
     // rather than merely harmless.
     await waitFor(() => expect(screen.getByTestId('amount')).toHaveTextContent('$10.00'))
   })
+
+  describe('under StrictMode', () => {
+    // The app is wrapped in StrictMode (main.jsx), and every other test here renders without
+    // it — which is exactly how a toggle that did nothing in the real app kept a green suite.
+    //
+    // StrictMode double-invokes state updaters to surface impure ones. toggleCurrency used to
+    // call setCurrency from inside a setSettings updater, so the flip ran twice per press and
+    // landed back where it started: the dock button was visible, the handler fired, and the
+    // currency never changed.
+    function renderStrict() {
+      return render(
+        <StrictMode>
+          <AuthContext.Provider value={{ status: 'authenticated' }}>
+            <CurrencyProvider>
+              <Probe />
+            </CurrencyProvider>
+          </AuthContext.Provider>
+        </StrictMode>,
+      )
+    }
+
+    it('flips the currency exactly once per press', async () => {
+      const user = userEvent.setup()
+      api.get.mockResolvedValue(settings('USD', true))
+      renderStrict()
+      await waitFor(() => expect(screen.getByTestId('currency')).toHaveTextContent('USD'))
+
+      await user.click(screen.getByRole('button', { name: 'toggle' }))
+      expect(screen.getByTestId('currency')).toHaveTextContent('LBP')
+      expect(screen.getByTestId('amount')).toHaveTextContent('890,000 LBP')
+
+      await user.click(screen.getByRole('button', { name: 'toggle' }))
+      expect(screen.getByTestId('currency')).toHaveTextContent('USD')
+    })
+
+    it('still refuses to leave the primary while dual display is off', async () => {
+      const user = userEvent.setup()
+      api.get.mockResolvedValue(settings('USD', false))
+      renderStrict()
+      await waitFor(() => expect(screen.getByTestId('dual')).toHaveTextContent('false'))
+
+      await user.click(screen.getByRole('button', { name: 'toggle' }))
+      expect(screen.getByTestId('currency')).toHaveTextContent('USD')
+    })
+  })
 })
+

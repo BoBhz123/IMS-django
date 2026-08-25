@@ -803,6 +803,16 @@ Append here when something bites. Do not repeat these.
   the database one forgotten filter away from still opening the door.
 - **Re-sharing an already-shared order returns the same token.** Minting a fresh one would silently
   cut off the customer who was sent the link yesterday.
+- **Never call a setter from inside another setter's updater.** React treats an updater as a
+  pure function and may call it more than once; StrictMode does so deliberately, and `main.jsx`
+  wraps the whole app. `toggleCurrency` flipped the display currency from inside a `setSettings`
+  updater purely to read `enableDualCurrency` from it — so every press ran the flip twice,
+  USD -> LBP -> USD, and the currency never changed. The button was visible, the handler fired,
+  and nothing happened. Read the value through the `useCallback` dependency array instead.
+- **A component test that does not render under `StrictMode` cannot see this class of bug**, and
+  `@testing-library/react`'s `render` does not add it. That is how a toggle that did nothing in
+  the real app kept a green suite across several passes. `CurrencyContext.test.jsx` has a
+  `describe('under StrictMode')` block for exactly this; put stateful-context regressions there.
 - **`useOverlayLayer` does two separable jobs, and popovers want only one.** Escape ordering is
   wanted by every overlay; freezing the page behind it is wanted only by the ones that cover it.
   The refcounted scroll lock was added unconditionally, so `FilterPopover` inherited a body lock

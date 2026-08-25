@@ -71,16 +71,27 @@ export function CurrencyProvider({ children }) {
     }
   }, [isAuthenticated])
 
+  // A no-op with dual display off. The toggle is hidden in that mode too (see CurrencyToggle),
+  // but guarding here as well means a stray call cannot put the app into a currency the account
+  // said it does not use.
+  //
+  // The guard reads `settings` through the dependency array. It must NOT be written as a
+  // `setSettings` updater that calls `setCurrency` inside itself, which is what this was:
+  //
+  //     setSettings((current) => {
+  //       if (!current.enableDualCurrency) return current
+  //       setCurrency((shown) => otherCurrency(shown))   // <- side effect in an updater
+  //       return current
+  //     })
+  //
+  // React treats a state updater as a pure function and is free to call it more than once —
+  // StrictMode does so deliberately, in development *and* in the production build of the SPA,
+  // since main.jsx wraps the app. The flip therefore ran twice per press: USD -> LBP -> USD.
+  // The button worked, the handler fired, and nothing on screen ever changed.
   const toggleCurrency = useCallback(() => {
-    // A no-op with dual display off. The toggle is hidden in that mode too (see Dock and
-    // WindowChrome), but guarding here as well means a stray call cannot put the app into a
-    // currency the account said it does not use.
-    setSettings((current) => {
-      if (!current.enableDualCurrency) return current
-      setCurrency((shown) => otherCurrency(shown))
-      return current
-    })
-  }, [])
+    if (!settings.enableDualCurrency) return
+    setCurrency((shown) => otherCurrency(shown))
+  }, [settings.enableDualCurrency])
 
   const updateSettings = useCallback(async (patch) => {
     const { data } = await api.patch('/accounts/currency-settings/', patch)
