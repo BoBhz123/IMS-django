@@ -1,6 +1,6 @@
 import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AuthContext } from '@/context/AuthContext'
 import { INVOICE_FALLBACK_NAME, INVOICE_TAGLINE } from '@/lib/invoiceConfig'
 import { Invoice } from './Invoice'
@@ -198,13 +198,7 @@ describe('Invoice payment stamp', () => {
 })
 
 describe('Invoice sharing', () => {
-  it('offers to create a link before one exists, and no share targets yet', () => {
-    renderInvoice({ onShare: vi.fn() })
-    expect(screen.getByRole('button', { name: /share invoice/i })).toBeInTheDocument()
-    expect(screen.queryByRole('link', { name: /whatsapp/i })).not.toBeInTheDocument()
-  })
-
-  it('mints the link on demand rather than whenever the invoice is opened', async () => {
+  it('mints the public link on demand rather than whenever the invoice is opened', async () => {
     // Sharing publishes customer details to an unauthenticated URL, so it must be a
     // deliberate act — not a side effect of viewing.
     const user = userEvent.setup()
@@ -216,30 +210,161 @@ describe('Invoice sharing', () => {
     expect(onShare).toHaveBeenCalledTimes(1)
   })
 
-  it('shows the share targets once a link exists', () => {
-    renderInvoice({
-      shareUrl: 'https://myimsapp.com/i/tok3n',
-      paymentStatus: 'PAID',
-      paidAmount: 98,
-    })
-    const whatsapp = screen.getByRole('link', { name: /whatsapp/i })
-    expect(whatsapp).toHaveAttribute('href', expect.stringContaining('https://wa.me/?text='))
-    expect(decodeURIComponent(whatsapp.getAttribute('href'))).toContain(
-      'https://myimsapp.com/i/tok3n',
-    )
-    expect(screen.getByRole('link', { name: /telegram/i })).toHaveAttribute(
-      'href', expect.stringContaining('t.me/share/url'),
-    )
+  it('does not offer to copy a link before one exists', () => {
+    renderInvoice({ onShare: vi.fn() })
+    expect(screen.getByRole('button', { name: /share invoice/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /copy link/i })).not.toBeInTheDocument()
+  })
+
+  it('offers to copy the link once one exists', () => {
+    renderInvoice({ shareUrl: 'https://myimsapp.com/i/tok3n' })
     expect(screen.getByRole('button', { name: /copy link/i })).toBeInTheDocument()
   })
 
-  it('opens share targets in a new tab without leaking the opener', () => {
-    renderInvoice({ shareUrl: 'https://myimsapp.com/i/tok3n' })
-    for (const name of [/whatsapp/i, /telegram/i]) {
-      const link = screen.getByRole('link', { name })
-      expect(link).toHaveAttribute('target', '_blank')
-      expect(link.getAttribute('rel')).toContain('noopener')
+  it('sends the document without needing a public link to exist first', () => {
+    // The send buttons carry the PDF and nothing else, so gating them on a share token
+    // would force every send to publish the customer's details to a public URL that is
+    // then never used.
+    renderInvoice({})
+    expect(screen.getByRole('button', { name: /whatsapp/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /telegram/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /download pdf/i })).toBeInTheDocument()
+  })
+
+  it('has no link to this application anywhere in the action bar', () => {
+    // The whole point of the change: a share carries the invoice, not an invitation to
+    // open a web page. No wa.me, no t.me, no share-token URL.
+    const { container } = renderInvoice({ shareUrl: 'https://myimsapp.com/i/tok3n' })
+
+    for (const anchor of container.querySelectorAll('a[href]')) {
+      expect(anchor.getAttribute('href')).not.toMatch(/wa\.me|t\.me|myimsapp\.com/)
     }
+  })
+})
+
+describe('Invoice PDF sharing', () => {
+  function installShare({ canShare, share }) {
+    Object.defineProperty(navigator, 'canShare', { value: canShare, configurable: true })
+    Object.defineProperty(navigator, 'share', { value: share, configurable: true })
+  }
+
+  afterEach(() => {
+    for (const name of ['share', 'canShare']) {
+      if (name in navigator) Reflect.deleteProperty(navigator, name)
+    }
+  })
+
+  it('sends the actual PDF, and only the PDF, to the share sheet', async () => {
+    const user = userEvent.setup()
+    const share = vi.fn().mockResolvedValue(undefined)
+    installShare({ canShare: () => true, share })
+
+    renderInvoice({ shareUrl: 'https://myimsapp.com/i/tok3n', paymentStatus: 'PAID', paidAmount: 98 })
+    await user.click(screen.getByRole('button', { name: /whatsapp/i }))
+
+    expect(share).toHaveBeenCalledTimes(1)
+    const [payload] = share.mock.calls[0]
+    expect(payload.files).toHaveLength(1)
+    expect(payload.files[0].type).toBe('application/pdf')
+    expect(payload.files[0].name).toMatch(/^Invoice_\d{4}-\d{2}-\d{2}_.*\.pdf$/)
+    // A PDF, not a stub: the header is the first four bytes of any valid file.
+    expect(await payload.files[0].slice(0, 4).text()).toBe('%PDF')
+
+    // No body, and above all no URL back into this app — even though this invoice has a
+    // live share token, which is precisely the case that used to leak one.
+    expect(payload.text).toBeUndefined()
+    expect(payload.title).toMatch(/^Invoice #/)
+    expect(JSON.stringify({ t: payload.title })).not.toMatch(/http|wa\.me|t\.me/)
+  })
+
+  it('shares the document from Telegram too', async () => {
+    const user = userEvent.setup()
+    const share = vi.fn().mockResolvedValue(undefined)
+    installShare({ canShare: () => true, share })
+
+    renderInvoice({ shareUrl: 'https://myimsapp.com/i/tok3n' })
+    await user.click(screen.getByRole('button', { name: /telegram/i }))
+
+    expect(share).toHaveBeenCalledTimes(1)
+    expect(share.mock.calls[0][0].files[0].type).toBe('application/pdf')
+    expect(share.mock.calls[0][0].text).toBeUndefined()
+  })
+
+  it('downloads the PDF where the platform cannot share files', async () => {
+    // Firefox and most desktop Linux. A wa.me link cannot attach the file, so opening one
+    // would deliver a web link from a button labelled WhatsApp. The download leaves the
+    // reader holding the real document instead.
+    const user = userEvent.setup()
+    const share = vi.fn()
+    const createObjectURL = vi.fn(() => 'blob:invoice')
+    installShare({ canShare: () => false, share })
+    vi.stubGlobal('URL', Object.assign(Object.create(URL), {
+      createObjectURL, revokeObjectURL: vi.fn(),
+    }))
+
+    renderInvoice({ shareUrl: 'https://myimsapp.com/i/tok3n' })
+    await user.click(screen.getByRole('button', { name: /whatsapp/i }))
+
+    expect(share).not.toHaveBeenCalled()
+    expect(createObjectURL).toHaveBeenCalledTimes(1)
+    expect(createObjectURL.mock.calls[0][0].type).toBe('application/pdf')
+    vi.unstubAllGlobals()
+  })
+
+  it('falls back to a download when the share sheet itself fails', async () => {
+    const user = userEvent.setup()
+    const createObjectURL = vi.fn(() => 'blob:invoice')
+    installShare({
+      canShare: () => true,
+      share: vi.fn().mockRejectedValue(new Error('NotAllowedError')),
+    })
+    vi.stubGlobal('URL', Object.assign(Object.create(URL), {
+      createObjectURL, revokeObjectURL: vi.fn(),
+    }))
+
+    renderInvoice({})
+    await user.click(screen.getByRole('button', { name: /telegram/i }))
+
+    expect(createObjectURL).toHaveBeenCalledTimes(1)
+    vi.unstubAllGlobals()
+  })
+
+  it('does not download when the reader simply dismisses the share sheet', async () => {
+    // A dismissal is a decision, not a failure — pushing a file into the downloads folder
+    // because somebody closed the sheet is the wrong recovery.
+    const user = userEvent.setup()
+    const createObjectURL = vi.fn(() => 'blob:invoice')
+    const abort = Object.assign(new Error('cancelled'), { name: 'AbortError' })
+    installShare({ canShare: () => true, share: vi.fn().mockRejectedValue(abort) })
+    vi.stubGlobal('URL', Object.assign(Object.create(URL), {
+      createObjectURL, revokeObjectURL: vi.fn(),
+    }))
+
+    renderInvoice({})
+    await user.click(screen.getByRole('button', { name: /whatsapp/i }))
+
+    expect(createObjectURL).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('offers a download that does not depend on the share sheet at all', async () => {
+    const user = userEvent.setup()
+    const createObjectURL = vi.fn(() => 'blob:invoice')
+    const revokeObjectURL = vi.fn()
+    vi.stubGlobal('URL', Object.assign(Object.create(URL), { createObjectURL, revokeObjectURL }))
+
+    renderInvoice({ shareUrl: 'https://myimsapp.com/i/tok3n' })
+    await user.click(screen.getByRole('button', { name: /download pdf/i }))
+
+    expect(createObjectURL).toHaveBeenCalledTimes(1)
+    expect(createObjectURL.mock.calls[0][0].type).toBe('application/pdf')
+    vi.unstubAllGlobals()
+  })
+
+  it('does not need a share link before the PDF can be downloaded', () => {
+    // The document exists whether or not it has been published to a public URL.
+    renderInvoice({})
+    expect(screen.getByRole('button', { name: /download pdf/i })).toBeInTheDocument()
   })
 
   it('has a close action in the toolbar', async () => {

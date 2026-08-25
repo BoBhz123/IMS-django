@@ -3010,6 +3010,35 @@ class HtmlEmailTests(TestCase):
         emails.send_verification_code(self.user, '<script>x</script>')
         self.assertNotIn('<script>', self.html_of(self.sent()))
 
+    def test_no_raw_template_syntax_reaches_the_reader(self):
+        """
+        Django's `{# ... #}` is a *single-line* comment and nothing else — a newline between
+        the delimiters is not a comment at all, it is literal text, and the whole block is
+        emitted into the body where Gmail renders it as visible paragraphs above the code.
+        There is no error and no warning; the template renders "successfully".
+
+        Asserted on both bodies and over every delimiter, because the failure is silent in
+        exactly the place nobody looks: an email that was already sent.
+        """
+        emails.send_verification_code(self.user, '123456')
+        emails.send_password_reset_code(self.user, '654321')
+
+        for message in mail.outbox:
+            for body in (message.body, self.html_of(message)):
+                for delimiter in ('{#', '#}', '{%', '%}', '{{', '}}'):
+                    self.assertNotIn(
+                        delimiter, body,
+                        f'raw template syntax {delimiter!r} leaked into a sent email',
+                    )
+
+    def test_the_html_carries_the_brand_mark_and_the_accent(self):
+        emails.send_verification_code(self.user, '123456')
+        html = self.html_of(self.sent())
+        # The logo is drawn from table cells and background colours, never an <img> — see
+        # test_the_html_has_no_remote_content for why a remote asset is not an option.
+        self.assertIn('#2563EB', html)
+        self.assertIn('IMS', html)
+
 
 @override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')
 class SendTestEmailTemplateTests(TestCase):
@@ -3837,4 +3866,96 @@ class CurrencySettingsDoNotReachBillingTests(TestCase):
             offenders, [],
             'billing must never branch on a display-currency setting — every card charge is '
             f'USD by contract. Found: {offenders}',
+        )
+
+
+class AccountAwareJWTAuthenticationTests(TestCase):
+    """
+    The custom authentication class, and the checks it inherited by copying.
+
+    `AccountAwareJWTAuthentication.get_user` is a full override of simplejwt's, taken so the
+    user, the membership and the account arrive in one query instead of three. That means the
+    library's own rejections are duplicated code here rather than inherited behaviour, so
+    each one is asserted — if an update to this class drops a check, these fail rather than
+    quietly widening who can authenticate.
+    """
+
+    def setUp(self):
+        from accounts.authentication import AccountAwareJWTAuthentication
+
+        self.auth = AccountAwareJWTAuthentication()
+        self.user = User.objects.create_user(
+            username='member@example.com', email='member@example.com', password='pw-12345',
+        )
+        self.account = Account.objects.create(
+            name='Corner Shop', subscription_status=Account.ACTIVE,
+        )
+        Membership.objects.create(user=self.user, account=self.account, is_owner=True)
+
+    def token_for(self, user):
+        from rest_framework_simplejwt.tokens import RefreshToken
+
+        return RefreshToken.for_user(user).access_token
+
+    def test_the_user_membership_and_account_arrive_in_one_query(self):
+        # The whole reason the class exists. Traversing membership/account afterwards must
+        # not touch the database, or the join was not used.
+        token = self.token_for(self.user)
+
+        with self.assertNumQueries(1):
+            user = self.auth.get_user(token)
+            self.assertEqual(user.membership.account.name, 'Corner Shop')
+
+    def test_get_account_is_free_once_authenticated(self):
+        from accounts.models import get_account
+
+        user = self.auth.get_user(self.token_for(self.user))
+        with self.assertNumQueries(0):
+            self.assertEqual(get_account(user), self.account)
+
+    def test_a_user_without_a_membership_still_authenticates(self):
+        # Platform superadmins have no membership. select_related on a missing reverse
+        # one-to-one must not raise — get_account returns None and the scoping denies.
+        from accounts.models import get_account
+
+        orphan = User.objects.create_user(username='orphan', password='pw-12345')
+        user = self.auth.get_user(self.token_for(orphan))
+        self.assertIsNone(get_account(user))
+
+    # --- the copied checks ------------------------------------------------------------------
+
+    def test_an_inactive_user_is_rejected(self):
+        from rest_framework_simplejwt.exceptions import AuthenticationFailed
+
+        token = self.token_for(self.user)
+        self.user.is_active = False
+        self.user.save(update_fields=['is_active'])
+
+        with self.assertRaises(AuthenticationFailed):
+            self.auth.get_user(token)
+
+    def test_a_token_for_a_deleted_user_is_rejected(self):
+        from rest_framework_simplejwt.exceptions import AuthenticationFailed
+
+        token = self.token_for(self.user)
+        self.user.delete()
+
+        with self.assertRaises(AuthenticationFailed):
+            self.auth.get_user(token)
+
+    def test_a_token_with_no_user_claim_is_rejected(self):
+        from rest_framework_simplejwt.exceptions import InvalidToken
+        from rest_framework_simplejwt.settings import api_settings
+
+        token = self.token_for(self.user)
+        del token.payload[api_settings.USER_ID_CLAIM]
+
+        with self.assertRaises(InvalidToken):
+            self.auth.get_user(token)
+
+    def test_it_is_the_configured_default(self):
+        # Wired in settings, or every request goes back to paying the three queries.
+        self.assertIn(
+            'accounts.authentication.AccountAwareJWTAuthentication',
+            settings.REST_FRAMEWORK['DEFAULT_AUTHENTICATION_CLASSES'],
         )

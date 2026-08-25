@@ -196,6 +196,13 @@ select {
      margin is zero; Firefox honours its own preference and may still print them, which is a
      browser setting and not something a stylesheet can override. The paper's own breathing
      room is .invoice-print's padding below — with margin: 0 nothing else supplies it. */
+  /* The page box stays at margin:0 and the 10mm is supplied by .invoice-print's padding
+     below. The two are geometrically identical on paper, and the difference is that
+     `@page { margin: 10mm }` hands the browser back its default headers and footers — the
+     source URL, the document title and a timestamp, printed on a document that goes to a
+     customer. Zero page margin is the only lever CSS has over those, so the margin is moved
+     inside the element rather than given to the page box. Firefox honours its own preference
+     either way, which is a browser setting a stylesheet cannot reach. */
   @page {
     size: auto;
     margin: 0;
@@ -235,8 +242,10 @@ select {
     width: 100%;
     max-width: 800px;
     margin: 0 auto;
-    /* @page margin is 0, so the invoice supplies its own. */
-    padding: 12mm;
+    /* @page margin is 0, so the invoice supplies its own. 10mm is the tight-but-professional
+       figure — under about 8mm the content starts landing inside the non-printable edge that
+       most inkjets physically cannot reach. */
+    padding: 10mm;
     height: auto;
     max-height: none !important;
     overflow: visible !important;
@@ -280,7 +289,63 @@ select {
     break-inside: avoid;
     page-break-inside: avoid;
   }
+
+  /* --- print typography -------------------------------------------------------------------
+     Screen sizes are in px, which a print renderer resolves against an assumed 96dpi and so
+     produces type that is merely "whatever that px happened to be" on paper. Points are the
+     unit paper is actually specified in, so the sizes below are what the invoice is set in
+     when printed, independent of the screen it was laid out on.
+
+     The px values these override are Tailwind arbitrary utilities (text-[13px] and friends)
+     which carry single-class specificity, so !important is what makes these land — matching
+     how the rest of this block already works. */
+  .invoice-print .invoice-page {
+    font-size: 9pt !important;
+    line-height: 1.35 !important;
+  }
+  .invoice-print table {
+    font-size: 8.5pt !important;
+  }
+  .invoice-print thead th {
+    font-size: 6.5pt !important;
+  }
+
+  /* Row padding, not font size, is what decides how many lines fit on a sheet: at 13 rows
+     it is worth roughly a third of a page. Halving the vertical padding keeps the type at a
+     comfortable reading size while fitting an ordinary multi-item invoice on one page. */
+  .invoice-print thead th,
+  .invoice-print tbody td {
+    padding-top: 1.4mm !important;
+    padding-bottom: 1.4mm !important;
+  }
+
+  /* The blocks around the table tighten proportionally, or the table gains a page's worth of
+     rows and the letterhead gives it straight back. */
+  .invoice-print .invoice-page > * + * {
+    margin-top: 4mm !important;
+  }
+  .invoice-print .invoice-page > *:last-child {
+    margin-top: 5mm !important;
+    padding-top: 2.5mm !important;
+  }
+
   .no-print {
     display: none !important;
+  }
+}
+
+/* On screen the invoice is a preview inside a modal, not a sheet of paper, so it is scaled
+   down to put more of the document in view before scrolling. `zoom` rather than
+   `transform: scale()` on purpose: a transform scales the painted result but leaves the
+   element's layout box at full size, so the modal keeps reserving the unscaled height and
+   the saving shows up as empty space below the invoice instead of as more visible rows.
+   `zoom` reflows, so the container shrinks with the content.
+
+   Print is unaffected — this is inside a screen query, and the print block above resets
+   transforms anyway. Browsers without `zoom` simply render at full size, which is the
+   behaviour this replaced. */
+@media screen {
+  .invoice-preview {
+    zoom: 0.88;
   }
 }

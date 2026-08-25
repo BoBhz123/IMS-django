@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 
 const ThemeContext = createContext(null)
 
@@ -16,9 +16,20 @@ export function ThemeProvider({ children }) {
     localStorage.setItem('ims.theme', theme)
   }, [theme])
 
-  const toggleTheme = () => setTheme((current) => (current === 'dark' ? 'light' : 'dark'))
+  // Stable identity, so a consumer that only reads `toggleTheme` is not re-rendered by a
+  // theme change it does not display.
+  const toggleTheme = useCallback(
+    () => setTheme((current) => (current === 'dark' ? 'light' : 'dark')),
+    [],
+  )
 
-  return <ThemeContext.Provider value={{ theme, toggleTheme }}>{children}</ThemeContext.Provider>
+  // An object literal here is a new identity on every render of this provider, which
+  // re-renders every consumer in the tree whether or not the theme actually changed. This
+  // provider wraps the whole app, so that is every themed component in it. AuthContext and
+  // CurrencyContext are both already memoised for the same reason — see the Working Log.
+  const value = useMemo(() => ({ theme, toggleTheme }), [theme, toggleTheme])
+
+  return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>
 }
 
 export function useTheme() {

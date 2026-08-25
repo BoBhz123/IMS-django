@@ -1,9 +1,10 @@
 /**
- * Share-message construction for an invoice.
+ * Sharing an invoice as a document.
  *
- * Pure string building, kept out of React so the wording and the URL encoding can be tested
- * without rendering anything — a share link that loses its line breaks or double-encodes its
- * URL is invisible until a customer receives it.
+ * There is deliberately no message-building here any more. This module used to compose a
+ * plain-text summary and encode it into wa.me / t.me share URLs; both are gone, because a
+ * share now carries the PDF itself and no link to this application. See the block comment
+ * below for why a link cannot carry a file, and what replaced it.
  */
 
 const STATUS_LABEL = {
@@ -17,65 +18,77 @@ export function paymentLabel(status) {
   return STATUS_LABEL[status] ?? 'UNPAID'
 }
 
-/**
- * The plain-text summary sent to WhatsApp or Telegram.
+/* --- sharing the document itself ---------------------------------------------------------
  *
- * `formatPrimary`/`formatSecondary` are injected rather than imported so the message renders
- * in whatever currency the account is configured for, and omits the conversion line entirely
- * when dual display is off — `formatSecondary` returns null in that mode.
+ * A `wa.me` or `t.me/share/url` link carries text and a URL and nothing else — neither
+ * scheme has a parameter for an attachment, and no amount of encoding adds one. Sending the
+ * actual PDF therefore cannot go through those links at all; it goes through the Web Share
+ * API, which hands the file to the OS share sheet where the reader picks WhatsApp, Telegram
+ * or anything else installed.
+ *
+ * The consequence worth stating: a web page cannot preselect WhatsApp for a file share. The
+ * sheet is the OS's, and choosing the target is the user's step. What the buttons below do
+ * is put the real document into that sheet instead of a link to a web page.
+ *
+ * Support is real but not universal — Chrome on Android, Safari on iOS and Chrome/Edge on
+ * Windows share files; Firefox does not, and desktop Linux generally does not. Where it is
+ * unsupported the caller downloads the PDF instead of opening a share URL: a wa.me link
+ * cannot attach the file, so sending one would deliver a link to a web page under the label
+ * "share the invoice", which is the thing this was changed to stop doing. A download at
+ * least leaves the reader holding the actual document to attach by hand.
  */
-export function buildShareMessage({
-  reference,
-  sellerName,
-  total,
-  paymentStatus,
-  paidAmount = 0,
-  remainingAmount = 0,
-  itemCount,
-  shareUrl,
-  formatPrimary,
-  formatSecondary = () => null,
-}) {
-  const lines = []
-  lines.push(`Invoice ${reference}${sellerName ? ` — ${sellerName}` : ''}`)
 
-  const converted = formatSecondary(total)
-  lines.push(
-    `${itemCount} ${itemCount === 1 ? 'item' : 'items'} · Total ${formatPrimary(total)}` +
-      (converted ? ` (${converted})` : ''),
-  )
+/** Wraps a PDF blob as a `File`, which is what `navigator.share` requires. */
+export function makeInvoiceFile(blob, fileName) {
+  return new File([blob], fileName, { type: 'application/pdf' })
+}
 
-  const status = paymentLabel(paymentStatus)
-  if (paymentStatus === 'PAID') {
-    lines.push(`${status} · ${formatPrimary(paidAmount)}`)
-  } else if (paymentStatus === 'PARTIALLY_PAID') {
-    lines.push(
-      `${status} · Paid ${formatPrimary(paidAmount)} · Balance ${formatPrimary(remainingAmount)}`,
-    )
-  } else {
-    lines.push(`${status} · Balance ${formatPrimary(remainingAmount)}`)
+/**
+ * Whether this browser can share this actual file.
+ *
+ * Tested with the real `File` rather than a bare capability check: `navigator.share` may
+ * exist while file sharing specifically is unsupported, and `canShare` also rejects types
+ * the platform will not accept. Guarded for jsdom and SSR, where `navigator.canShare` is
+ * simply absent.
+ */
+export function canShareFiles(file) {
+  if (typeof navigator === 'undefined') return false
+  if (typeof navigator.share !== 'function' || typeof navigator.canShare !== 'function') {
+    return false
   }
-
-  if (shareUrl) lines.push(shareUrl)
-  return lines.join('\n')
+  try {
+    return navigator.canShare({ files: [file] })
+  } catch {
+    // Older implementations throw on an unexpected payload instead of returning false.
+    return false
+  }
 }
 
 /**
- * wa.me takes the whole message as one encoded `text` parameter — there is no separate URL
- * field, so the link has to live inside the message body.
+ * Hands the file to the OS share sheet.
+ *
+ * Resolves to one of 'shared' | 'dismissed' | 'unsupported' | 'error' rather than throwing,
+ * because the caller's decision differs per outcome and only one of them is a failure worth
+ * telling the user about. A dismissal is an AbortError — the reader opened the sheet and
+ * changed their mind, which must not paint an error over a working feature.
+ *
+ * `title` and `text` are omitted from the payload when absent rather than passed as
+ * undefined: some implementations validate the shape and an explicit `text: undefined` is
+ * not the same as no text. The invoice path sends the file and a title only — no body, and
+ * in particular no URL back into this application.
  */
-export function whatsappShareUrl(message) {
-  return `https://wa.me/?text=${encodeURIComponent(message)}`
-}
+export async function shareInvoiceFile({ file, title, text }) {
+  if (!canShareFiles(file)) return 'unsupported'
 
-/**
- * Telegram takes the URL and the text separately. `url` must still be encoded on its own:
- * Telegram renders the preview from it, and an unencoded one truncates at the first `&`.
- * With no shareable URL the text alone is still valid.
- */
-export function telegramShareUrl(message, shareUrl) {
-  const params = new URLSearchParams()
-  params.set('url', shareUrl || '')
-  params.set('text', message)
-  return `https://t.me/share/url?${params.toString()}`
+  const payload = { files: [file] }
+  if (title) payload.title = title
+  if (text) payload.text = text
+
+  try {
+    await navigator.share(payload)
+    return 'shared'
+  } catch (error) {
+    if (error?.name === 'AbortError') return 'dismissed'
+    return 'error'
+  }
 }

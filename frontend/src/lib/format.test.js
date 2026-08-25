@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { fillSeriesGaps, formatLBP } from '@/lib/format'
 
 describe('fillSeriesGaps', () => {
@@ -136,5 +136,75 @@ describe('formatLBP', () => {
 
   it('keeps one decimal in compact mode, which is a magnitude not a pound amount', () => {
     expect(formatLBP(20, 89000, { compact: true })).toBe('1.8M LBP')
+  })
+})
+
+describe('Intl formatter reuse', () => {
+  /**
+   * Constructing an Intl formatter resolves a locale and costs ~50x what formatting a
+   * number does. These functions are called several times per table row, and every list
+   * page renders its rows twice, so building one per call put hundreds of locale
+   * resolutions on every keystroke of a debounced search.
+   *
+   * The module is re-imported per test so the assertion sees a cold cache — otherwise an
+   * earlier test in this file has already populated it and the spy counts nothing.
+   */
+  it('builds one number formatter per option shape, not one per call', async () => {
+    vi.resetModules()
+    const Real = Intl.NumberFormat
+    // spyOn alone does not preserve `new` semantics, so the spy constructs the real
+    // formatter itself. It must be a `function` — an arrow is not a constructor.
+    const spy = vi.spyOn(Intl, 'NumberFormat')
+      .mockImplementation(function (...a) { return new Real(...a) })
+    const { formatMoney } = await import('@/lib/format')
+
+    for (let i = 0; i < 50; i += 1) formatMoney(i)
+
+    expect(spy).toHaveBeenCalledTimes(1)
+    spy.mockRestore()
+  })
+
+  it('still distinguishes option shapes rather than caching one for everything', async () => {
+    vi.resetModules()
+    const Real = Intl.NumberFormat
+    // spyOn alone does not preserve `new` semantics, so the spy constructs the real
+    // formatter itself. It must be a `function` — an arrow is not a constructor.
+    const spy = vi.spyOn(Intl, 'NumberFormat')
+      .mockImplementation(function (...a) { return new Real(...a) })
+    const { formatMoney } = await import('@/lib/format')
+
+    formatMoney(1)
+    formatMoney(1, { compact: true })
+    formatMoney(2)
+    formatMoney(2, { compact: true })
+
+    // One for standard, one for compact — and no more.
+    expect(spy).toHaveBeenCalledTimes(2)
+    spy.mockRestore()
+  })
+
+  it('builds one date formatter per option shape', async () => {
+    vi.resetModules()
+    const Real = Intl.DateTimeFormat
+    const spy = vi.spyOn(Intl, 'DateTimeFormat')
+      .mockImplementation(function (...a) { return new Real(...a) })
+    const { formatDate } = await import('@/lib/format')
+
+    for (let i = 1; i <= 20; i += 1) formatDate(`2026-08-${String(i).padStart(2, '0')}`)
+
+    expect(spy).toHaveBeenCalledTimes(1)
+    spy.mockRestore()
+  })
+
+  it('formats identically whether the formatter is cold or cached', async () => {
+    // The optimisation must be invisible in output — a changed string here would be a
+    // changed invoice, CSV or dashboard figure.
+    vi.resetModules()
+    const { formatMoney: cold } = await import('@/lib/format')
+    const first = cold(1234.5)
+    const second = cold(1234.5)
+
+    expect(first).toBe('$1,234.50')
+    expect(second).toBe(first)
   })
 })

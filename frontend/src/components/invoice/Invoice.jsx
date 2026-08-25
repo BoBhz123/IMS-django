@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
-import { Check, Copy, Printer, Send, Share2, X } from 'lucide-react'
-import { buildShareMessage, paymentLabel, telegramShareUrl, whatsappShareUrl } from '@/lib/invoiceShare'
+import { Check, Copy, Download, Printer, Send, Share2, X } from 'lucide-react'
+import {
+  canShareFiles,
+  makeInvoiceFile,
+  paymentLabel,
+  shareInvoiceFile,
+} from '@/lib/invoiceShare'
+import { invoicePdfBlob } from '@/lib/invoicePdf'
 import { Modal } from '@/components/ui/Modal'
 import { formatDate, formatLBP, formatMoney, invoiceFileName, shortId } from '@/lib/format'
 import { INVOICE_FOOTER_NOTE, INVOICE_TAGLINE } from '@/lib/invoiceConfig'
@@ -72,26 +78,105 @@ export function Invoice({
   const [copied, setCopied] = useState(false)
   const copyResetRef = useRef(null)
   const restorePrintTitleRef = useRef(null)
+  const revokeRef = useRef(null)
+  const objectUrlsRef = useRef([])
 
   useEffect(() => () => {
     clearTimeout(copyResetRef.current)
+    clearTimeout(revokeRef.current)
+    // An object URL pins its blob in memory until revoked. Unmounting before the deferred
+    // revoke fires would strand a whole PDF per download for the life of the document.
+    objectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url))
+    objectUrlsRef.current = []
     // Runs the restore rather than only detaching it: unmounting mid-print must not leave the
     // browser tab named after an invoice.
     restorePrintTitleRef.current?.()
   }, [])
 
-  const shareMessage = buildShareMessage({
-    reference: shortId(id),
-    sellerName: seller.name,
-    total,
-    paymentStatus,
-    paidAmount,
-    remainingAmount,
-    itemCount: rows.length,
-    shareUrl,
-    formatPrimary: primary,
-    formatSecondary: secondary,
-  })
+  /**
+   * Renders the invoice to a PDF `File`.
+   *
+   * Synchronous on purpose. `navigator.share` must be called inside the user gesture that
+   * triggered it, and awaiting anything first — a dynamic import, a fetch, a canvas render —
+   * spends that gesture and makes the share throw on Safari. Building the bytes inline keeps
+   * the whole path gesture-safe, which is the practical reason lib/pdf.js exists at all.
+   */
+  function buildInvoiceFile() {
+    const blob = invoicePdfBlob({
+      documentType,
+      reference: shortId(id),
+      placedAt,
+      seller,
+      partyLabel,
+      partyName,
+      partyPhone,
+      partyLocation,
+      rows,
+      paymentStatus,
+      paidAmount,
+      remainingAmount,
+      secondaryCode,
+      formatPrimary: primary,
+      formatSecondary: secondary,
+      formatDate,
+      tagline: INVOICE_TAGLINE,
+      footerNote: INVOICE_FOOTER_NOTE,
+    })
+    return makeInvoiceFile(blob, invoiceFileName(placedAt, id))
+  }
+
+  function downloadPdfFile(file) {
+    const url = URL.createObjectURL(file)
+    objectUrlsRef.current.push(url)
+
+    const link = document.createElement('a')
+    link.href = url
+    link.download = file.name
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+
+    // Revoking synchronously cancels the download in Firefox and older WebKit — the browser
+    // has not finished reading the blob when the handler returns.
+    clearTimeout(revokeRef.current)
+    revokeRef.current = setTimeout(() => {
+      URL.revokeObjectURL(url)
+      objectUrlsRef.current = objectUrlsRef.current.filter((held) => held !== url)
+    }, 10000)
+  }
+
+  /**
+   * Sends the invoice as a document — the PDF and nothing else.
+   *
+   * There is no link in this path. The share carries the file and a title; it does not carry
+   * a URL back into this app, so what the recipient gets is the invoice rather than an
+   * invitation to open a web page. That also means the public share link is no longer
+   * involved in sending an invoice at all — it stays available under "Share invoice" and
+   * "Copy link" for anyone who does want a URL.
+   *
+   * Where the platform cannot share files — Firefox, most desktop Linux — the fallback is a
+   * download, not a wa.me link. A wa.me link cannot attach the file, so opening one would
+   * deliver a web link under a button labelled "WhatsApp" and quietly reintroduce exactly
+   * what this replaced. A download leaves the reader holding the real document to attach.
+   */
+  function handleSendPdf() {
+    const file = buildInvoiceFile()
+
+    if (!canShareFiles(file)) {
+      downloadPdfFile(file)
+      return
+    }
+
+    shareInvoiceFile({ file, title: `Invoice #${shortId(id)}` }).then((result) => {
+      // A dismissal is the reader changing their mind and needs no recovery. A genuine
+      // failure still has to leave them with the document.
+      if (result === 'error') downloadPdfFile(file)
+    })
+  }
+
+  function handleDownloadPdf() {
+    downloadPdfFile(buildInvoiceFile())
+  }
 
   async function handleCopyLink() {
     try {
@@ -146,6 +231,42 @@ export function Invoice({
             Print / Save PDF
           </button>
 
+          {/* The guaranteed path to the file, and the one action here that always produces
+              the document regardless of platform — so it carries the app's red accent to
+              stand out from the neutral chrome around it. `accent-red` rather than a raw
+              `red-600`: the token is what shifts correctly between light and dark themes,
+              which a hardcoded Tailwind colour does not. */}
+          <button
+            type="button"
+            onClick={handleDownloadPdf}
+            className="flex items-center gap-1.5 rounded-xl bg-accent-red px-3 py-1.5 text-[13px] font-semibold text-white hover:opacity-90"
+          >
+            <Download size={14} />
+            Download PDF
+          </button>
+
+          {/* Sending the document. Both targets do the same thing — hand the PDF to the OS
+              share sheet — because no web page can preselect an app for a file share; the
+              sheet belongs to the OS and the reader picks from it. They are kept as two
+              familiar affordances rather than one "Send" button, and neither depends on a
+              public share link existing. */}
+          <button
+            type="button"
+            onClick={handleSendPdf}
+            className="flex items-center gap-1.5 rounded-xl bg-[#25D366] px-3 py-1.5 text-[13px] font-semibold text-white hover:opacity-90"
+          >
+            <Share2 size={14} />
+            WhatsApp
+          </button>
+          <button
+            type="button"
+            onClick={handleSendPdf}
+            className="flex items-center gap-1.5 rounded-xl bg-[#229ED9] px-3 py-1.5 text-[13px] font-semibold text-white hover:opacity-90"
+          >
+            <Send size={14} />
+            Telegram
+          </button>
+
           {/* Sharing is opt-in per invoice: the first press mints a public link (see
               PublicInvoiceView), so it is a deliberate act rather than something that happens
               because the invoice was opened. */}
@@ -162,34 +283,14 @@ export function Invoice({
           )}
 
           {shareUrl && (
-            <>
-              <a
-                href={whatsappShareUrl(shareMessage)}
-                target="_blank"
-                rel="noreferrer noopener"
-                className="flex items-center gap-1.5 rounded-xl bg-[#25D366] px-3 py-1.5 text-[13px] font-semibold text-white hover:opacity-90"
-              >
-                <Share2 size={14} />
-                WhatsApp
-              </a>
-              <a
-                href={telegramShareUrl(shareMessage, shareUrl)}
-                target="_blank"
-                rel="noreferrer noopener"
-                className="flex items-center gap-1.5 rounded-xl bg-[#229ED9] px-3 py-1.5 text-[13px] font-semibold text-white hover:opacity-90"
-              >
-                <Send size={14} />
-                Telegram
-              </a>
-              <button
-                type="button"
-                onClick={handleCopyLink}
-                className="flex items-center gap-1.5 rounded-xl border border-hairline px-3 py-1.5 text-[13px] font-semibold text-text-primary hover:bg-canvas-2"
-              >
-                {copied ? <Check size={14} /> : <Copy size={14} />}
-                {copied ? 'Copied' : 'Copy link'}
-              </button>
-            </>
+            <button
+              type="button"
+              onClick={handleCopyLink}
+              className="flex items-center gap-1.5 rounded-xl border border-hairline px-3 py-1.5 text-[13px] font-semibold text-text-primary hover:bg-canvas-2"
+            >
+              {copied ? <Check size={14} /> : <Copy size={14} />}
+              {copied ? 'Copied' : 'Copy link'}
+            </button>
           )}
 
           <button
@@ -202,7 +303,9 @@ export function Invoice({
           </button>
         </div>
 
-        <div className="invoice-page">
+        {/* `invoice-preview` scales the document down on screen only — see index.css. The
+            print rules key off `invoice-print` on the wrapper and are unaffected. */}
+        <div className="invoice-page invoice-preview">
           {/* Letterhead: who is billing, and which document this is. No logo and no seller
               address — neither is in the reference layout, and neither is stored per account. */}
           <div className="avoid-break mb-6 flex flex-col gap-4 border-b-2 border-[#4F46E5] pb-5 sm:flex-row sm:items-start sm:justify-between">
@@ -260,29 +363,29 @@ export function Invoice({
             <table className="w-full min-w-[520px] border-collapse text-left text-[13px] print:min-w-0">
               <thead>
                 <tr className="bg-[#4F46E5] text-[10px] tracking-[0.06em] text-white uppercase">
-                  <th className="w-8 px-2 py-2.5 text-center font-bold">#</th>
-                  <th className="px-3 py-2.5 font-bold">Items</th>
-                  <th className="w-14 px-2 py-2.5 text-right font-bold">Qty</th>
-                  <th className="w-24 px-3 py-2.5 text-right font-bold">Unit cost</th>
-                  <th className="w-24 px-3 py-2.5 text-right font-bold">Total</th>
+                  <th className="w-8 px-2 py-2 text-center font-bold">#</th>
+                  <th className="px-3 py-2 font-bold">Items</th>
+                  <th className="w-14 px-2 py-2 text-right font-bold">Qty</th>
+                  <th className="w-24 px-3 py-2 text-right font-bold">Unit cost</th>
+                  <th className="w-24 px-3 py-2 text-right font-bold">Total</th>
                 </tr>
               </thead>
               <tbody>
                 {rows.map((row, index) => (
                   <tr key={index} className={index % 2 === 1 ? 'bg-[#F1F5F9]' : 'bg-white'}>
-                    <td className="border-b border-slate-200 px-2 py-2.5 text-center text-slate-400 tabular-nums">
+                    <td className="border-b border-slate-200 px-2 py-2 text-center text-slate-400 tabular-nums">
                       {index + 1}
                     </td>
-                    <td className="border-b border-slate-200 px-3 py-2.5 text-slate-900">
+                    <td className="border-b border-slate-200 px-3 py-2 text-slate-900">
                       {row.name}
                     </td>
-                    <td className="border-b border-slate-200 px-2 py-2.5 text-right text-slate-500 tabular-nums">
+                    <td className="border-b border-slate-200 px-2 py-2 text-right text-slate-500 tabular-nums">
                       {row.quantity}
                     </td>
-                    <td className="border-b border-slate-200 px-3 py-2.5 text-right text-slate-500 tabular-nums">
+                    <td className="border-b border-slate-200 px-3 py-2 text-right text-slate-500 tabular-nums">
                       {primary(row.unitPrice)}
                     </td>
-                    <td className="border-b border-slate-200 px-3 py-2.5 text-right font-medium text-slate-900 tabular-nums">
+                    <td className="border-b border-slate-200 px-3 py-2 text-right font-medium text-slate-900 tabular-nums">
                       {primary(row.lineTotal)}
                     </td>
                   </tr>

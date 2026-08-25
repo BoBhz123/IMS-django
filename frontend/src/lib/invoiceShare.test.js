@@ -1,18 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-  buildShareMessage, paymentLabel, telegramShareUrl, whatsappShareUrl,
+  canShareFiles,
+  makeInvoiceFile,
+  paymentLabel,
+  shareInvoiceFile,
 } from './invoiceShare'
-
-const usd = (value) => `$${Number(value).toFixed(2)}`
-
-const base = {
-  reference: 'A3F2B1C9',
-  sellerName: 'Acme Trading',
-  total: 148,
-  itemCount: 3,
-  shareUrl: 'https://myimsapp.com/i/tok3n',
-  formatPrimary: usd,
-}
 
 describe('paymentLabel', () => {
   it('spells out a partial payment', () => {
@@ -26,64 +18,98 @@ describe('paymentLabel', () => {
   })
 })
 
-describe('buildShareMessage', () => {
-  it('states the balance still owing on a partial payment', () => {
-    const message = buildShareMessage({
-      ...base, paymentStatus: 'PARTIALLY_PAID', paidAmount: 100, remainingAmount: 48,
+describe('sharing the document itself', () => {
+  const pdf = () =>
+    makeInvoiceFile(new Blob([new Uint8Array([0x25, 0x50])], { type: 'application/pdf' }),
+      'Invoice_2026-08-24_A3F2B1C9.pdf')
+
+  /** jsdom ships neither `share` nor `canShare`, so both are installed per test. */
+  function installShare({ canShare, share }) {
+    for (const [name, value] of Object.entries({ canShare, share })) {
+      if (value === undefined) continue
+      Object.defineProperty(navigator, name, { value, configurable: true, writable: true })
+    }
+  }
+
+  afterEach(() => {
+    for (const name of ['share', 'canShare']) {
+      if (name in navigator) Reflect.deleteProperty(navigator, name)
+    }
+  })
+
+  it('names the file so the recipient sees an invoice, not a blob', () => {
+    const file = pdf()
+    expect(file.name).toBe('Invoice_2026-08-24_A3F2B1C9.pdf')
+    expect(file.type).toBe('application/pdf')
+  })
+
+  it('reports no file sharing on a browser without the Web Share API', () => {
+    // Firefox and most desktop Linux. The caller downloads the PDF there rather than
+    // opening a share URL, which could not carry the file anyway.
+    expect(canShareFiles(pdf())).toBe(false)
+  })
+
+  it('reports no file sharing when share exists but files are unsupported', () => {
+    // Older Safari: navigator.share is present for text but rejects files.
+    installShare({ share: vi.fn(), canShare: () => false })
+    expect(canShareFiles(pdf())).toBe(false)
+  })
+
+  it('reports no file sharing when canShare throws on the payload', () => {
+    installShare({ share: vi.fn(), canShare: () => { throw new TypeError('bad payload') } })
+    expect(canShareFiles(pdf())).toBe(false)
+  })
+
+  it('reports file sharing when the platform accepts the file', () => {
+    installShare({ share: vi.fn(), canShare: () => true })
+    expect(canShareFiles(pdf())).toBe(true)
+  })
+
+  it('passes the file itself to the share sheet', async () => {
+    const share = vi.fn().mockResolvedValue(undefined)
+    installShare({ share, canShare: () => true })
+
+    const file = pdf()
+    await expect(shareInvoiceFile({ file, title: 'Invoice', text: 'body' })).resolves.toBe('shared')
+    expect(share).toHaveBeenCalledWith({ files: [file], title: 'Invoice', text: 'body' })
+  })
+
+  it('shares the file and title alone when there is no body', async () => {
+    // The invoice path sends no text at all. `text: undefined` is not the same as no text —
+    // some implementations validate the payload shape — so the key must be absent, not
+    // present and empty.
+    const share = vi.fn().mockResolvedValue(undefined)
+    installShare({ share, canShare: () => true })
+
+    const file = pdf()
+    await shareInvoiceFile({ file, title: 'Invoice #A3F2B1C9' })
+
+    expect(share).toHaveBeenCalledWith({ files: [file], title: 'Invoice #A3F2B1C9' })
+    expect(Object.keys(share.mock.calls[0][0])).not.toContain('text')
+  })
+
+  it('does not attempt a share the platform cannot do', async () => {
+    const share = vi.fn()
+    installShare({ share, canShare: () => false })
+
+    await expect(shareInvoiceFile({ file: pdf() })).resolves.toBe('unsupported')
+    expect(share).not.toHaveBeenCalled()
+  })
+
+  it('treats a dismissed share sheet as not an error', async () => {
+    // The reader opened the sheet and changed their mind. Painting a failure over that
+    // reports a broken feature to someone who just cancelled.
+    const abort = Object.assign(new Error('cancelled'), { name: 'AbortError' })
+    installShare({ share: vi.fn().mockRejectedValue(abort), canShare: () => true })
+
+    await expect(shareInvoiceFile({ file: pdf() })).resolves.toBe('dismissed')
+  })
+
+  it('reports a genuine failure so the caller can fall back', async () => {
+    installShare({
+      share: vi.fn().mockRejectedValue(new Error('NotAllowedError')),
+      canShare: () => true,
     })
-    expect(message).toContain('PARTIALLY PAID · Paid $100.00 · Balance $48.00')
-    expect(message).toContain('3 items · Total $148.00')
-    expect(message).toContain('https://myimsapp.com/i/tok3n')
-  })
-
-  it('does not print a balance line for a paid invoice', () => {
-    const message = buildShareMessage({
-      ...base, paymentStatus: 'PAID', paidAmount: 148, remainingAmount: 0,
-    })
-    expect(message).toContain('PAID · $148.00')
-    expect(message).not.toContain('Balance')
-  })
-
-  it('includes the converted total only when dual currency is on', () => {
-    const dual = buildShareMessage({
-      ...base, paymentStatus: 'UNPAID', remainingAmount: 148,
-      formatSecondary: () => '13,172,000 LBP',
-    })
-    expect(dual).toContain('(13,172,000 LBP)')
-
-    const single = buildShareMessage({ ...base, paymentStatus: 'UNPAID', remainingAmount: 148 })
-    expect(single).not.toContain('LBP')
-  })
-
-  it('says "item" for a single line', () => {
-    const message = buildShareMessage({
-      ...base, itemCount: 1, paymentStatus: 'UNPAID', remainingAmount: 148,
-    })
-    expect(message).toContain('1 item ·')
-  })
-
-  it('omits the link when the invoice has not been shared', () => {
-    const message = buildShareMessage({
-      ...base, shareUrl: null, paymentStatus: 'UNPAID', remainingAmount: 148,
-    })
-    expect(message).not.toContain('http')
-  })
-})
-
-describe('share links', () => {
-  it('encodes the whole message into wa.me, newlines included', () => {
-    const url = whatsappShareUrl('Invoice A3F2\nTotal $10.00')
-    expect(url).toBe('https://wa.me/?text=Invoice%20A3F2%0ATotal%20%2410.00')
-  })
-
-  it('sends url and text as separate telegram parameters', () => {
-    const url = telegramShareUrl('Invoice A3F2', 'https://myimsapp.com/i/tok3n')
-    const params = new URLSearchParams(url.split('?')[1])
-    expect(params.get('url')).toBe('https://myimsapp.com/i/tok3n')
-    expect(params.get('text')).toBe('Invoice A3F2')
-  })
-
-  it('still builds a telegram link with nothing to link to', () => {
-    expect(telegramShareUrl('Invoice A3F2', null)).toContain('text=Invoice+A3F2')
+    await expect(shareInvoiceFile({ file: pdf() })).resolves.toBe('error')
   })
 })

@@ -325,8 +325,12 @@ STATIC_URL = 'static/'
 
 REST_FRAMEWORK = {
     'COERCE_DECIMAL_TO_STRING':False,
+    # Subclasses simplejwt's JWTAuthentication to join membership+account into the user
+    # lookup. Every request resolves get_account(request.user), and without the join that
+    # traversal costs two extra queries on every authenticated call. See
+    # accounts/authentication.py.
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'accounts.authentication.AccountAwareJWTAuthentication',
     ),
     # Per-model Django permissions were a proxy for "may this person use the app" in a
     # single-tenant install. In SaaS the real gates are account scoping (which row can you

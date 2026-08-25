@@ -1240,3 +1240,67 @@ Append here when something bites. Do not repeat these.
 - **`ProductPicker` only learns a product's name by being clicked.** Any code path that sets a line's
   `product` id some other way must also pass `selectedName`, or the picker reads "Select product"
   while holding a real id.
+- **Django's `{# ... #}` is a SINGLE-LINE comment.** A newline between the delimiters means it is
+  not a comment at all: the whole block renders as literal text. Three multi-line ones sat in
+  `emails/otp_code.html` and Gmail displayed them as paragraphs of prose above the verification
+  code. There is no error and no warning — the template renders "successfully" and the defect is
+  visible only in an inbox, after the mail has gone. Use `{% comment %}` blocks in templates,
+  always. `HtmlEmailTests.test_no_raw_template_syntax_reaches_the_reader` checks both bodies of
+  both flows for every delimiter.
+- **The OTP email's brand mark is drawn from table cells, not an `<img>`.**
+  `test_the_html_has_no_remote_content` forbids `<img`, `http://` and `https://` outright — a code
+  email that fetches a remote asset shows "images not displayed" warnings, adds spam weight and
+  delays the six digits. The mark is a rounded tile of stacked bars built from `<td>`s carrying
+  `bgcolor` and `height` *attributes* alongside the inline style, which is the most reliable
+  construct in Word's renderer. It mirrors `frontend/public/favicon.svg`; change one and change both.
+- **Intl formatters must be built once and reused, never per call.** Constructing an
+  `Intl.NumberFormat` costs ~20µs against ~0.4µs to format with an existing one — measured at 54x.
+  Every function in `lib/format.js` used to construct one per call, and `toLocaleDateString` does
+  it internally too. A list page renders ten rows *twice* (table + cards), each with several money
+  figures, so a debounced search was paying hundreds of locale resolutions per keystroke. The
+  caches are keyed on the option object; adding a new formatter means going through
+  `numberFormatter`/`dateFormatter`, not calling `Intl` directly.
+- **`@page { margin: 0 }` is not a placeholder to be tidied into `10mm`.** It is the only lever CSS
+  has over the browser's own print headers and footers, and a non-zero page margin hands Chrome and
+  Safari back the source URL, the document title and a timestamp — printed onto a customer's
+  invoice. The 10mm of paper margin comes from `.invoice-print`'s own padding instead: same
+  geometry, no browser chrome. `invoicePrint.test.js` asserts it against the stylesheet source,
+  because jsdom has no layout and cannot observe a print rule by rendering.
+- **The on-screen invoice is scaled with `zoom`, not `transform: scale()`.** A transform scales the
+  painted result but leaves the layout box at full size, so the modal keeps reserving the unscaled
+  height and the saving appears as empty space below the invoice rather than as more visible rows.
+- **`navigator.share` cannot be pointed at WhatsApp or Telegram.** Neither `wa.me` nor
+  `t.me/share/url` has a parameter for an attachment — no encoding adds one — so sharing the actual
+  PDF has to go through the Web Share API, which opens the OS sheet and lets the *user* pick the
+  target. Both buttons therefore do exactly the same thing, and that is not a bug to be tidied
+  into one button: they are two familiar affordances onto one sheet.
+- **The invoice share carries the PDF and no link, by decision (2026-08-26).** `buildShareMessage`,
+  `whatsappShareUrl` and `telegramShareUrl` were deleted, not deprecated — a share must not deliver
+  a URL back into this app under a button labelled WhatsApp. The payload is
+  `{ files: [pdf], title }` with **no `text`**, and `shareInvoiceFile` omits absent keys rather than
+  passing `text: undefined`, which some implementations validate against.
+  Where file sharing is unsupported (Firefox, most desktop Linux) the fallback is a **download**,
+  never a `wa.me` link — reopening that path is what the change existed to stop. A dismissed sheet
+  (`AbortError`) must *not* trigger the download; only a real failure does.
+- **The send buttons are deliberately not gated on `shareUrl`.** They were, while they still built
+  link-based messages. Now that they carry only the PDF, gating them would force every send to first
+  mint a public share token — publishing the customer's details to an unauthenticated URL that is
+  then never used. "Share invoice"/"Copy link" remain for the case where a URL is actually wanted.
+- **`lib/pdf.js` is hand-rolled and the PDF must be built synchronously.** jsPDF + html2canvas is
+  ~550 kB for a document that is text, rules and filled rectangles, against ~9 kB for this. More
+  importantly `navigator.share` must be called inside the user gesture that triggered it: awaiting
+  a dynamic import or a canvas render first spends the gesture and Safari throws. Scope is the
+  standard 14 fonts and Latin-1 only — non-Latin product names become `?`, and Print / Save PDF
+  stays the full-fidelity route for those.
+- **Authentication joins the account in: `accounts/authentication.py`.** Every request resolves
+  `get_account(request.user)`, and `user -> membership -> account` is two lazy hops on top of the
+  user fetch — three queries before a view sees any business data, on every call. The custom
+  `AccountAwareJWTAuthentication` selects the join and makes it one (orders and products list:
+  6 queries -> 4). It is a *full override* of simplejwt's `get_user`, so the library's own
+  rejections are copied code here; each is pinned by `AccountAwareJWTAuthenticationTests` so a
+  dropped check fails rather than silently widening who can authenticate.
+- **List-endpoint query counts are pinned by slope, not by a fixed number.**
+  `ListEndpointQueryBudgetTests` compares 4 orders against 40 and requires the counts be equal. A
+  hardcoded `assertNumQueries(4)` fails on every harmless refactor and still passes an N+1 that
+  happens to land on the same total; a difference between two dataset sizes is a per-row query and
+  nothing else is.

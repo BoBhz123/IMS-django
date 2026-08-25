@@ -4987,3 +4987,101 @@ class PublicInvoiceShareTests(AccountFixtureMixin, APITestCase):
     def test_sharing_requires_authentication(self):
         response = APIClient().post(f'/inventory/orders/{self.order.id}/share/')
         self.assertIn(response.status_code, (401, 403))
+
+
+class ListEndpointQueryBudgetTests(AccountFixtureMixin, APITestCase):
+    """
+    The list endpoints must cost the same number of queries whatever the row count.
+
+    Written as a comparison between two dataset sizes rather than as a fixed budget, because
+    the number that matters is the *slope*: a hardcoded `assertNumQueries(4)` fails on any
+    harmless refactor and still passes an N+1 that happens to land on the same total. Here a
+    per-row query shows up as a difference and nothing else does.
+
+    This is the guard for the prefetching on OrderViewSet/PurchaseViewSet/ProductViewSet and
+    for AccountAwareJWTAuthentication's join. Dropping any of them fails this.
+    """
+
+    def build(self, account, orders, products_per_order=3):
+        category = Category.objects.create(name=f'Cat {account.pk}', account=account)
+        supplier = Supplier.objects.create(name=f'Sup {account.pk}', account=account)
+        products = [
+            Product.objects.create(
+                name=f'P{account.pk}-{i}', category=category, supplier=supplier,
+                cost_price=2, default_sell_price=5, stock_quantity=10000, account=account,
+            )
+            for i in range(products_per_order * 2)
+        ]
+        for i in range(orders):
+            customer = Customer.objects.create(name=f'C{account.pk}-{i}', account=account)
+            order = Order.objects.create(customer=customer, account=account)
+            OrderItem.objects.bulk_create([
+                OrderItem(
+                    order=order, product=products[(i + j) % len(products)],
+                    quantity=2, unit_price=5, unit_cost_price=2,
+                )
+                for j in range(products_per_order)
+            ])
+            purchase = Purchase.objects.create(supplier=supplier, account=account)
+            PurchaseItem.objects.bulk_create([
+                PurchaseItem(
+                    purchase_order=purchase, product=products[(i + j) % len(products)],
+                    quantity=2, unit_price=2,
+                )
+                for j in range(products_per_order)
+            ])
+
+    def count_for(self, username, orders, url):
+        account, _user, client, auth = self.make_account_user(username)
+        self.build(account, orders)
+
+        from django.test.utils import CaptureQueriesContext
+
+        client.get(url, HTTP_AUTHORIZATION=auth)  # warm any lazy import/setup
+        with CaptureQueriesContext(connection) as ctx:
+            response = client.get(url, HTTP_AUTHORIZATION=auth)
+        self.assertEqual(response.status_code, 200)
+        return len(ctx)
+
+    def assert_flat(self, url):
+        small = self.count_for(f'small{url.count("/")}{abs(hash(url)) % 97}', 4, url)
+        large = self.count_for(f'large{url.count("/")}{abs(hash(url)) % 97}', 40, url)
+        self.assertEqual(
+            small, large,
+            f'{url} issued {large} queries for 40 orders vs {small} for 4 — the difference '
+            'is a query per row, which is an N+1 and grows with every customer.',
+        )
+
+    def test_orders_list_is_flat(self):
+        self.assert_flat('/inventory/orders/')
+
+    def test_purchases_list_is_flat(self):
+        self.assert_flat('/inventory/purchases/')
+
+    def test_products_list_is_flat(self):
+        self.assert_flat('/inventory/products/')
+
+    def test_analytics_is_flat(self):
+        self.assert_flat('/inventory/analytics/')
+
+    def test_authentication_does_not_re_resolve_the_account(self):
+        # Three queries before any business data was the state before
+        # AccountAwareJWTAuthentication; the account join makes it one.
+        account, _user, client, auth = self.make_account_user('budget-auth')
+        self.build(account, 3)
+
+        from django.test.utils import CaptureQueriesContext
+
+        client.get('/inventory/orders/', HTTP_AUTHORIZATION=auth)
+        with CaptureQueriesContext(connection) as ctx:
+            client.get('/inventory/orders/', HTTP_AUTHORIZATION=auth)
+
+        account_queries = [
+            q for q in ctx.captured_queries
+            if 'accounts_membership' in q['sql'] or 'accounts_account' in q['sql']
+        ]
+        self.assertLessEqual(
+            len(account_queries), 1,
+            'the membership and account must arrive with the user, not as separate '
+            f'round trips: {[q["sql"][:80] for q in account_queries]}',
+        )
