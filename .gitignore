@@ -12,3 +12,10 @@ db.sqlite3
 
 # Django collectstatic output — regenerated on every deploy (DISABLE_COLLECTSTATIC unset)
 /staticfiles/
+
+# Node dependencies, at any depth. frontend/.gitignore already covers frontend/node_modules,
+# but nothing covered the root: `npx` run from the repo root creates an empty node_modules/
+# there, and the root package.json's build script is an npm entry point too. Unignored, a
+# populated one is thousands of files away from being swept into a commit by `git add -A`.
+# No leading slash, so this matches every level and the frontend rule becomes belt-and-braces.
+node_modules/
