@@ -25,6 +25,22 @@ const baseURL =
 
 export const api = axios.create({ baseURL })
 
+/**
+ * The same origin, with none of the machinery below.
+ *
+ * For the one unauthenticated endpoint this app has — the public invoice a customer opens
+ * from a share link. Three things `api`'s interceptors do are wrong for that caller:
+ *
+ *   - they attach `Authorization` whenever a token happens to be in localStorage. The server
+ *     sets `authentication_classes = []` precisely so the response depends on the token in
+ *     the URL and nothing else; sending a credential to it invites the opposite;
+ *   - they toast every failure, so a dead link would raise an error banner over a page whose
+ *     entire job is to explain that the link is dead;
+ *   - they redirect to /subscription on a lapsed-subscription 403 and try a token refresh on
+ *     401. A customer has no subscription and no session, and must never be sent to either.
+ */
+export const publicApi = axios.create({ baseURL })
+
 const ACCESS_KEY = 'ims.access'
 const REFRESH_KEY = 'ims.refresh'
 

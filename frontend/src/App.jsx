@@ -15,6 +15,7 @@ import { Purchases } from '@/pages/Purchases'
 import { Customers } from '@/pages/Customers'
 import { Expenses } from '@/pages/Expenses'
 import { Suppliers } from '@/pages/Suppliers'
+import { PublicInvoice } from '@/pages/PublicInvoice'
 
 function App() {
   return (
@@ -25,6 +26,14 @@ function App() {
         <Route path="/signup" element={<Signup />} />
         <Route path="/signup/verify" element={<VerifyEmail />} />
         <Route path="/subscription" element={<Subscription />} />
+
+        {/* The shared invoice, and the only route whose reader is a customer rather than a
+            user of this app. It sits OUTSIDE ProtectedRoute deliberately: the token in the
+            URL is the entire access-control story (see PublicInvoiceView), and wrapping it
+            would bounce every recipient to the login screen — which is exactly what the
+            catch-all below did while this route did not exist. It must also stay above that
+            catch-all, since `*` matches /i/<token> too. */}
+        <Route path="/i/:token" element={<PublicInvoice />} />
 
         <Route element={<ProtectedRoute />}>
           <Route element={<AppShell />}>
