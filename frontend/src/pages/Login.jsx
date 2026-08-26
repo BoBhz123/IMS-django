@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { Lock, Mail } from 'lucide-react'
 import { useAuth } from '@/context/AuthContext'
+import { BrandMark } from '@/components/ui/BrandMark'
 import { GlassCard } from '@/components/ui/GlassCard'
 
 export function Login() {
@@ -49,9 +50,7 @@ export function Login() {
         transition={{ duration: 0.5, ease: [0.22, 1, 0.36, 1] }}
       >
         <div className="mb-6 flex flex-col items-center gap-3 text-center">
-          <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-accent-blue font-display text-lg font-bold text-white shadow-lg shadow-accent-blue/30">
-            IMS
-          </div>
+          <BrandMark size={56} className="rounded-2xl shadow-lg shadow-accent-blue/30" />
           <div>
             <h1 className="font-display text-[20px] font-semibold text-text-primary">Sign in</h1>
             <p className="text-[13px] text-text-secondary">Access your inventory dashboard</p>

@@ -2,7 +2,11 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!-- The filename carries the version deliberately. Chrome keeps favicons in a cache of
+         its own, separate from the HTTP cache and unmoved by a hard reload, so a changed
+         icon at an unchanged URL keeps showing the old drawing until the profile evicts it.
+         A new path cannot hit the old entry. Bump to -v3 if the mark changes again. -->
+    <link rel="icon" type="image/svg+xml" href="/favicon-v2.svg" />
     <!-- iOS ignores rel="icon" entirely. Without this, "Add to Home Screen" — which the
          apple-mobile-web-app-capable tag below actively invites — saves a screenshot of the
          page as the icon. 180x180 is the size iOS asks for; it downsamples for every other. -->

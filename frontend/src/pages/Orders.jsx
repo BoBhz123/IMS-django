@@ -22,6 +22,7 @@ import { FilterField, FilterPopover, filterControlClass } from '@/components/ui/
 import { PaymentBadge } from '@/components/ui/PaymentBadge'
 import { PAYMENT_OPTIONS } from '@/lib/payment'
 import { btnGhost, btnGhostAccent, btnIcon, btnPrimary } from '@/lib/buttonStyles'
+import { publicInvoiceUrl } from '@/lib/invoiceShare'
 import { Invoice } from '@/components/invoice/Invoice'
 import { TransactionDetail } from '@/components/transactions/TransactionDetail'
 import { OrderForm } from '@/components/forms/OrderForm'
@@ -338,7 +339,11 @@ export function Orders() {
             setSharing(true)
             try {
               const { data } = await api.post(`/inventory/orders/${invoiceOrder.id}/share/`)
-              setShareUrl(data.share_url)
+              // The token, not the server's `share_url`. That field is composed from
+              // SITE_URL, so a link minted while developing points at production, where the
+              // token does not exist. publicInvoiceUrl builds it against this page's own
+              // origin — see lib/invoiceShare.js.
+              setShareUrl(publicInvoiceUrl(data.share_token))
             } finally {
               setSharing(false)
             }

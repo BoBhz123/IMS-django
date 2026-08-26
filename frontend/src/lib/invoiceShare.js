@@ -15,7 +15,11 @@
  * file in the downloads folder and opens nothing looks like the button is broken; the
  * download belongs to the button labelled "Download PDF" and nowhere else.
  *
- * The summary carries no URL back into this application — see `buildShareSummary`.
+ * **Since 2026-08-26 the link path is what the invoice's Share menu uses**, because a link
+ * can be addressed to the customer's own number and carry the public invoice URL, and the
+ * OS share sheet can do neither: no web page may preselect a recipient for a file share.
+ * `shareInvoiceFile` below is kept whole — it is the only way to send the bytes themselves,
+ * and the decision to prefer an addressed link over an attachment is the caller's to make.
  */
 
 const STATUS_LABEL = {
@@ -29,36 +33,135 @@ export function paymentLabel(status) {
   return STATUS_LABEL[status] ?? 'UNPAID'
 }
 
+/* --- the public invoice link -------------------------------------------------------------- */
+
+/**
+ * The customer-facing URL for a share token, on whichever host is serving this page.
+ *
+ * Derived from `window.location.origin` for the same reason `lib/api.js` derives its base
+ * URL that way: one bundle is served from the apex, from every subdomain, and from a LAN or
+ * tunnel URL in development. A link built from a fixed domain is unopenable while testing
+ * locally — the token exists only in the local database, and the link points at production,
+ * which has never heard of it.
+ *
+ * This deliberately replaces the server's `share_url`, which is composed from `SITE_URL`.
+ * The trade is real and worth stating: a staff member working on a subdomain now sends links
+ * on that subdomain rather than on the canonical apex. Both serve the same SPA, so both
+ * open; the local-development case is the one that was actually broken.
+ *
+ * Returns null for a missing token rather than a URL ending in `undefined` — a caller with
+ * no link must omit it, not send a broken one.
+ */
+export function publicInvoiceUrl(shareToken) {
+  if (!shareToken) return null
+  if (typeof window === 'undefined') return null
+  return `${window.location.origin}/i/${shareToken}`
+}
+
 /* --- the text fallback -------------------------------------------------------------------- */
 
 /**
- * A one-line summary for the link-based fallback: reference, seller, total.
+ * A one-line summary for the message: reference, seller, total, and the public invoice link.
  *
- * Deliberately short, and deliberately free of any URL into this app — a share must not
- * become an invitation to open a web page. `formatPrimary` is injected so the total reads in
- * the account's own display currency, the same way the document does.
+ * The link is the delivery mechanism, not a decoration — the recipient opens it to read the
+ * invoice and save the PDF, which is why a share may now carry a URL back into this app.
+ * That reverses the earlier "no URL in a share" rule, and the reason it is safe to reverse
+ * is unchanged from what made the rule necessary: the URL is a capability. Anyone holding it
+ * reads that customer's name, phone and order lines with no login. It is minted per invoice,
+ * revocable, and must never be built by hand from an id — only from a real `share_token`.
+ *
+ * `formatPrimary` is injected so the total reads in the account's own display currency, the
+ * same way the document does. `invoiceUrl` is optional: a purchase invoice has no public
+ * link, and a mint that failed must still produce a sendable message.
  */
-export function buildShareSummary({ reference, sellerName, total, formatPrimary }) {
+export function buildShareSummary({ reference, sellerName, total, formatPrimary, invoiceUrl }) {
   const who = sellerName ? ` — ${sellerName}` : ''
-  return `Invoice #${reference}${who} · Total: ${formatPrimary(total)}`
+  const link = invoiceUrl ? ` · View invoice: ${invoiceUrl}` : ''
+  return `Invoice #${reference}${who} · Total: ${formatPrimary(total)}${link}`
+}
+
+/** E.164 allows 15 digits at most, and no real international number is shorter than 8. */
+const MIN_E164_DIGITS = 8
+const MAX_E164_DIGITS = 15
+
+/**
+ * A phone number reduced to what WhatsApp accepts, or '' when it cannot be trusted.
+ *
+ * WhatsApp wants E.164 *without* the leading `+`: country code then subscriber number,
+ * digits only. The `+` matters more than it looks — in a query string `+` is a literal
+ * space, so `?phone=+96171999888` arrives as `" 96171999888"` and the chat silently fails
+ * to open. Stripping it sidesteps the encoding question entirely and is what WhatsApp's own
+ * documentation asks for.
+ *
+ * The refusals are the important part, because the failure they prevent is *sending a
+ * customer's invoice to a stranger*:
+ *
+ *   - **A leading `0` with no `+`** is a national trunk prefix — `03 123 456` is a complete
+ *     number inside its own country and meaningless outside it. Turning it into E.164 needs
+ *     a country code this app does not store (there is no country on `Account`, and guessing
+ *     Lebanon would be wrong for every other account). Refused, so the send falls back to
+ *     the contact picker and a human chooses.
+ *   - **Too few or too many digits** is not a phone number: a typo, an extension, a note in
+ *     the field. `n/a` and `-` reduce to nothing at all.
+ *
+ * `00` is the other international prefix and is accepted, since it carries a country code.
+ *
+ * The gap worth knowing about: a bare `71999888` stored without a country code passes the
+ * length test and is sent as-is, because nothing distinguishes it from a short-country-code
+ * international number. Storing numbers with a `+` is what makes this reliable.
+ */
+export function normalizePhone(phone) {
+  const raw = String(phone ?? '').trim()
+  const digits = raw.replace(/\D/g, '')
+
+  let candidate = digits
+  if (!raw.startsWith('+')) {
+    if (digits.startsWith('00')) candidate = digits.slice(2)
+    else if (digits.startsWith('0')) return ''
+  }
+
+  if (candidate.length < MIN_E164_DIGITS || candidate.length > MAX_E164_DIGITS) return ''
+  return candidate
 }
 
 /**
- * wa.me takes the whole message as one encoded `text` parameter — there is no separate URL
- * field, so everything to be said has to live inside the message body.
+ * A WhatsApp deep link, addressed to the customer when we have a number we can trust.
+ *
+ * One endpoint for both cases, differing only in whether `phone` is present:
+ *
+ *   - with it, WhatsApp opens that customer's chat with the message prefilled and the seller
+ *     just presses send;
+ *   - without it, the same URL opens WhatsApp on the contact picker carrying the same
+ *     message, and the seller chooses the recipient.
+ *
+ * The whole message — including the public invoice link — travels in `text`. There is no
+ * separate URL field in either form.
  */
-export function whatsappShareUrl(message) {
-  return `https://wa.me/?text=${encodeURIComponent(message)}`
-}
-
-/**
- * Telegram takes `url` and `text` separately and expects both to be present. There is no URL
- * to send any more, so `url` goes empty and the summary travels as text — which Telegram
- * renders fine, and which keeps the "no link back into the app" rule intact.
- */
-export function telegramShareUrl(message) {
+export function whatsappShareUrl(message, { phone } = {}) {
   const params = new URLSearchParams()
-  params.set('url', '')
+
+  // Omitted entirely rather than sent empty. `phone=` with nothing after it is not the same
+  // request as no phone at all: WhatsApp reads it as an address it cannot resolve and shows
+  // an error instead of the contact picker.
+  const number = normalizePhone(phone)
+  if (number) params.set('phone', number)
+  params.set('text', message)
+
+  return `https://api.whatsapp.com/send?${params.toString()}`
+}
+
+/**
+ * Telegram takes `url` and `text` separately, and renders the URL as a link preview.
+ *
+ * **There is no phone parameter, and this is not an oversight to be fixed.** Telegram
+ * identifies a recipient by chat id or @username, and has no way to open a chat with a bare
+ * phone number — `t.me/share/url` always opens the contact picker. So the customer's number
+ * is unusable here even though we hold it, and Telegram sharing stays "compose to whoever
+ * you pick" while WhatsApp can be addressed.
+ */
+export function telegramShareUrl(message, { url } = {}) {
+  const params = new URLSearchParams()
+  params.set('url', url || '')
   params.set('text', message)
   return `https://t.me/share/url?${params.toString()}`
 }

@@ -1,15 +1,14 @@
-import { useEffect, useRef, useState } from 'react'
-import { Check, Copy, Download, Printer, Send, Share2, X } from 'lucide-react'
+import { useEffect, useRef } from 'react'
+import { Download, Printer, X } from 'lucide-react'
 import {
   buildShareSummary,
-  canShareFiles,
   makeInvoiceFile,
   paymentLabel,
-  shareInvoiceFile,
   telegramShareUrl,
   whatsappShareUrl,
 } from '@/lib/invoiceShare'
 import { invoicePdfBlob } from '@/lib/invoicePdf'
+import { InvoiceShareMenu } from './InvoiceShareMenu'
 import { Modal } from '@/components/ui/Modal'
 import { formatDate, formatLBP, formatMoney, invoiceFileName, shortId } from '@/lib/format'
 import { INVOICE_FOOTER_NOTE, INVOICE_TAGLINE } from '@/lib/invoiceConfig'
@@ -78,14 +77,11 @@ export function Invoice({
   // and a reader looks for them; when a discount does arrive, only `total` changes.
   const total = subtotal
 
-  const [copied, setCopied] = useState(false)
-  const copyResetRef = useRef(null)
   const restorePrintTitleRef = useRef(null)
   const revokeRef = useRef(null)
   const objectUrlsRef = useRef([])
 
   useEffect(() => () => {
-    clearTimeout(copyResetRef.current)
     clearTimeout(revokeRef.current)
     // An object URL pins its blob in memory until revoked. Unmounting before the deferred
     // revoke fires would strand a whole PDF per download for the life of the document.
@@ -149,66 +145,43 @@ export function Invoice({
   }
 
   /**
-   * Sends the invoice: the PDF through the OS share sheet, or the link for the target.
+   * Sends the invoice as an addressed message carrying the public invoice link.
    *
-   * Everything up to `navigator.share` runs synchronously inside the click — the PDF is
-   * built inline (lib/pdf.js is written to make that possible), `canShareFiles` is a plain
-   * check and `shareInvoiceFile` is deliberately not `async`. Any `await` before the call
-   * would move it off the gesture's call stack and mobile browsers would refuse it with
-   * NotAllowedError.
+   * This replaces the OS share sheet for these two targets (2026-08-26). The sheet could
+   * carry the actual PDF but nothing else: no web page may preselect WhatsApp, and no web
+   * page may tell it who to send to. A `wa.me`/`api.whatsapp.com` link can do both — open
+   * the customer's own chat, with the reference, the total and a link the customer opens to
+   * read the invoice and save the PDF for themselves.
    *
-   * Where files cannot be shared this opens the target's own share URL with a short text
-   * summary. It does *not* download: a press on "WhatsApp" that silently drops a file into
-   * the downloads folder and opens nothing reads as a broken button. Downloading is what the
-   * "Download PDF" button is for, and it is the only thing that does it.
+   * Still synchronous inside the click, for a different reason than before: `window.open`
+   * reached after an `await` is treated as an unsolicited popup and blocked. That is why the
+   * share token is minted when the menu opens rather than here — see InvoiceShareMenu.
+   *
+   * It does *not* download. A press on "WhatsApp" that drops a file into the downloads
+   * folder and opens nothing reads as a broken button; downloading belongs to the button
+   * labelled "Download PDF" and to nothing else.
    */
-  function handleSendPdf(buildTargetUrl) {
-    const file = buildInvoiceFile()
-    const openTarget = () =>
-      window.open(
-        buildTargetUrl(
-          buildShareSummary({
-            reference: shortId(id),
-            sellerName: seller.name,
-            total,
-            formatPrimary: primary,
-          }),
-        ),
-        '_blank',
-        'noopener,noreferrer',
-      )
-
-    if (!canShareFiles(file)) {
-      openTarget()
-      return
-    }
-
-    shareInvoiceFile({ file, title: `Invoice #${shortId(id)}` }).then((result) => {
-      // A dismissal is the reader changing their mind — the sheet did open, so there is
-      // nothing to recover. A genuine failure falls through to the link.
-      if (result === 'error') openTarget()
-    })
+  function handleSend(buildTargetUrl) {
+    window.open(
+      buildTargetUrl(
+        buildShareSummary({
+          reference: shortId(id),
+          sellerName: seller.name,
+          total,
+          formatPrimary: primary,
+          invoiceUrl: shareUrl,
+        }),
+        // WhatsApp uses the number to address the chat; Telegram ignores it and takes the
+        // URL for its link preview. Both are passed both — the builder keeps what it can use.
+        { phone: partyPhone, url: shareUrl },
+      ),
+      '_blank',
+      'noopener,noreferrer',
+    )
   }
 
   function handleDownloadPdf() {
     downloadPdfFile(buildInvoiceFile())
-  }
-
-  async function handleCopyLink() {
-    try {
-      await navigator.clipboard.writeText(shareUrl)
-      setCopied(true)
-      // Reverts on its own — a permanently "Copied" button gives no feedback the second time.
-      // Tracked in a ref so closing the invoice cancels it; this modal is closed within two
-      // seconds of a copy often enough (copy the link, close, paste) for it to matter.
-      clearTimeout(copyResetRef.current)
-      copyResetRef.current = setTimeout(() => setCopied(false), 2000)
-    } catch {
-      // Clipboard access is denied outside a secure context and in some embedded browsers.
-      // The link is visible in the WhatsApp/Telegram targets either way, so this is a
-      // degraded copy button rather than a broken share feature.
-      setCopied(false)
-    }
   }
 
   function handlePrint() {
@@ -261,52 +234,18 @@ export function Invoice({
             Download PDF
           </button>
 
-          {/* Sending the document. On a platform that can share files both hand the PDF to
-              the OS share sheet — no web page can preselect an app for a file share, so the
-              reader picks the target there. Where it cannot, each falls back to its own
-              share URL with a text summary, which is why they take different builders. */}
-          <button
-            type="button"
-            onClick={() => handleSendPdf(whatsappShareUrl)}
-            className="flex items-center gap-1.5 rounded-xl bg-[#25D366] px-3 py-1.5 text-[13px] font-semibold text-white hover:opacity-90"
-          >
-            <Share2 size={14} />
-            WhatsApp
-          </button>
-          <button
-            type="button"
-            onClick={() => handleSendPdf(telegramShareUrl)}
-            className="flex items-center gap-1.5 rounded-xl bg-[#229ED9] px-3 py-1.5 text-[13px] font-semibold text-white hover:opacity-90"
-          >
-            <Send size={14} />
-            Telegram
-          </button>
-
-          {/* Sharing is opt-in per invoice: the first press mints a public link (see
-              PublicInvoiceView), so it is a deliberate act rather than something that happens
-              because the invoice was opened. */}
-          {onShare && !shareUrl && (
-            <button
-              type="button"
-              onClick={onShare}
-              disabled={sharing}
-              className="flex items-center gap-1.5 rounded-xl border border-hairline px-3 py-1.5 text-[13px] font-semibold text-text-primary hover:bg-canvas-2 disabled:opacity-60"
-            >
-              <Share2 size={14} />
-              {sharing ? 'Creating link…' : 'Share invoice'}
-            </button>
-          )}
-
-          {shareUrl && (
-            <button
-              type="button"
-              onClick={handleCopyLink}
-              className="flex items-center gap-1.5 rounded-xl border border-hairline px-3 py-1.5 text-[13px] font-semibold text-text-primary hover:bg-canvas-2"
-            >
-              {copied ? <Check size={14} /> : <Copy size={14} />}
-              {copied ? 'Copied' : 'Copy link'}
-            </button>
-          )}
+          {/* Sending the document, behind one control. On a platform that can share files
+              both targets hand the PDF to the OS share sheet — no web page can preselect an
+              app for a file share, so the reader picks the target there. Where it cannot,
+              each falls back to its own share URL with a text summary, which is why they
+              still take different builders. */}
+          <InvoiceShareMenu
+            onWhatsApp={() => handleSend(whatsappShareUrl)}
+            onTelegram={() => handleSend(telegramShareUrl)}
+            shareUrl={shareUrl}
+            onShare={onShare}
+            sharing={sharing}
+          />
 
           <button
             type="button"
